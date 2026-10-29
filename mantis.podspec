@@ -10,7 +10,7 @@ Pod::Spec.new do |s|
   s.license      = package["license"]
   s.authors      = package["author"]
   s.platforms    = { :ios => "15.1" }
-  s.source       = { :git => package["repository"], :tag => s.version.to_s }
+  s.source       = { :git => "#{package["homepage"]}.git", :tag => s.version.to_s }
   s.source_files = "ios/**/*.{h,m}"
   s.frameworks   = "UIKit", "QuartzCore"
   # Build-time gate: Xcode expands $(MANTIS_E2E) from the build environment, so only `MANTIS_E2E=1 xcodebuild ...`

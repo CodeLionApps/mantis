@@ -5,7 +5,10 @@
   "license": "MIT",
   "author": "CodeLionApps",
   "homepage": "https://github.com/CodeLionApps/mantis",
-  "repository": "https://github.com/CodeLionApps/mantis.git",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CodeLionApps/mantis.git"
+  },
   "main": "src/runner/index.js",
   "exports": {
     ".": "./src/runner/index.js",
