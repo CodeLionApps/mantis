@@ -1,6 +1,6 @@
 {
   "name": "@codelionapps/mantis",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Lightning fast React Native test driver: runs Detox tests 2-3x faster, Playwright-style locators",
   "license": "MIT",
   "author": "CodeLionApps",
