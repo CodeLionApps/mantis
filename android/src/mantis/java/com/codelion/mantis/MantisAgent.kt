@@ -1,0 +1,376 @@
+package com.codelion.mantis
+
+import android.app.Activity
+import android.app.Application
+import android.content.Context
+import android.graphics.Rect
+import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.util.TypedValue
+import android.view.Choreographer
+import android.view.InputDevice
+import android.view.MotionEvent
+import android.view.View
+import android.view.ViewConfiguration
+import android.view.ViewGroup
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputMethodManager
+import android.view.inspector.WindowInspector
+import android.widget.EditText
+import android.widget.HorizontalScrollView
+import android.widget.ScrollView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import com.facebook.react.uimanager.TouchTargetHelper
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.Response
+import okhttp3.WebSocket
+import okhttp3.WebSocketListener
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.concurrent.TimeUnit
+
+/**
+ * Mantis native agent. Compiled in only with MANTIS_E2E=1 (src/mantis, see build.gradle) and started by
+ * MantisInitProvider. The app must allow cleartext traffic to localhost (network security config) in that build.
+ *
+ * Passive until a runner listens on the host: dials ws://localhost:9123 (adb reverse) and retries every second.
+ * Own socket, independent of the JS thread, so measuring / hit-testing / input work while JS is busy.
+ * All view work on the main thread. Coordinates exchanged with the runner are dp (= JS units).
+ */
+object MantisAgent {
+  private const val URL = "ws://localhost:9123/?role=native"
+  private val main = Handler(Looper.getMainLooper())
+  private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
+  private lateinit var app: Application
+  private var activity: Activity? = null
+  private var ws: WebSocket? = null
+
+  @JvmStatic
+  fun install(application: Application) {
+    app = application
+    app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+      override fun onActivityResumed(a: Activity) { activity = a }
+      override fun onActivityPaused(a: Activity) { if (activity == a) activity = null }
+      override fun onActivityCreated(a: Activity, b: Bundle?) {}
+      override fun onActivityStarted(a: Activity) {}
+      override fun onActivityStopped(a: Activity) {}
+      override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
+      override fun onActivityDestroyed(a: Activity) {}
+    })
+    connect()
+  }
+
+  private fun connect() {
+    ws = client.newWebSocket(Request.Builder().url(URL).build(), object : WebSocketListener() {
+      override fun onOpen(webSocket: WebSocket, response: Response) {
+        webSocket.send(JSONObject().put("method", "Agent.hello")
+          .put("params", JSONObject().put("role", "native").put("platform", "android")).toString())
+      }
+      override fun onMessage(webSocket: WebSocket, text: String) {
+        val msg = JSONObject(text)
+        val id = msg.getInt("id")
+        val params = msg.optJSONObject("params") ?: JSONObject()
+        main.post {
+          try {
+            handle(msg.getString("method"), params) { result -> reply(id, result, null) }
+          } catch (e: Throwable) {
+            reply(id, null, e.toString())
+          }
+        }
+      }
+      override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = retry()
+      override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = retry()
+    })
+  }
+
+  private fun retry() { main.postDelayed({ connect() }, 1000) }
+
+  private fun reply(id: Int, result: Any?, error: String?) {
+    val out = JSONObject().put("id", id)
+    if (error != null) out.put("error", JSONObject().put("message", error)) else out.put("result", result ?: JSONObject.NULL)
+    ws?.send(out.toString())
+  }
+
+  private val decor: View get() = activity?.window?.decorView ?: error("no resumed activity")
+  private val density: Float get() = app.resources.displayMetrics.density
+
+  /** All windows of this process (activity, Modal dialogs, popups), topmost first. Coordinates are screen-based. */
+  private fun roots(): List<View> {
+    // ponytail: API 29+ (WindowInspector); below that only the activity window, so no Modal support
+    val all = if (Build.VERSION.SDK_INT >= 29) WindowInspector.getGlobalWindowViews() else listOf(decor)
+    return all.filter { it.isShown }.reversed()
+  }
+
+  private fun findView(tag: Int): View? = roots().firstNotNullOfOrNull { it.findViewById<View>(tag) }
+
+  private fun screenRect(v: View): Rect {
+    val l = IntArray(2).also { v.getLocationOnScreen(it) }
+    return Rect(l[0], l[1], l[0] + v.width, l[1] + v.height)
+  }
+
+  /** Topmost window containing the point (px, screen); where a real touch would land. */
+  private fun windowAt(x: Float, y: Float): View = roots().firstOrNull { screenRect(it).contains(x.toInt(), y.toInt()) } ?: decor
+
+  private fun rectOf(v: View): JSONObject {
+    val r = screenRect(v)
+    return JSONObject().put("x", r.left / density).put("y", r.top / density)
+      .put("width", v.width / density).put("height", v.height / density)
+  }
+
+  private fun isScroller(v: View) = v is ScrollView || v is HorizontalScrollView
+
+  /** Part of the screen where [v] can be seen: its window clipped by every scrolling ancestor. */
+  private fun viewport(v: View): Rect {
+    val clip = screenRect(v.rootView)
+    var cur = v.parent
+    while (cur is View) { if (isScroller(cur) && !clip.intersect(screenRect(cur))) clip.setEmpty(); cur = cur.parent }
+    return clip
+  }
+
+  private fun nearestScroller(v: View): View? {
+    var cur = v.parent
+    while (cur is View) { if (isScroller(cur)) return cur; cur = cur.parent }
+    return null
+  }
+
+  /**
+   * Visible share of the view the way Detox's toBeVisible measures it: min of Espresso isDisplayingAtLeast and
+   * IsDisplayingAtLeastDetoxMatcher (visible rect ∩ every ancestor's, area capped at screen minus status + action
+   * bar). Neither clips to the screen, so an edge-to-edge tab bar under the nav bar still counts. 0 = not shown.
+   */
+  private fun visibleRatio(v: View?): Double {
+    if (v == null || !v.isShown || v.width == 0 || v.height == 0) return 0.0
+    val r = Rect()
+    if (!v.getGlobalVisibleRect(r)) return 0.0
+    val dm = app.resources.displayMetrics
+    val w = minOf(Math.abs(v.width * v.scaleX).toDouble(), dm.widthPixels.toDouble())
+    val h = Math.abs(v.height * v.scaleY).toDouble()
+    val espresso = r.width().toDouble() * r.height() / (w * minOf(h, dm.heightPixels.toDouble()))
+    val pr = Rect()
+    var p = v.parent as? View
+    while (p != null) { p.getGlobalVisibleRect(pr); if (!r.intersect(pr)) return 0.0; p = p.parent as? View }
+    val tv = TypedValue()
+    val actionBar = if (v.context.theme.resolveAttribute(android.R.attr.actionBarSize, tv, true))
+      TypedValue.complexToDimensionPixelSize(tv.data, dm) else 0
+    val statusBarId = app.resources.getIdentifier("status_bar_height", "dimen", "android")
+    val statusBar = if (statusBarId > 0) app.resources.getDimensionPixelSize(statusBarId) else 0
+    val detox = r.width().toDouble() * r.height() / (w * minOf(h, (dm.heightPixels - statusBar - actionBar).toDouble()))
+    return minOf(espresso, detox)
+  }
+
+  private fun sameRect(a: JSONObject, b: JSONObject) =
+    listOf("x", "y", "width", "height").all { Math.abs(a.getDouble(it) - b.getDouble(it)) < 0.01 } // any px change: a list still
+    // drifting at <0.5 dp/frame makes Android's ScrollView eat the next DOWN as "stop fling"
+
+  /** Fabric: View.id == React tag. Returns the root surface view (ReactSurfaceView / ReactRootView). */
+  private fun reactRoot(v: View): ViewGroup? {
+    if (v is ViewGroup && v.javaClass.simpleName.let { it.contains("SurfaceView") || it.contains("RootView") }) return v
+    if (v is ViewGroup) for (i in 0 until v.childCount) reactRoot(v.getChildAt(i))?.let { return it }
+    return null
+  }
+
+  private fun ancestorTags(v: View?): JSONArray {
+    val out = JSONArray()
+    var cur: Any? = v
+    while (cur is View) { if (cur.id > 0) out.put(cur.id); cur = cur.parent }
+    return out
+  }
+
+  /** Hit-test like RN's own touch dispatch, in the topmost window at the point; IME counts as an overlay. */
+  private fun hitTest(xDp: Float, yDp: Float): JSONObject {
+    val x = xDp * density
+    val y = yDp * density
+    val ime = ViewCompat.getRootWindowInsets(decor)?.getInsets(WindowInsetsCompat.Type.ime())?.bottom ?: 0
+    if (ime > 0 && y > screenRect(decor).bottom - ime) return JSONObject().put("covered", "keyboard")
+    val win = windowAt(x, y)
+    val root = reactRoot(win) ?: return JSONObject().put("covered", "window ${win.javaClass.simpleName}")
+    val rootLoc = IntArray(2).also { root.getLocationOnScreen(it) }
+    val tag = TouchTargetHelper.findTargetTagForTouch(x - rootLoc[0], y - rootLoc[1], root)
+    // a nested <Text> hit returns the virtual span's tag, which has no View: chain = span + the view under the point
+    val view = root.findViewById<View>(tag) ?: leafAt(root, x, y)
+    return JSONObject().put("tag", tag).put("class", view.javaClass.simpleName)
+      .put("chain", ancestorTags(view).apply { if (view.id != tag) put(tag) })
+  }
+
+  private fun leafAt(v: View, x: Float, y: Float): View {
+    if (v is ViewGroup) for (i in v.childCount - 1 downTo 0) {
+      val c = v.getChildAt(i)
+      if (c.isShown && screenRect(c).contains(x.toInt(), y.toInt())) return leafAt(c, x, y)
+    }
+    return v
+  }
+
+  private fun handle(method: String, p: JSONObject, done: (Any?) -> Unit) {
+    when (method) {
+      // Visible share per tag (Detox semantics, see visibleRatio), for toBeInViewport and filter({ visible })
+      "Layout.visibility" -> {
+        val tags = p.getJSONArray("tags")
+        val out = JSONArray()
+        val shown = JSONArray() // in a window and not hidden: what Detox/Espresso can match (screens below are not)
+        for (i in 0 until tags.length()) {
+          val v = if (tags.isNull(i)) null else findView(tags.getInt(i))
+          out.put(visibleRatio(v))
+          shown.put(v?.isShown == true)
+        }
+        done(JSONObject().put("ratios", out).put("shown", shown))
+      }
+
+      // Detox scrollTo(edge): jump the scroll view to its start/end (programmatic, like Detox's edge scroll)
+      "Input.scrollToEdge" -> {
+        val sv = findView(p.getInt("tag"))
+        val end = p.getString("edge") in setOf("bottom", "right")
+        when (sv) {
+          is ScrollView -> if (end) sv.fullScroll(View.FOCUS_DOWN) else sv.scrollTo(0, 0)
+          is HorizontalScrollView -> if (end) sv.fullScroll(View.FOCUS_RIGHT) else sv.scrollTo(0, 0)
+          else -> { done(JSONObject().put("ok", false).put("reason", "not a scroll view")); return }
+        }
+        done(JSONObject().put("ok", true))
+      }
+
+      // Actionability, native half: exists natively, stable across 2 frames, receives events at center.
+      "Action.check" -> {
+        val tag = p.getInt("tag")
+        val tags = p.getJSONArray("tags").let { a -> (0 until a.length()).map { a.optInt(it) }.toSet() }
+        val v = findView(tag)
+        if (v == null || !v.isShown) { done(JSONObject().put("ok", false).put("reason", "not mounted natively")); return }
+        // a just-shown window (Modal = Dialog) gets its final layout (insets) only around the time WM focuses it;
+        // 2 stable frames before that can still be the provisional position (measured: shift ~36 dp, focus +~130 ms)
+        if (!v.rootView.hasWindowFocus()) { done(JSONObject().put("ok", false).put("reason", "window not focused")); return }
+        val r1 = rectOf(v)
+        Choreographer.getInstance().postFrameCallback {
+          val r2 = rectOf(v)
+          if (!sameRect(r1, r2)) { done(JSONObject().put("ok", false).put("reason", "not stable").put("r1", r1).put("r2", r2)); return@postFrameCallback }
+          val cx = (r2.getDouble("x") + r2.getDouble("width") / 2).toFloat()
+          val cy = (r2.getDouble("y") + r2.getDouble("height") / 2).toFloat()
+          // viewport: centre must be on screen and not clipped by a scroll view; delta tells the runner where to scroll
+          val vp = viewport(v)
+          if (!vp.contains((cx * density).toInt(), (cy * density).toInt())) {
+            val sv = nearestScroller(v)?.let { viewport(it).apply { intersect(screenRect(it)) } }
+            done(JSONObject().put("ok", false).put("reason", "not in viewport").put("rect", r2)
+              .put("delta", sv?.let { cy - it.exactCenterY() / density } ?: 0f))
+            return@postFrameCallback
+          }
+          val hit = hitTest(cx, cy)
+          val chain = hit.optJSONArray("chain")
+          val receives = chain != null && (0 until chain.length()).any { chain.getInt(it) in tags }
+          done(JSONObject().put("ok", receives).put("point", JSONObject().put("x", cx).put("y", cy)).put("rect", r2)
+            .put("hit", hit).put("reason", if (receives) null else "covered by ${hit.opt("class") ?: hit.opt("covered")} (tag ${hit.opt("tag")}) at ($cx, $cy)"))
+        }
+      }
+
+      "Input.tap" -> {
+        val x = p.getDouble("x").toFloat() * density
+        val y = p.getDouble("y").toFloat() * density
+        val win = windowAt(x, y)
+        val down = SystemClock.uptimeMillis()
+        touch(win, down, down, MotionEvent.ACTION_DOWN, x, y)
+        // hold = until next frame (~16 ms), enough for Pressable / gesture handlers to see DOWN
+        val target = if (p.has("tag")) findView(p.getInt("tag")) else null
+        val trace = JSONArray()
+        fun sample() { target?.let { trace.put(rectOf(it).put("ms", SystemClock.uptimeMillis() - down)) } }
+        sample()
+        Choreographer.getInstance().postFrameCallback {
+          sample()
+          touch(win, down, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x, y)
+          done(JSONObject().put("ok", true))
+          // debug: target's rect for 30 frames after UP, as an event (MANTIS_TRACE)
+          if (target != null) {
+            var n = 0
+            val cb = object : Choreographer.FrameCallback {
+              override fun doFrame(t: Long) {
+                sample()
+                if (++n < 30) Choreographer.getInstance().postFrameCallback(this)
+                else ws?.send(JSONObject().put("method", "Debug.tapTrace")
+                  .put("params", JSONObject().put("tag", p.getInt("tag")).put("rects", trace)).toString())
+              }
+            }
+            Choreographer.getInstance().postFrameCallback(cb)
+          }
+        }
+      }
+
+      // Scroll = a real drag on the scroll view: DOWN, eased MOVEs (one per frame), finger held still (MOVEs at the
+      // end point) for > 100 ms = VelocityTracker's horizon, then UP. Velocity at UP is 0: no fling, deterministic.
+      // dy (dp) = how far content should move up (positive = reveal content below).
+      "Input.scroll" -> {
+        val sv = findView(p.getInt("tag"))
+        // JS commit can be ~1 frame ahead of the native mount: not ready yet, the runner retries next frame
+        if (sv == null || !sv.isShown) { done(JSONObject().put("ok", false).put("reason", "scroll view not mounted natively")); return }
+        val vp = viewport(sv).apply { intersect(screenRect(sv)) }
+        val slop = ViewConfiguration.get(sv.context).scaledTouchSlop
+        val want = p.getDouble("dy").toFloat() * density
+        val amount = (Math.abs(want) + slop).coerceAtMost(vp.height() * 0.8f) * Math.signum(want)
+        val x = vp.exactCenterX()
+        val y0 = vp.exactCenterY() + amount / 2
+        val y1 = vp.exactCenterY() - amount / 2
+        val hit = hitTest(x / density, y0 / density).optJSONArray("chain")
+        if (hit == null || (0 until hit.length()).none { hit.getInt(it) == sv.id }) {
+          done(JSONObject().put("ok", false).put("reason", "scroll view covered at start point")); return
+        }
+        val win = windowAt(x, y0)
+        val down = SystemClock.uptimeMillis()
+        touch(win, down, down, MotionEvent.ACTION_DOWN, x, y0)
+        val moves = p.optInt("moves", 6)
+        var frame = 0
+        var lastMove = down
+        Choreographer.getInstance().postFrameCallback(object : Choreographer.FrameCallback {
+          override fun doFrame(t: Long) {
+            frame++
+            val now = SystemClock.uptimeMillis()
+            if (frame <= moves) {
+              val k = 1 - (1 - frame.toFloat() / moves).let { it * it } // ease-out
+              touch(win, down, now, MotionEvent.ACTION_MOVE, x, y0 + (y1 - y0) * k)
+              lastMove = now
+            } else if (now - lastMove < 110) {
+              touch(win, down, now, MotionEvent.ACTION_MOVE, x, y1)
+            } else {
+              touch(win, down, now, MotionEvent.ACTION_UP, x, y1)
+              // 2 frames: lets the scroll events of the UP (momentum begin) reach the JS queue before the runner
+              // queries again, so the "scroll view animating" check cannot miss them
+              Choreographer.getInstance().postFrameCallback {
+                Choreographer.getInstance().postFrameCallback { done(JSONObject().put("ok", true).put("px", amount)) }
+              }
+              return
+            }
+            Choreographer.getInstance().postFrameCallback(this)
+          }
+        })
+      }
+
+      // Text via the IME path (InputConnection), not by setting props. replace = select all first (Playwright fill).
+      "Input.typeText" -> {
+        val focused = roots().firstNotNullOfOrNull { it.findFocus() }
+        if (focused !is EditText) { done(JSONObject().put("ok", false).put("reason", "focused: ${focused?.javaClass?.simpleName}")); return }
+        val want = p.optJSONArray("tags")?.let { t -> (0 until t.length()).map { t.optInt(it) } }
+        if (want != null && focused.id !in want) { done(JSONObject().put("ok", false).put("reason", "focus still on tag ${focused.id}")); return }
+        val ic = focused.onCreateInputConnection(EditorInfo()) ?: error("no InputConnection")
+        if (p.optBoolean("replace")) ic.setSelection(0, focused.text.length)
+        ic.commitText(p.getString("text"), 1)
+        done(JSONObject().put("ok", true).put("focusedTag", focused.id))
+      }
+
+      // What a user does when the soft keyboard covers the next target (Detox's replaceText never opens it)
+      "Input.hideKeyboard" -> {
+        val imm = app.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        val hidden = roots().any { imm.hideSoftInputFromWindow(it.windowToken, 0) }
+        done(JSONObject().put("ok", hidden))
+      }
+
+      else -> error("unknown method $method")
+    }
+  }
+
+  /** x, y in screen px; delivered to [win]'s root view in its own coordinates. */
+  private fun touch(win: View, down: Long, now: Long, action: Int, x: Float, y: Float) {
+    val l = IntArray(2).also { win.getLocationOnScreen(it) }
+    val ev = MotionEvent.obtain(down, now, action, x - l[0], y - l[1], 0)
+    ev.source = InputDevice.SOURCE_TOUCHSCREEN
+    win.dispatchTouchEvent(ev)
+    ev.recycle()
+  }
+}

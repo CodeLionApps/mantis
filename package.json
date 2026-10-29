@@ -1,0 +1,54 @@
+{
+  "name": "@codelionapps/mantis",
+  "version": "0.1.0",
+  "description": "Lightning fast React Native test driver: runs Detox tests 2-3x faster, Playwright-style locators",
+  "license": "MIT",
+  "author": "CodeLionApps",
+  "homepage": "https://github.com/CodeLionApps/mantis",
+  "repository": "https://github.com/CodeLionApps/mantis.git",
+  "main": "src/runner/index.js",
+  "exports": {
+    ".": "./src/runner/index.js",
+    "./agent": "./src/agent/index.js",
+    "./detox": "./src/detox/index.js",
+    "./device": "./src/device/index.js",
+    "./metro": "./metro.js",
+    "./reset": "./src/reset.js",
+    "./runner": "./src/runner/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "src",
+    "metro.js",
+    "android/build.gradle",
+    "android/src",
+    "ios",
+    "mantis.podspec",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node src/selftest.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "peerDependencies": {
+    "detox": ">=20",
+    "react-native": ">=0.76"
+  },
+  "peerDependenciesMeta": {
+    "detox": {
+      "optional": true
+    }
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "react-native",
+    "e2e",
+    "testing",
+    "detox",
+    "test-driver"
+  ]
+}

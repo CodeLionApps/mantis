@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <application>
+    <!-- Starts the Mantis agent with the app process, before any activity (like androidx.startup). -->
+    <provider
+      android:name="com.codelion.mantis.MantisInitProvider"
+      android:authorities="${applicationId}.mantis-init"
+      android:exported="false" />
+  </application>
+</manifest>

@@ -1,0 +1,33 @@
+// Mantis native agent as an RN library (autolinked). The agent's sources and its ContentProvider are compiled in only
+// when MANTIS_E2E=1 is set for the Gradle build; otherwise the library is just the empty MantisPackage (autolinking
+// needs a ReactPackage) and the app contains no agent.
+def mantisE2E = System.getenv("MANTIS_E2E") == "1"
+
+apply plugin: "com.android.library"
+// AGP 9 has built-in Kotlin; older AGP or android.builtInKotlin=false needs the plugin
+def agpMajor = com.android.Version.ANDROID_GRADLE_PLUGIN_VERSION.tokenize(".")[0].toInteger()
+if (agpMajor <= 8 || providers.gradleProperty("android.builtInKotlin").orNull == "false") {
+    apply plugin: "kotlin-android"
+}
+
+def ext = { name, fallback -> rootProject.ext.has(name) ? rootProject.ext.get(name) : fallback }
+
+android {
+    namespace "com.codelion.mantis"
+    compileSdkVersion ext("compileSdkVersion", 35)
+    defaultConfig {
+        minSdkVersion ext("minSdkVersion", 24)
+    }
+    sourceSets {
+        main {
+            if (mantisE2E) {
+                java.srcDirs += "src/mantis/java"
+                manifest.srcFile "src/mantis/AndroidManifest.xml"
+            }
+        }
+    }
+}
+
+dependencies {
+    implementation "com.facebook.react:react-native:+" // react-android, resolved by the RN Gradle plugin
+}
