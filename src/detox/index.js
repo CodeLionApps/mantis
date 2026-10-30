@@ -1,7 +1,7 @@
 // Detox API on top of Mantis: replaces the element/by/waitFor/expect globals so existing Detox test files run
 // unchanged with Mantis doing the actions and assertions. Add to Jest's setupFilesAfterEnv:
-// require.resolve("@codelionapps/mantis/detox"). Detox itself still installs and launches the app; device.launchApp is
-// wrapped to wait for the Mantis agents of the new process.
+// require.resolve("@codelionapps/mantis/detox"). Detox itself still installs and launches the app; device.launchApp and
+// device.reloadReactNative are wrapped to wait for the Mantis agents of the new process / JS context.
 // Covers: by.id/text/label, withAncestor, atIndex, tap, replaceText, typeText, clearText, scroll, scrollTo,
 // getAttributes, toBeVisible/toExist/toHaveText (+ .not), waitFor(...).withTimeout(). See README.md for the limits.
 const { performance } = require("node:perf_hooks");
@@ -12,6 +12,9 @@ const mantisDevice = require("../device");
 // short grace instead. Helpers like isVisible() (try/catch around expect) cost this much when the answer is "no".
 const EXPECT_TIMEOUT = Number(process.env.MANTIS_EXPECT_TIMEOUT) || 1000;
 
+// the worker, not the globals: works with exposeGlobals: false, and require("detox") reads element/expect/... off it
+const { worker } = mantisDevice.requireDetox("detox/internals");
+const device = mantisDevice.detoxDevice("the Detox device");
 const ios = device.getPlatform() === "ios";
 const app = new App(PORT, device.getPlatform());
 beforeAll(async () => {
@@ -19,11 +22,16 @@ beforeAll(async () => {
   mantisDevice.reversePort(PORT);
   // MANTIS_NO_IDLE: Mantis starts the app itself (src/device launchApp), nothing waits for Detox's "app idle"
   const launch = process.env.MANTIS_NO_IDLE ? mantisDevice.launchApp : device.launchApp.bind(device);
-  device.launchApp = (params = {}) =>
+  // same signature as Detox (params, bundleId); relaunch keeps the connections when only the running app was
+  // brought to the foreground (newInstance: false)
+  device.launchApp = (params = {}, ...rest) =>
     app.relaunch(() =>
-      // iOS simulators share the Mac's localhost: tell the agents which port this runner listens on
-      launch(ios ? { ...params, launchArgs: { ...params.launchArgs, mantisPort: PORT } } : params),
+      // iOS simulators share the Mac's localhost: tell the agents this runner's port and token
+      launch(ios ? { ...params, launchArgs: { ...params.launchArgs, ...app.launchArgs } } : params, ...rest),
     );
+  // a reload starts a new JS context: the next step waits for its agent instead of hitting the dying one
+  const reload = device.reloadReactNative.bind(device);
+  device.reloadReactNative = (...args) => app.reloadJs(() => reload(...args));
 });
 afterAll(() => app.close());
 
@@ -149,9 +157,13 @@ const waitFor = (el, negate = false) => {
   };
 };
 
-Object.assign(global, {
+const api = {
   by,
   element: (m) => new Element(m),
   expect: (el) => assertions(el, false, EXPECT_TIMEOUT),
   waitFor,
-});
+};
+// require("detox") (its facade reads these off the worker on every call) and, when Detox exposes them, the globals.
+// Not the globals otherwise: global expect would be Jest's.
+Object.assign(worker, api);
+if (global.device === device) Object.assign(global, api);

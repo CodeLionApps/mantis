@@ -1,7 +1,20 @@
 // Mantis native agent as an RN library (autolinked). The agent's sources and its ContentProvider are compiled in only
 // when MANTIS_E2E=1 is set for the Gradle build; otherwise the library is just the empty MantisPackage (autolinking
 // needs a ReactPackage) and the app contains no agent.
-def mantisE2E = System.getenv("MANTIS_E2E") == "1"
+def mantisEnv = System.getenv("MANTIS_E2E")
+if (mantisEnv != null && !(mantisEnv in ["", "0", "1"])) {
+    throw new GradleException("MANTIS_E2E must be 1 (agent) or 0/unset (no agent), got '${mantisEnv}'")
+}
+def mantisE2E = mantisEnv == "1"
+
+// An app bundle (.aab) is what goes to Play: refuse to build one with the agent in it, e.g. when MANTIS_E2E=1 leaked
+// into a release job. ponytail: a release .apk uploaded by hand is not caught here; scripts/check-release.sh is.
+if (mantisE2E) {
+    gradle.taskGraph.whenReady { graph ->
+        def bundle = graph.allTasks.find { it.name ==~ /package\w*Bundle/ }
+        if (bundle) throw new GradleException("MANTIS_E2E=1 in an app bundle build (${bundle.path}): the Mantis agent must never ship")
+    }
+}
 
 apply plugin: "com.android.library"
 // AGP 9 has built-in Kotlin; older AGP or android.builtInKotlin=false needs the plugin

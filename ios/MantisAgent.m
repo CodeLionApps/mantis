@@ -2,19 +2,45 @@
 // src/runner.
 //
 // Compiled in only with MANTIS_E2E=1 in the build environment (mantis.podspec defines MANTIS_E2E_$(MANTIS_E2E), so only
-// that build gets MANTIS_E2E_1). Every other build compiles this file to nothing.
-// ponytail: private UIKit/IOKit API (touch synthesis) must never reach the App Store; the define is the only guard.
+// that build gets MANTIS_E2E_1) and only for the simulator. Every other build compiles this file to nothing.
+// Private UIKit/IOKit API (touch synthesis) must never reach the App Store: App Store binaries are device builds, and a
+// device build with MANTIS_E2E=1 (e.g. the variable leaked into a release job) fails to compile instead.
 //
 // Passive until a runner listens: dials ws://localhost:<port> (simulators share the Mac's localhost; port: launch
 // argument -mantisPort N, default 9123), retries every 2 s. Own socket, independent of the JS thread. All view work on
 // the main thread. Coordinates are points (= JS units).
-#ifdef MANTIS_E2E_1
+#import <TargetConditionals.h>
+// mantis.podspec always defines exactly one MANTIS_E2E_<value>: unset gives MANTIS_E2E_, so any other value (true,
+// yes, "1 ") is a typo that would silently build without the agent
+#if !defined(MANTIS_E2E_) && !defined(MANTIS_E2E_0) && !defined(MANTIS_E2E_1)
+#error "MANTIS_E2E must be 1 (agent) or 0/unset (no agent)"
+#endif
+#if defined(MANTIS_E2E_1) && !TARGET_OS_SIMULATOR
+#error "MANTIS_E2E=1 in a device build: the Mantis agent is for simulator E2E builds only and must never ship"
+#endif
+#if defined(MANTIS_E2E_1) && TARGET_OS_SIMULATOR
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 
-static UITouch *_touch; // synthesized finger; one is enough for tap/scroll
+static UITouch *_touch; // synthesized finger between Began and Ended/Cancelled; nil = no gesture in progress
+static NSUInteger _gestureId; // bumped by every gesture, so callbacks of an earlier one can tell they're stale
+
+// Every callback that answers an RPC runs through this: an exception (private API changed, view gone, ...) becomes the
+// RPC's error instead of killing the app and with it the whole E2E session.
+static void MantisGuard(void (^done)(id), void (^body)(void)) {
+  @try { body(); } @catch (NSException *e) { done(e); }
+}
+
+// RN component views (Fabric, all RCTViewComponentView subclasses): their tag is the React tag. Any other view may set
+// tag too (plain UIKit API), so only these count. nil protocol (renamed in some RN version): every view counts.
+static BOOL isRN(UIView *v) {
+  static Protocol *proto;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{ proto = NSProtocolFromString(@"RCTComponentViewProtocol"); });
+  return !proto || [v conformsToProtocol:proto];
+}
 
 // CADisplayLink target that runs a block (the link retains it; invalidating the link frees both)
 @interface MantisBlockTarget : NSObject
@@ -40,6 +66,10 @@ static UIResponder *MantisFirstResponder(void) {
 - (void)synth:(UITouchPhase)phase at:(CGPoint)p;
 @end
 
+static NSException *MantisError(NSString *reason) {
+  return [NSException exceptionWithName:@"MantisAgent" reason:reason userInfo:nil];
+}
+
 @implementation MantisAgent {
   NSURLSessionWebSocketTask *_ws;
 }
@@ -47,6 +77,8 @@ static UIResponder *MantisFirstResponder(void) {
 static MantisAgent *shared;
 
 + (void)load {
+  // app extensions and logic test bundles load this binary too (use_frameworks!): no UIApplication there
+  if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) return;
   dispatch_async(dispatch_get_main_queue(), ^{
     shared = [MantisAgent new];
     [shared connect];
@@ -54,11 +86,15 @@ static MantisAgent *shared;
 }
 
 - (void)connect {
-  NSInteger port = [NSUserDefaults.standardUserDefaults integerForKey:@"mantisPort"] ?: 9123;
+  // launch arguments only (-mantisPort N -mantisToken T), not values the app may have persisted under the same keys
+  NSDictionary *args = [NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain];
+  NSInteger port = [args[@"mantisPort"] integerValue] ?: 9123;
+  id token = [args[@"mantisToken"] isKindOfClass:NSString.class] ? args[@"mantisToken"] : NSNull.null;
   NSString *url = [NSString stringWithFormat:@"ws://localhost:%ld/?role=native", (long)port];
   _ws = [NSURLSession.sharedSession webSocketTaskWithURL:[NSURL URLWithString:url]];
   [_ws resume];
-  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios"}}];
+  // v: src/runner PROTOCOL; token: proves to the runner that it launched this app (simulators share localhost)
+  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @1, @"token": token}}];
   [self receive];
 }
 
@@ -80,15 +116,33 @@ static MantisAgent *shared;
       });
       return;
     }
-    NSDictionary *msg = [NSJSONSerialization JSONObjectWithData:[m.string dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil];
+    // validate before use: a binary / non-JSON / id-less frame has nothing to answer
+    id msg = m.type == NSURLSessionWebSocketMessageTypeString
+      ? [NSJSONSerialization JSONObjectWithData:[m.string dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
+    id mid = [msg isKindOfClass:NSDictionary.class] ? msg[@"id"] : nil;
+    if (![mid isKindOfClass:NSNumber.class]) {
+      NSLog(@"[Mantis] ignoring a frame that is not an RPC request");
+      [self receive];
+      return;
+    }
+    id method = msg[@"method"], params = msg[@"params"];
     dispatch_async(dispatch_get_main_queue(), ^{
-      @try {
-        [self handle:msg[@"method"] params:msg[@"params"] ?: @{} done:^(id result) {
-          [self send:@{@"id": msg[@"id"], @"result": result ?: [NSNull null]}];
-        }];
-      } @catch (NSException *e) {
-        [self send:@{@"id": msg[@"id"], @"error": @{@"message": e.description}}];
-      }
+      // exactly one reply per request, whatever path (sync, async callback, exception) gets there first
+      __block BOOL replied = NO;
+      void (^done)(id) = ^(id result) {
+        if (replied) return;
+        replied = YES;
+        NSDictionary *out = [result isKindOfClass:NSException.class]
+          ? @{@"id": mid, @"error": @{@"message": [NSString stringWithFormat:@"%@: %@", [result name], [result reason]]}}
+          : @{@"id": mid, @"result": result ?: NSNull.null};
+        if (![NSJSONSerialization isValidJSONObject:out]) // NaN / inf would make NSJSONSerialization throw
+          out = @{@"id": mid, @"error": @{@"message": [NSString stringWithFormat:@"%@: result not JSON-serializable", method]}};
+        [self send:out];
+      };
+      MantisGuard(done, ^{
+        if (![method isKindOfClass:NSString.class]) [NSException raise:@"MantisAgent" format:@"no method"];
+        [self handle:method params:[params isKindOfClass:NSDictionary.class] ? params : @{} done:done];
+      });
     });
     [self receive];
   }];
@@ -105,9 +159,15 @@ static MantisAgent *shared;
   return all;
 }
 
+static UIView *findTagged(UIView *v, NSInteger tag) {
+  if (v.tag == tag && isRN(v)) return v;
+  for (UIView *c in v.subviews) { UIView *f = findTagged(c, tag); if (f) return f; }
+  return nil;
+}
+
 - (UIView *)viewForTag:(NSInteger)tag {
   if (tag <= 0) return nil;
-  for (UIWindow *w in self.windows) { UIView *v = [w viewWithTag:tag]; if (v) return v; }
+  for (UIWindow *w in self.windows) { UIView *v = findTagged(w, tag); if (v) return v; }
   return nil;
 }
 
@@ -182,7 +242,7 @@ static BOOL sameRect(CGRect a, CGRect b) { // any sub-point change = still movin
 
 static NSArray *tagChain(UIView *v) {
   NSMutableArray *a = [NSMutableArray array];
-  for (; v; v = v.superview) if (v.tag > 0) [a addObject:@(v.tag)];
+  for (; v; v = v.superview) if (v.tag > 0 && isRN(v)) [a addObject:@(v.tag)];
   return a;
 }
 
@@ -213,16 +273,52 @@ static NSString *transitionReason(UIWindow *w) {
   return nil;
 }
 
-// Run block after n display frames (vsync-aligned, unlike a timer).
-- (void)afterFrames:(int)n do:(void (^)(void))block {
+// Run block after n display frames (vsync-aligned, unlike a timer); an exception in it answers the RPC (done).
+- (void)afterFrames:(int)n done:(void (^)(id))done do:(void (^)(void))block {
   __block int left = n;
   __block CADisplayLink *link = [CADisplayLink displayLinkWithTarget:[MantisBlockTarget withBlock:^{
     if (--left > 0) return;
     [link invalidate];
     link = nil;
-    block();
+    MantisGuard(done, block);
   }] selector:@selector(fire)];
   [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
+  // the display link stops while the app is in the background: answer instead of never. 2 s: DetoxSync counts
+  // main-queue dispatch_after up to 1.5 s as "app busy"
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    if (!link) return;
+    [link invalidate];
+    link = nil;
+    done(MantisError(@"no display frame for 2 s (app in the background?)"));
+  });
+}
+
+// Finger down at p (screen points). One gesture at a time. The returned done ends the RPC: on an error, or when the
+// gesture is still down after 10 s (display link stopped: app in the background), it cancels the touch first, so UIKit
+// never keeps a stale finger that turns the next tap into a two-finger gesture. 10 s: a scroll is ~10 frames, seconds
+// on a starved CI machine, and it must fire before the runner's 15 s RPC timeout.
+- (void (^)(id))fingerDown:(CGPoint)p done:(void (^)(id))done {
+  if (_touch) [NSException raise:@"MantisAgent" format:@"another gesture is in progress (actions on one app run one at a time)"];
+  NSUInteger gid = ++_gestureId;
+  void (^end)(id) = ^(id r) {
+    if (gid == _gestureId && _touch) [self cancelTouch];
+    done(r);
+  };
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    end(MantisError(@"gesture still down after 10 s, cancelled"));
+  });
+  @try { [self synth:UITouchPhaseBegan at:p]; } @catch (NSException *e) { end(e); @throw; }
+  return end;
+}
+
+// Lifts the finger with Cancelled instead of Ended: UIKit and RN drop the gesture. Never throws.
+- (void)cancelTouch {
+  @try {
+    CGPoint p = [_touch locationInView:nil];
+    CGPoint o = _touch.window.frame.origin;
+    [self synth:UITouchPhaseCancelled at:CGPointMake(p.x + o.x, p.y + o.y)];
+  } @catch (NSException *ignored) {}
+  _touch = nil;
 }
 
 - (void)handle:(NSString *)method params:(NSDictionary *)p done:(void (^)(id))done {
@@ -243,14 +339,16 @@ static NSString *transitionReason(UIWindow *w) {
     if (!v || !shown(v)) return done(@{@"ok": @NO, @"reason": @"not mounted natively"});
     CGRect r1 = presentedRect(v);
     // 2 vsyncs: RN's native-driver display link has stepped at least once in between, whatever the callback order
-    [self afterFrames:2 do:^{
+    [self afterFrames:2 done:done do:^{
       if (!shown(v)) return done(@{@"ok": @NO, @"reason": @"not mounted natively"});
       CGRect r2 = presentedRect(v);
       if (!sameRect(r1, r2)) return done(@{@"ok": @NO, @"reason": @"not stable", @"r1": R(r1), @"r2": R(r2)});
       CGPoint c = CGPointMake(CGRectGetMidX(r2), CGRectGetMidY(r2));
       if (!CGRectContainsPoint(viewport(v), c)) {
         UIScrollView *sv = nearestScroller(v);
-        CGFloat delta = sv ? c.y - CGRectGetMidY(CGRectIntersection(viewport(sv), presentedRect(sv))) : 0;
+        CGRect svVisible = sv ? CGRectIntersection(viewport(sv), presentedRect(sv)) : CGRectNull;
+        // the scroller itself off screen (nested in another one): no delta to give (CGRectNull's mid is inf)
+        CGFloat delta = CGRectIsNull(svVisible) ? 0 : c.y - CGRectGetMidY(svVisible);
         return done(@{@"ok": @NO, @"reason": @"not in viewport", @"rect": R(r2), @"delta": @(delta)});
       }
       NSString *busy = transitionReason(v.window);
@@ -268,10 +366,12 @@ static NSString *transitionReason(UIWindow *w) {
     // finger down, held 30 ms, then up. 1 frame is 8 ms at 120 Hz and iOS 26 UISwitch then misses the tap (spike:
     // 1 frame 2/6 toggles, >= 16 ms 12/12), so hold for time, not frames.
     CGPoint pt = CGPointMake([p[@"x"] doubleValue], [p[@"y"] doubleValue]);
-    [self synth:UITouchPhaseBegan at:pt];
+    void (^end)(id) = [self fingerDown:pt done:done];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
-      [self synth:UITouchPhaseEnded at:pt];
-      done(@{@"ok": @YES});
+      MantisGuard(end, ^{
+        [self synth:UITouchPhaseEnded at:pt];
+        end(@{@"ok": @YES});
+      });
     });
   } else if ([method isEqualToString:@"Input.scroll"]) {
     // Scroll = a real drag on the scroll view, same recipe as Android: down, eased moves (one per frame), finger held
@@ -282,33 +382,49 @@ static NSString *transitionReason(UIWindow *w) {
     // JS commit can be ~1 frame ahead of the native mount: not ready yet, the runner retries next frame
     if (!sv || !shown(sv)) return done(@{@"ok": @NO, @"reason": @"scroll view not mounted natively"});
     CGRect vp = CGRectIntersection(viewport(sv), presentedRect(sv));
+    if (CGRectIsEmpty(vp)) return done(@{@"ok": @NO, @"reason": @"scroll view not on screen"});
     const CGFloat slop = 10; // UIPanGestureRecognizer hysteresis
     double want = [p[@"dy"] doubleValue];
+    // dy 0 would put down and up on one point: a tap on whatever is under it
+    if (want == 0) return done(@{@"ok": @NO, @"reason": @"dy is 0, nothing to scroll"});
+    CGPoint startOffset = sv.contentOffset;
     double amount = MIN(fabs(want) + slop, vp.size.height * 0.8) * (want < 0 ? -1 : 1);
     CGPoint a = CGPointMake(CGRectGetMidX(vp), CGRectGetMidY(vp) + amount / 2);
     CGPoint b = CGPointMake(a.x, CGRectGetMidY(vp) - amount / 2);
     if (![tagChain([self hitView:a]) containsObject:@(host.tag)])
       return done(@{@"ok": @NO, @"reason": @"scroll view covered at start point"});
-    [self synth:UITouchPhaseBegan at:a];
-    int moves = [p[@"moves"] intValue] ?: 6;
+    void (^end)(id) = [self fingerDown:a done:done];
+    NSUInteger gid = _gestureId;
+    int moves = MAX([p[@"moves"] intValue], 0) ?: 6;
     __block int frame = 0;
     __block CFTimeInterval lastMove = CACurrentMediaTime();
     __block CADisplayLink *link = [CADisplayLink displayLinkWithTarget:[MantisBlockTarget withBlock:^{
-      frame++;
-      CFTimeInterval now = CACurrentMediaTime();
-      if (frame <= moves) {
-        double k = 1 - (1 - (double)frame / moves) * (1 - (double)frame / moves); // ease-out
-        [self synth:UITouchPhaseMoved at:CGPointMake(a.x, a.y + (b.y - a.y) * k)];
-        lastMove = now;
-      } else if (now - lastMove < 0.11) {
-        [self synth:UITouchPhaseMoved at:b];
-      } else {
+      // cancelled (error, watchdog): stop
+      if (gid != _gestureId || !_touch) {
         [link invalidate];
         link = nil;
-        [self synth:UITouchPhaseEnded at:b];
-        // 2 frames: lets the scroll events of the release reach the JS queue before the runner queries again
-        [self afterFrames:2 do:^{ done(@{@"ok": @YES, @"pt": @(amount)}); }];
+        return;
       }
+      MantisGuard(end, ^{
+        frame++;
+        CFTimeInterval now = CACurrentMediaTime();
+        if (frame <= moves) {
+          double k = 1 - (1 - (double)frame / moves) * (1 - (double)frame / moves); // ease-out
+          [self synth:UITouchPhaseMoved at:CGPointMake(a.x, a.y + (b.y - a.y) * k)];
+          lastMove = now;
+        } else if (now - lastMove < 0.11) {
+          [self synth:UITouchPhaseMoved at:b];
+        } else {
+          [link invalidate];
+          link = nil;
+          [self synth:UITouchPhaseEnded at:b];
+          // 2 frames: lets the scroll events of the release reach the JS queue before the runner queries again
+          // moved: NO = the drag happened but the content didn't move (at its end), the runner stops scrolling
+          [self afterFrames:2 done:end do:^{
+            end(@{@"ok": @YES, @"pt": @(amount), @"moved": @(!CGPointEqualToPoint(startOffset, sv.contentOffset))});
+          }];
+        }
+      });
     }] selector:@selector(fire)];
     [link addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
   } else if ([method isEqualToString:@"Input.scrollToEdge"]) {
@@ -321,7 +437,8 @@ static NSString *transitionReason(UIWindow *w) {
     if ([edge isEqualToString:@"bottom"]) o.y = MAX(o.y, sv.contentSize.height + in.bottom - sv.bounds.size.height);
     if ([edge isEqualToString:@"right"]) o.x = MAX(o.x, sv.contentSize.width + in.right - sv.bounds.size.width);
     [sv setContentOffset:o animated:NO];
-    done(@{@"ok": @YES});
+    // 2 frames, like Input.scroll: the scroll events reach the JS queue before the runner queries again
+    [self afterFrames:2 done:done do:^{ done(@{@"ok": @YES}); }];
   } else if ([method isEqualToString:@"Input.typeText"]) {
     // Text through UITextInput on the first responder (the keyboard's own path: insertText:), not by setting props.
     // replace = select all first (Playwright fill).
@@ -388,8 +505,10 @@ static IOHIDEventRef mantisHIDEvent(CGPoint p, UITouchPhase phase) {
     AppendEvent = dlsym(RTLD_DEFAULT, "IOHIDEventAppendEvent");
     SetInt = dlsym(RTLD_DEFAULT, "IOHIDEventSetIntegerValueWithOptions");
   }
+  if (!CreateHand || !CreateFinger || !AppendEvent || !SetInt)
+    [NSException raise:@"MantisAgent" format:@"touch synthesis unavailable: IOHIDEvent symbols missing on this iOS version"];
   uint64_t now = mach_absolute_time();
-  Boolean touching = phase != UITouchPhaseEnded;
+  Boolean touching = phase != UITouchPhaseEnded && phase != UITouchPhaseCancelled;
   IOHIDEventRef hand = CreateHand(kCFAllocatorDefault, now, kDigitizerHand, 0, 0, kEvTouch, 0, 0, 0, 0, 0, 0, 0, true, 0);
   SetInt(hand, kFieldDisplayIntegrated, 1, 0xF0000000);
   IOHIDEventRef finger = CreateFinger(kCFAllocatorDefault, now, 1, 2, phase == UITouchPhaseMoved ? kEvPosition : (kEvRange | kEvTouch),
@@ -401,10 +520,17 @@ static IOHIDEventRef mantisHIDEvent(CGPoint p, UITouchPhase phase) {
 }
 
 @implementation MantisAgent (Synth)
-// p in screen points; the touch belongs to the topmost window that takes it at began (Modal, alert, ...)
+// p in screen points; the touch belongs to the topmost window that takes it at began (Modal, alert, ...).
+// One finger: Began starts a gesture, Ended / Cancelled finishes it; anything out of order is an error, not a touch
+// sent to a stale view or window. On an exception _touch stays set, so fingerDown's done cancels it (UIKit may have
+// the touch already).
 - (void)synth:(UITouchPhase)phase at:(CGPoint)sp {
-  if (phase == UITouchPhaseBegan) {
+  BOOL began = phase == UITouchPhaseBegan;
+  if (began && _touch) [NSException raise:@"MantisAgent" format:@"another gesture is in progress"];
+  if (!began && !_touch) [NSException raise:@"MantisAgent" format:@"no gesture in progress"];
+  if (began) {
     UIView *hit = [self hitView:sp];
+    if (!hit) [NSException raise:@"MantisAgent" format:@"no window takes a touch at (%.1f, %.1f)", sp.x, sp.y];
     UIWindow *w = hit.window;
     CGPoint p = CGPointMake(sp.x - w.frame.origin.x, sp.y - w.frame.origin.y);
     _touch = [UITouch new];
@@ -429,6 +555,7 @@ static IOHIDEventRef mantisHIDEvent(CGPoint p, UITouchPhase phase) {
   [e _addTouch:_touch forDelayedDelivery:NO];
   CFRelease(hid);
   [UIApplication.sharedApplication sendEvent:e];
+  if (phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled) _touch = nil; // don't keep the view / window alive
 }
 @end
 #endif

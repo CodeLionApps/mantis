@@ -6,7 +6,9 @@
 const path = require("node:path");
 
 function withMantis(config) {
-  if (process.env.MANTIS_E2E !== "1") return config;
+  const env = process.env.MANTIS_E2E;
+  if (env && env !== "0" && env !== "1") throw new Error(`MANTIS_E2E must be 1 (agent) or 0/unset, got ${JSON.stringify(env)}`);
+  if (env !== "1") return config;
   const before = config.serializer.getModulesRunBeforeMainModule("");
   // read by src/metro/transformer.js in Metro's transform workers, which inherit this env
   process.env.MANTIS_UPSTREAM_TRANSFORMER = config.transformer.babelTransformerPath; // set by RN's default config

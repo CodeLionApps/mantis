@@ -143,15 +143,21 @@ function descendantTags(fiber) {
 }
 
 let ReactFabric;
-function rectOf(fiber) {
+function loadFabric() {
   if (!ReactFabric) {
     const m = require("react-native/Libraries/Renderer/shims/ReactFabric");
     ReactFabric = m.default || m;
   }
-  const r =
-    ReactFabric.getPublicInstanceFromInternalInstanceHandle(
-      fiber,
-    ).getBoundingClientRect();
+  return ReactFabric;
+}
+function rectOf(fiber) {
+  const el = loadFabric().getPublicInstanceFromInternalInstanceHandle(fiber);
+  // DOM Node APIs on refs (ReactNativeElement); older RN versions hand out an instance without them
+  if (typeof el?.getBoundingClientRect !== "function")
+    throw new Error(
+      "this React Native version has no getBoundingClientRect on host instances (DOM Node APIs); Mantis is tested on RN 0.88",
+    );
+  const r = el.getBoundingClientRect();
   return { x: r.x, y: r.y, width: r.width, height: r.height };
 }
 
@@ -197,14 +203,33 @@ function isMounted(tag) {
       if (nativeTagOf(f) === tag) return true;
   return false;
 }
-require("react-native/Libraries/Core/RawEventEmitter").default.addListener(
-  "topTouchStart",
-  (e) =>
-    send({
-      method: "Input.touchStart",
-      params: { seq: ++touchSeq, mounted: isMounted(e.nativeEvent.target) },
-    }),
-);
+let unsupported = null; // why this RN version can't be driven, reported in hello
+try {
+  require("react-native/Libraries/Core/RawEventEmitter").default.addListener(
+    "topTouchStart",
+    (e) =>
+      send({
+        method: "Input.touchStart",
+        params: { seq: ++touchSeq, mounted: isMounted(e.nativeEvent.target) },
+      }),
+  );
+} catch (e) {
+  unsupported = "RawEventEmitter: " + e.message;
+}
+
+// RN internals the agent relies on (no public API exists for them). One missing = a React Native version Mantis
+// doesn't support: the runner fails with this instead of finding 0 nodes forever. Checked after the entry module
+// ran (the renderer is loaded by then).
+function checkInternals() {
+  if (unsupported) return unsupported;
+  try {
+    if (typeof loadFabric().getPublicInstanceFromInternalInstanceHandle !== "function")
+      return "ReactFabric.getPublicInstanceFromInternalInstanceHandle missing";
+  } catch (e) {
+    return "ReactFabric: " + e.message;
+  }
+  return null;
+}
 
 // ---------- RPC ----------
 const handlers = {
@@ -216,19 +241,23 @@ const handlers = {
 // Runner port: 9123; on iOS the launch argument `-mantisPort N` (NSUserDefaults argument domain, read through RN
 // Settings) overrides it, since simulators share the Mac's localhost. Android always dials 9123 on the device; the
 // runner maps it to its own port with adb reverse.
-let runnerUrl;
-function getRunnerUrl() {
-  if (runnerUrl) return runnerUrl;
-  let port = 9123;
+// The token (launch argument -mantisToken, iOS only) proves to the runner that this app was launched by it.
+let launchArgs;
+function getLaunchArgs() {
+  if (launchArgs) return launchArgs;
+  launchArgs = { port: 9123, token: null };
   try {
     if (require("react-native").Platform.OS === "ios") {
       const m = require("react-native/Libraries/Settings/Settings"); // Android: a fallback that only warns
-      port = Number((m.default || m).get("mantisPort")) || 9123;
+      const settings = m.default || m;
+      launchArgs.port = Number(settings.get("mantisPort")) || 9123;
+      launchArgs.token = settings.get("mantisToken") || null;
     }
   } catch (e) {}
-  return (runnerUrl = `ws://localhost:${port}/?role=js`);
+  return launchArgs;
 }
 
+const PROTOCOL = 1; // src/runner PROTOCOL
 let ws = null;
 let retries = 0;
 const CTX = Math.random().toString(36).slice(2); // JS context identity
@@ -237,18 +266,36 @@ function send(msg) {
 }
 
 function connect() {
-  ws = new WebSocket(getRunnerUrl());
+  const { port, token } = getLaunchArgs();
+  ws = new WebSocket(`ws://localhost:${port}/?role=js`);
   ws.onopen = () => {
-    retries = 0;
     // react-native is loaded by now (connect runs after the entry module), not when this file is evaluated
     const platform = require("react-native").Platform.OS;
     send({
       method: "Agent.hello",
-      params: { role: "js", platform, ctx: CTX, commitId },
+      params: {
+        role: "js",
+        platform,
+        v: PROTOCOL,
+        token,
+        error: checkInternals(),
+        ctx: CTX,
+        commitId,
+      },
     });
   };
   ws.onmessage = async (e) => {
-    const { id, method, params } = JSON.parse(e.data);
+    let msg;
+    try {
+      msg = JSON.parse(e.data);
+    } catch (err) {
+      return; // not a runner frame; nothing to answer
+    }
+    const { id, method, params } = msg || {};
+    if (id == null) return;
+    // a call = the runner accepted our hello; not on open: a runner that refuses us (other platform / token) would
+    // otherwise get an immediate reconnect after every refusal, a busy loop
+    retries = 0;
     try {
       const h = handlers[method];
       if (!h) throw new Error("unknown method " + method);
