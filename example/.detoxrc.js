@@ -10,8 +10,9 @@ module.exports = {
       type: 'android.apk',
       binaryPath: `${apk}/release/app-release.apk`,
       testBinaryPath: `${apk}/androidTest/release/app-release-androidTest.apk`,
+      // --rerun: the JS agent lives in ../src (file: link), outside what Gradle watches for the bundle task
       build:
-        'cd android && MANTIS_E2E=1 ./gradlew assembleRelease :app:assembleAndroidTest -DtestBuildType=release',
+        'cd android && MANTIS_E2E=1 ./gradlew :app:createBundleReleaseJsAndAssets --rerun assembleRelease :app:assembleAndroidTest -DtestBuildType=release',
     },
     'ios.release': {
       type: 'ios.app',

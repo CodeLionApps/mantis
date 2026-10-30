@@ -1,13 +1,21 @@
 // Mantis runner: a WebSocket server both in-app agents dial into, plus Playwright-style locators with auto-wait.
 // Runs inside Detox's Jest environment: Detox still installs and launches the app (device.launchApp, permissions,
 // launch args); Mantis does the actions and assertions instead of element()/expect(). See README.md.
+const { randomUUID } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
 const { WebSocketServer } = require("ws");
 
 // Host port. iOS agents dial it directly (launch arg mantisPort, which src/detox adds); Android agents always dial
-// 9123 on the device and adb reverse maps that to this port (see src/device).
-const PORT = Number(process.env.MANTIS_PORT) || 9123;
+// 9123 on the device and adb reverse maps that to this port (see src/device). One port per Jest worker, so parallel
+// workers (one device each) don't collide: MANTIS_PORT is the first worker's.
+const PORT =
+  (Number(process.env.MANTIS_PORT) || 9123) +
+  (Number(process.env.JEST_WORKER_ID) || 1) -
+  1;
 const DEFAULT_TIMEOUT = 10000;
+const CONNECT_TIMEOUT = 15000;
+// bumped on incompatible changes; agents send it in Agent.hello (an app built with another Mantis version)
+const PROTOCOL = 1;
 
 /** Detox's toBeVisible threshold (≥ 75% of the view shown), for toBeInViewport. */
 const DETOX_VISIBLE = Object.freeze({ ratio: 0.75 });
@@ -24,7 +32,8 @@ const timing = (step, t0, tLast) => {
   require("node:fs").appendFileSync(
     process.env.MANTIS_TIMING,
     JSON.stringify({
-      test: global[Symbol.for("$$jest-matchers-object")].state.currentTestName,
+      // Jest's current test, when run under Jest
+      test: global[Symbol.for("$$jest-matchers-object")]?.state.currentTestName,
       step,
       total: now - t0,
       last: now - tLast,
@@ -41,67 +50,128 @@ const trace = (row) =>
   );
 
 class Peer {
-  constructor(platform) {
+  constructor(role, platform, token) {
+    this.role = role;
     this.platform = platform;
+    this.token = token;
     this.ws = null;
     this.seq = 0;
     this.pending = new Map();
     this.hello = null;
+    this.rejected = null; // why the last hello was refused, for the "not connected" error
     this.waiters = [];
   }
 
-  // a socket becomes current only once it says hello
+  get connected() {
+    return !!this.hello && this.ws?.readyState === 1;
+  }
+
+  // A socket becomes current only once its hello checks out; only the current socket may answer RPCs or send events.
   attach(ws) {
+    // a bad frame (invalid UTF-8, RSV bits) emits error, then close; unhandled, it would kill the test process
+    ws.on("error", (e) =>
+      trace({ event: "socket error", role: this.role, message: e.message }),
+    );
+    // agents say hello right after connecting; a socket that doesn't is not one of them
+    const helloTimer = setTimeout(() => ws !== this.ws && ws.terminate(), 5000).unref();
     ws.on("message", (data) => {
-      const msg = JSON.parse(data);
+      let msg;
+      try {
+        msg = JSON.parse(data);
+      } catch {
+        return ws.close(1007, "not JSON");
+      }
+      if (msg?.method === "Agent.hello") return this.greet(ws, msg.params || {});
+      if (ws !== this.ws) return;
       if (msg.id != null) {
         const p = this.pending.get(msg.id);
         if (!p) return;
         this.pending.delete(msg.id);
-        if (msg.error) p.reject(new Error(msg.error.message));
+        if (msg.error) p.reject(new Error(String(msg.error.message ?? JSON.stringify(msg.error))));
         else p.resolve(msg.result);
-      } else if (msg.method === "Agent.hello") {
-        // iOS simulators share the Mac's localhost, so a Mantis build running there can dial in too
-        if (msg.params.platform !== this.platform) return ws.close();
-        this.ws = ws;
-        this.hello = msg.params;
-        this.waiters.splice(0).forEach((w) => w());
-      } else {
+      } else if (typeof msg.method === "string") {
         trace({ event: msg.method, params: msg.params });
         this.onEvent?.(msg);
       }
     });
     ws.on("close", () => {
+      clearTimeout(helloTimer);
       if (this.ws !== ws) return;
       this.hello = null;
-      for (const p of this.pending.values())
-        p.reject(new Error("agent disconnected"));
-      this.pending.clear();
+      this.failPending("agent disconnected");
     });
   }
 
-  ready() {
-    return this.hello && this.ws?.readyState === 1
-      ? Promise.resolve()
-      : new Promise((r) => this.waiters.push(r));
+  greet(ws, p) {
+    const why =
+      p.role !== this.role
+        ? `role ${p.role} on the ${this.role} socket`
+        : // iOS simulators share the Mac's localhost, so another platform's Mantis build can dial in too
+          p.platform !== this.platform
+          ? `platform ${p.platform}, runner ${this.platform}`
+          : p.v !== PROTOCOL
+            ? `protocol v${p.v}, runner v${PROTOCOL}: rebuild the app with this Mantis version`
+            : p.error
+              ? p.error
+              : // ...and other runners' apps: iOS agents must echo this runner's token (launch arg mantisToken)
+                this.platform === "ios" && p.token !== this.token
+                ? "wrong token: launch with the runner's launchArgs (app.launchArgs)"
+                : null;
+    if (why) {
+      this.rejected = `${this.role} agent rejected: ${why}`;
+      trace({ event: "hello rejected", role: this.role, why });
+      return ws.close(1008, why.slice(0, 120));
+    }
+    if (this.ws !== ws) this.failPending("agent reconnected");
+    this.ws = ws;
+    this.hello = p;
+    this.rejected = null;
+    this.onHello?.(p);
+    this.waiters.splice(0).forEach((w) => w());
   }
 
-  call(method, params = {}) {
-    if (!this.hello)
-      return Promise.reject(new Error(`agent not connected: ${method}`));
+  failPending(reason) {
+    for (const p of this.pending.values()) p.reject(new Error(reason));
+    this.pending.clear();
+  }
+
+  /** Resolves once this agent is connected (e.g. reconnecting after a relaunch or a JS reload), else rejects. */
+  ready(timeout = CONNECT_TIMEOUT) {
+    if (this.connected) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const done = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+      const timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((w) => w !== done);
+        reject(
+          new Error(
+            `${this.role} agent not connected after ${timeout}ms` +
+              (this.rejected ? ` (${this.rejected})` : ""),
+          ),
+        );
+      }, timeout);
+      this.waiters.push(done);
+    });
+  }
+
+  async call(method, params = {}) {
+    if (!this.connected)
+      await this.ready().catch((e) => {
+        throw new Error(`${e.message}: ${method}`);
+      });
     const id = ++this.seq;
     const t0 = performance.now();
-    if (process.env.MANTIS_TRACE)
-      return this.raw(id, method, params).then((r) => {
-        trace({
-          method,
-          params,
-          dt: +(performance.now() - t0).toFixed(1),
-          result: r,
-        });
-        return r;
-      });
-    return this.raw(id, method, params);
+    const r = await this.raw(id, method, params);
+    trace({
+      method,
+      // typed text can be a password; the trace file is a CI artifact
+      params: params.text == null ? params : { ...params, text: `<${params.text.length} chars>` },
+      dt: +(performance.now() - t0).toFixed(1),
+      result: r,
+    });
+    return r;
   }
 
   raw(id, method, params) {
@@ -123,10 +193,12 @@ class Peer {
 class App {
   constructor(port = PORT, platform = "android") {
     this.port = port;
-    this.js = new Peer(platform);
-    this.native = new Peer(platform);
+    this.token = randomUUID();
+    this.js = new Peer("js", platform, this.token);
+    this.native = new Peer("native", platform, this.token);
     this.commitWaiters = [];
     this.touch = { seq: 0 }; // last touch start JS saw (Input.touchStart)
+    this.js.onHello = () => (this.touch = { seq: 0 }); // a new JS context counts touches from 0
     this.js.onEvent = (msg) => {
       if (msg.method === "Tree.committed")
         this.commitWaiters.splice(0).forEach((w) => w());
@@ -134,11 +206,23 @@ class App {
     };
   }
 
+  /** iOS launch args the agents need: simulators share the Mac's localhost, so this runner's port and token. */
+  get launchArgs() {
+    return { mantisPort: this.port, mantisToken: this.token };
+  }
+
   start() {
-    this.wss = new WebSocketServer({ port: this.port });
+    // loopback only: nothing else on the network may drive the app (Android reaches it through adb reverse)
+    this.wss = new WebSocketServer({ host: "127.0.0.1", port: this.port });
+    this.wss.on("error", (e) => trace({ event: "server error", message: e.message }));
     this.wss.on("connection", (ws, req) => {
       const role = new URL(req.url, "ws://x").searchParams.get("role");
-      (role === "js" ? this.js : this.native).attach(ws);
+      const peer = { js: this.js, native: this.native }[role];
+      if (!peer) {
+        ws.on("error", () => {});
+        return ws.close(1008, "unknown role");
+      }
+      peer.attach(ws);
     });
     return new Promise((resolve, reject) => {
       this.wss.once("listening", resolve);
@@ -152,35 +236,41 @@ class App {
     return new Promise((r) => this.wss.close(r));
   }
 
-  /** Runs a (re)launch, e.g. Detox's device.launchApp, and waits until both agents of the new process said hello. */
-  async relaunch(launch, { timeout = 15000 } = {}) {
-    this.js.hello = null;
-    this.native.hello = null;
-    this.touch = { seq: 0 };
+  /**
+   * Runs a (re)launch, e.g. Detox's device.launchApp, and waits until both agents of the new process said hello.
+   * A launch that only brings the running app to the foreground (Detox newInstance: false) keeps its connections.
+   */
+  async relaunch(launch, { timeout = CONNECT_TIMEOUT } = {}) {
+    const before = [this.js.ws, this.native.ws];
     const t0 = performance.now();
     await launch();
     timing("launch:started", t0, t0);
-    let handle;
-    const timer = new Promise((_, reject) => {
-      handle = setTimeout(
-        () =>
-          reject(
-            new Error(
-              `Mantis agents not connected ${timeout}ms after launch (js: ${!!this.js
-                .hello}, native: ${!!this.native.hello}). ` +
-                `Is this a Mantis build (MANTIS_E2E=1, withMantis() in metro.config.js) and is port ${this.port} reachable ` +
-                "from the device (Android: adb reverse)?",
-            ),
-          ),
-        timeout,
+    // let socket closes of a killed process land first (a launch made of sync execs blocks the event loop)
+    await sleep(50);
+    if (
+      this.js.connected &&
+      this.native.connected &&
+      this.js.ws === before[0] &&
+      this.native.ws === before[1]
+    )
+      return;
+    try {
+      await Promise.all([this.js.ready(timeout), this.native.ready(timeout)]);
+    } catch (e) {
+      throw new Error(
+        `Mantis agents not connected ${timeout}ms after launch (js: ${this.js.connected}, native: ${this.native.connected}): ` +
+          `${e.message}. Is this a Mantis build (MANTIS_E2E=1, withMantis() in metro.config.js) and is port ${this.port} ` +
+          "reachable from the device (Android: adb reverse)?",
       );
-    });
-    // cleared, so a finished run doesn't keep Jest alive for the rest of the timeout
-    await Promise.race([
-      Promise.all([this.js.ready(), this.native.ready()]),
-      timer,
-    ]).finally(() => clearTimeout(handle));
+    }
     timing("launch:agents", t0, t0);
+  }
+
+  /** Runs a JS reload (Detox device.reloadReactNative) and waits until the new JS context's agent said hello. */
+  async reloadJs(reload, { timeout = CONNECT_TIMEOUT } = {}) {
+    this.js.hello = null;
+    await reload();
+    await this.js.ready(timeout);
   }
 
   // After an action: let the app consume it before the next step. A tap that lands while JS is still handling the
@@ -193,21 +283,36 @@ class App {
     await sleep(16);
   }
 
-  // After a tap: did JS get its touch, on a view still mounted? Under load the touch can reach JS after settle's
-  // ping, so wait for it (bounded); none at all means RN dropped it natively.
-  async touchLanded(seq, timeout = 2000) {
+  // After a tap: the touch JS saw for it (the next one after seq), or null if none within timeout. Under load it can
+  // reach JS long after settle's ping (a stalled JS thread), so missing it early proves nothing. Any other count (a
+  // new JS context restarts at 0, a late touch of an earlier tap came first) can't be attributed: fail, never retry.
+  async touchAfter(seq, timeout) {
     const end = performance.now() + timeout;
-    while (this.touch.seq === seq && performance.now() < end)
+    for (;;) {
+      const t = this.touch;
+      if (t.seq === seq + 1) return t;
+      if (t.seq !== seq)
+        throw new Error(
+          `touch count went from ${seq} to ${t.seq} during one tap (JS reloaded, or a late touch of an earlier tap)`,
+        );
+      if (performance.now() > end) return null;
       await this.nextCommitOrFrame();
-    return this.touch.seq > seq && this.touch.mounted;
+    }
   }
 
   // retry pacing: next React commit or one frame, whichever first (not blind sleeps)
   nextCommitOrFrame() {
-    return Promise.race([
-      new Promise((r) => this.commitWaiters.push(r)),
-      sleep(16),
-    ]);
+    return new Promise((resolve) => {
+      const done = () => {
+        clearTimeout(timer);
+        // the frame won: don't leave this waiter for the next commit (60 a second pile up on a static screen)
+        const i = this.commitWaiters.indexOf(done);
+        if (i >= 0) this.commitWaiters.splice(i, 1);
+        resolve();
+      };
+      const timer = setTimeout(done, 16);
+      this.commitWaiters.push(done);
+    });
   }
 
   getByRole(role, { name } = {}) {
@@ -336,13 +441,10 @@ class Locator {
         if (c.ok) return { node: n, point: c.point, iter };
         if (focus && c.focusable) return { node: n, point: null, iter };
         reason = c.reason;
-        if (await this.scrollToward(n, c)) continue;
-        // soft keyboard over the target: dismiss it, as a user would
-        if (
-          c.hit?.covered === "keyboard" &&
-          (await this.app.native.call("Input.hideKeyboard")).ok
-        )
-          continue;
+        // soft keyboard over the target: dismiss it, as a user would. Either way the next check waits a frame
+        // (pacing below), so a scroll that didn't move anything can't spin RPC after RPC.
+        if (!(await this.scrollToward(n, c)) && c.hit?.covered === "keyboard")
+          await this.app.native.call("Input.hideKeyboard");
       }
       await this.app.nextCommitOrFrame();
     }
@@ -352,7 +454,7 @@ class Locator {
   }
 
   // Playwright's scrollIntoViewIfNeeded, done the user's way: a real drag on the nearest scroll view.
-  // Returns true if it scrolled. ponytail: vertical only; horizontal lists need dx + 'AndroidHorizontalScrollView'.
+  // Returns true if the content moved. ponytail: vertical only; horizontal lists need dx + 'AndroidHorizontalScrollView'.
   async scrollToward(n, c) {
     if (!n.scroll) return false;
     let dy;
@@ -370,21 +472,30 @@ class Locator {
       tag: n.scroll.tag,
       dy,
     });
-    return r.ok;
+    return r.ok && r.moved !== false;
   }
 
-  // A dropped touch (see touchLanded) never reached a handler, so tapping again is safe. Seen: a sheet re-rendering
-  // a few times in a row while session data arrives, its markdown Text remounting each time (fresh keys).
-  // ponytail: fixed 5 attempts, not tied to the timeout
-  async tap(opts) {
+  // A touch JS saw on a view React already replaced (mounted: false) never reached a handler, so tapping again is
+  // safe. Seen: a sheet re-rendering a few times in a row while session data arrives, its markdown Text remounting
+  // each time (fresh keys). Nothing else is retried: a touch that is merely late (JS busy) would be handled twice.
+  async tap(opts = {}) {
     const t0 = performance.now();
+    const timeout = opts.timeout ?? DEFAULT_TIMEOUT;
     for (let attempt = 1; ; attempt++) {
       const { node, point, iter } = await this.waitActionable(opts);
       const seq = this.app.touch.seq;
       await this.app.native.call("Input.tap", { ...point, tag: node.tag });
       await this.app.settle();
-      if ((await this.app.touchLanded(seq)) || attempt === 5)
-        return timing(`tap ${this}`, t0, iter);
+      const touch = await this.app.touchAfter(seq, timeout);
+      if (!touch)
+        throw new TimeoutError(
+          `${this}: tapped, but the app's JS saw no touch within ${timeout}ms`,
+        );
+      if (touch.mounted) return timing(`tap ${this}`, t0, iter);
+      if (attempt === 3)
+        throw new Error(
+          `${this}: tap dropped ${attempt} times (target re-mounted under the finger each time)`,
+        );
       trace({ event: "tap dropped, tapping again", locator: String(this) });
     }
   }
@@ -398,7 +509,7 @@ class Locator {
     });
     if (point) await this.app.native.call("Input.tap", point);
     else await this.app.native.call("Input.focus", { tag: node.tag });
-    const deadline = performance.now() + 5000;
+    const deadline = performance.now() + (opts.timeout ?? DEFAULT_TIMEOUT);
     for (;;) {
       const r = await this.app.native.call("Input.typeText", {
         text,
@@ -491,17 +602,34 @@ function expect(locator, negate = false) {
 }
 
 /**
- * Call at the top of a Mantis test file: starts the runner before the app is launched and reverses its port.
- * Launch through app.relaunch(() => device.launchApp(...)) so tests start once the agents are connected.
+ * Call at the top of a test file: starts the runner before the app is launched and reverses its port, in the test
+ * framework's suite hooks (beforeAll/afterAll: Jest, Vitest globals, Jasmine; before/after: Mocha).
+ * Target: { platform, deviceId }, left out = Detox's current device. Launch through app.relaunch(() => launch(...))
+ * so tests start once the agents are connected; pass launchArgs: app.launchArgs (iOS: the runner's port and token).
  */
-function setupMantis() {
-  const app = new App(PORT, device.getPlatform());
-  beforeAll(async () => {
+function setupMantis(target = {}) {
+  const { platform, deviceId } = require("../device").target(target);
+  const app = new App(PORT, platform);
+  const before = global.beforeAll ?? global.before;
+  const after = global.afterAll ?? global.after;
+  if (!before || !after)
+    throw new Error(
+      "setupMantis needs beforeAll/afterAll (or before/after) globals; otherwise call app.start(), reversePort() and app.close() yourself",
+    );
+  before(async () => {
     await app.start();
-    require("../device").reversePort(PORT);
+    require("../device").reversePort(app.port, { platform, deviceId });
   });
-  afterAll(() => app.close());
+  after(() => app.close());
   return app;
 }
 
-module.exports = { App, DETOX_VISIBLE, Locator, PORT, expect, setupMantis };
+module.exports = {
+  App,
+  DETOX_VISIBLE,
+  Locator,
+  PORT,
+  PROTOCOL,
+  expect,
+  setupMantis,
+};

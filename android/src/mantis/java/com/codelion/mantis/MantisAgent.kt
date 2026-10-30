@@ -24,6 +24,7 @@ import android.widget.HorizontalScrollView
 import android.widget.ScrollView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.facebook.react.uimanager.RootView
 import com.facebook.react.uimanager.TouchTargetHelper
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -38,7 +39,7 @@ import java.util.concurrent.TimeUnit
  * Mantis native agent. Compiled in only with MANTIS_E2E=1 (src/mantis, see build.gradle) and started by
  * MantisInitProvider. The app must allow cleartext traffic to localhost (network security config) in that build.
  *
- * Passive until a runner listens on the host: dials ws://localhost:9123 (adb reverse) and retries every second.
+ * Passive until a runner listens on the host: dials ws://localhost:9123 (adb reverse) and retries every 2 s.
  * Own socket, independent of the JS thread, so measuring / hit-testing / input work while JS is busy.
  * All view work on the main thread. Coordinates exchanged with the runner are dp (= JS units).
  */
@@ -68,27 +69,36 @@ object MantisAgent {
   private fun connect() {
     ws = client.newWebSocket(Request.Builder().url(URL).build(), object : WebSocketListener() {
       override fun onOpen(webSocket: WebSocket, response: Response) {
+        // v: src/runner PROTOCOL
         webSocket.send(JSONObject().put("method", "Agent.hello")
-          .put("params", JSONObject().put("role", "native").put("platform", "android")).toString())
+          .put("params", JSONObject().put("role", "native").put("platform", "android").put("v", 1)).toString())
       }
+      // OkHttp's reader thread: an exception here would restart the socket and fail every RPC in flight, so validate
+      // the frame first; a frame without a numeric id has nothing to answer
       override fun onMessage(webSocket: WebSocket, text: String) {
-        val msg = JSONObject(text)
-        val id = msg.getInt("id")
+        val msg = try { JSONObject(text) } catch (e: Exception) { return }
+        val id = (msg.opt("id") as? Number)?.toInt() ?: return
+        val method = msg.optString("method")
         val params = msg.optJSONObject("params") ?: JSONObject()
-        main.post {
-          try {
-            handle(msg.getString("method"), params) { result -> reply(id, result, null) }
-          } catch (e: Throwable) {
-            reply(id, null, e.toString())
+        // exactly one reply per request, whatever path (sync, frame callback, exception) gets there first
+        var replied = false
+        val done: (Any?) -> Unit = { result ->
+          if (!replied) {
+            replied = true
+            if (result is Throwable) reply(id, null, result.toString()) else reply(id, result, null)
           }
         }
+        main.post { guard(done) { handle(method, params, done) } }
       }
+      // the runner closes gracefully (e.g. a refused hello); OkHttp calls onClosed only once both sides sent close
+      override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(1000, null) }
       override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = retry()
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = retry()
     })
   }
 
-  private fun retry() { main.postDelayed({ connect() }, 1000) }
+  // 2 s like the iOS and JS agents (README); the runner is either up already or a test file away
+  private fun retry() { main.postDelayed({ connect() }, 2000) }
 
   private fun reply(id: Int, result: Any?, error: String?) {
     val out = JSONObject().put("id", id)
@@ -96,13 +106,64 @@ object MantisAgent {
     ws?.send(out.toString())
   }
 
-  private val decor: View get() = activity?.window?.decorView ?: error("no resumed activity")
+  /**
+   * Every callback that answers an RPC runs through this (also the frame callbacks, which run long after handle
+   * returned): an exception becomes the RPC's error instead of crashing the app and with it the whole E2E session.
+   */
+  private inline fun guard(noinline done: (Any?) -> Unit, body: () -> Unit) {
+    try { body() } catch (e: Throwable) { done(e) }
+  }
+
+  private fun onFrame(done: (Any?) -> Unit, body: () -> Unit) =
+    Choreographer.getInstance().postFrameCallback { guard(done, body) }
+
+  /** The finger that is down (tap, scroll); x, y = its last position, screen px. */
+  private class Finger(val win: View, val down: Long, var x: Float, var y: Float)
+  private var finger: Finger? = null
+
+  /**
+   * Puts a finger down. One gesture at a time. The returned done ends the RPC: on an error, or when the gesture is
+   * still down after 10 s (frame callbacks stalled), it sends ACTION_CANCEL first, so RN's JSTouchDispatcher never
+   * keeps a half gesture that mixes into the next one. 10 s: a scroll is ~10 frames, seconds on a starved emulator
+   * (measured: up to 5.4 s), and it must fire before the runner's 15 s RPC timeout.
+   */
+  private fun fingerDown(win: View, x: Float, y: Float, done: (Any?) -> Unit): Pair<Finger, (Any?) -> Unit> {
+    check(finger == null) { "another gesture is in progress (actions on one app run one at a time)" }
+    val f = Finger(win, SystemClock.uptimeMillis(), x, y)
+    finger = f
+    lateinit var watchdog: Runnable
+    val end: (Any?) -> Unit = { r ->
+      main.removeCallbacks(watchdog)
+      if (finger === f) {
+        runCatching { touch(win, f.down, SystemClock.uptimeMillis(), MotionEvent.ACTION_CANCEL, f.x, f.y) }
+        finger = null
+      }
+      done(r)
+    }
+    watchdog = Runnable { end(IllegalStateException("gesture still down after 10 s, cancelled")) }
+    main.postDelayed(watchdog, 10000)
+    try { touch(win, f.down, f.down, MotionEvent.ACTION_DOWN, x, y) } catch (e: Throwable) { end(e); throw e }
+    return f to end
+  }
+
+  /** MOVE / UP for [f]; fails if it was cancelled meanwhile (watchdog). UP lifts it: the next gesture may start. */
+  private fun move(f: Finger, action: Int, x: Float, y: Float) {
+    check(finger === f) { "gesture cancelled" }
+    f.x = x
+    f.y = y
+    touch(f.win, f.down, SystemClock.uptimeMillis(), action, x, y)
+    if (action == MotionEvent.ACTION_UP) finger = null
+  }
+
+  // null while no activity is resumed, e.g. a system dialog (permission prompt) is in front of the app
+  private val decorOrNull: View? get() = activity?.window?.decorView
+  private val decor: View get() = decorOrNull ?: error("no resumed activity")
   private val density: Float get() = app.resources.displayMetrics.density
 
   /** All windows of this process (activity, Modal dialogs, popups), topmost first. Coordinates are screen-based. */
   private fun roots(): List<View> {
     // ponytail: API 29+ (WindowInspector); below that only the activity window, so no Modal support
-    val all = if (Build.VERSION.SDK_INT >= 29) WindowInspector.getGlobalWindowViews() else listOf(decor)
+    val all = if (Build.VERSION.SDK_INT >= 29) WindowInspector.getGlobalWindowViews() else listOfNotNull(decorOrNull)
     return all.filter { it.isShown }.reversed()
   }
 
@@ -114,7 +175,7 @@ object MantisAgent {
   }
 
   /** Topmost window containing the point (px, screen); where a real touch would land. */
-  private fun windowAt(x: Float, y: Float): View = roots().firstOrNull { screenRect(it).contains(x.toInt(), y.toInt()) } ?: decor
+  private fun windowAt(x: Float, y: Float): View? = roots().firstOrNull { screenRect(it).contains(x.toInt(), y.toInt()) }
 
   private fun rectOf(v: View): JSONObject {
     val r = screenRect(v)
@@ -150,6 +211,7 @@ object MantisAgent {
     val dm = app.resources.displayMetrics
     val w = minOf(Math.abs(v.width * v.scaleX).toDouble(), dm.widthPixels.toDouble())
     val h = Math.abs(v.height * v.scaleY).toDouble()
+    if (w == 0.0 || h == 0.0) return 0.0 // scaled to nothing; NaN would make JSONArray.put throw
     val espresso = r.width().toDouble() * r.height() / (w * minOf(h, dm.heightPixels.toDouble()))
     val pr = Rect()
     var p = v.parent as? View
@@ -167,9 +229,12 @@ object MantisAgent {
     listOf("x", "y", "width", "height").all { Math.abs(a.getDouble(it) - b.getDouble(it)) < 0.01 } // any px change: a list still
     // drifting at <0.5 dp/frame makes Android's ScrollView eat the next DOWN as "stop fling"
 
-  /** Fabric: View.id == React tag. Returns the root surface view (ReactSurfaceView / ReactRootView). */
+  /**
+   * Fabric: View.id == React tag. Returns the React root of a window: ReactSurfaceView / ReactRootView, or a Modal's
+   * DialogRootViewGroup. By interface, not class name: R8 renames the classes (RN ships no keep rule for them).
+   */
   private fun reactRoot(v: View): ViewGroup? {
-    if (v is ViewGroup && v.javaClass.simpleName.let { it.contains("SurfaceView") || it.contains("RootView") }) return v
+    if (v is ViewGroup && v is RootView) return v
     if (v is ViewGroup) for (i in 0 until v.childCount) reactRoot(v.getChildAt(i))?.let { return it }
     return null
   }
@@ -185,9 +250,10 @@ object MantisAgent {
   private fun hitTest(xDp: Float, yDp: Float): JSONObject {
     val x = xDp * density
     val y = yDp * density
+    val decor = decorOrNull ?: return JSONObject().put("covered", "no resumed activity")
     val ime = ViewCompat.getRootWindowInsets(decor)?.getInsets(WindowInsetsCompat.Type.ime())?.bottom ?: 0
     if (ime > 0 && y > screenRect(decor).bottom - ime) return JSONObject().put("covered", "keyboard")
-    val win = windowAt(x, y)
+    val win = windowAt(x, y) ?: return JSONObject().put("covered", "no window")
     val root = reactRoot(win) ?: return JSONObject().put("covered", "window ${win.javaClass.simpleName}")
     val rootLoc = IntArray(2).also { root.getLocationOnScreen(it) }
     val tag = TouchTargetHelper.findTargetTagForTouch(x - rootLoc[0], y - rootLoc[1], root)
@@ -220,16 +286,20 @@ object MantisAgent {
         done(JSONObject().put("ratios", out).put("shown", shown))
       }
 
-      // Detox scrollTo(edge): jump the scroll view to its start/end (programmatic, like Detox's edge scroll)
+      // Detox scrollTo(edge): jump the scroll view to its start/end (programmatic, like Detox's edge scroll).
+      // scrollTo to the exact end, not fullScroll(): that one smooth-scrolls and moves focus (opens the IME next to a
+      // TextInput). ReactScrollView.scrollTo also updates Fabric's scroll state.
       "Input.scrollToEdge" -> {
         val sv = findView(p.getInt("tag"))
         val end = p.getString("edge") in setOf("bottom", "right")
+        val content = (sv as? ViewGroup)?.getChildAt(0)
         when (sv) {
-          is ScrollView -> if (end) sv.fullScroll(View.FOCUS_DOWN) else sv.scrollTo(0, 0)
-          is HorizontalScrollView -> if (end) sv.fullScroll(View.FOCUS_RIGHT) else sv.scrollTo(0, 0)
+          is ScrollView -> sv.scrollTo(0, if (end && content != null) maxOf(0, content.height - (sv.height - sv.paddingTop - sv.paddingBottom)) else 0)
+          is HorizontalScrollView -> sv.scrollTo(if (end && content != null) maxOf(0, content.width - (sv.width - sv.paddingLeft - sv.paddingRight)) else 0, 0)
           else -> { done(JSONObject().put("ok", false).put("reason", "not a scroll view")); return }
         }
-        done(JSONObject().put("ok", true))
+        // 2 frames, like Input.scroll: the scroll events reach the JS queue before the runner queries again
+        onFrame(done) { onFrame(done) { done(JSONObject().put("ok", true)) } }
       }
 
       // Actionability, native half: exists natively, stable across 2 frames, receives events at center.
@@ -242,9 +312,9 @@ object MantisAgent {
         // 2 stable frames before that can still be the provisional position (measured: shift ~36 dp, focus +~130 ms)
         if (!v.rootView.hasWindowFocus()) { done(JSONObject().put("ok", false).put("reason", "window not focused")); return }
         val r1 = rectOf(v)
-        Choreographer.getInstance().postFrameCallback {
+        onFrame(done) {
           val r2 = rectOf(v)
-          if (!sameRect(r1, r2)) { done(JSONObject().put("ok", false).put("reason", "not stable").put("r1", r1).put("r2", r2)); return@postFrameCallback }
+          if (!sameRect(r1, r2)) { done(JSONObject().put("ok", false).put("reason", "not stable").put("r1", r1).put("r2", r2)); return@onFrame }
           val cx = (r2.getDouble("x") + r2.getDouble("width") / 2).toFloat()
           val cy = (r2.getDouble("y") + r2.getDouble("height") / 2).toFloat()
           // viewport: centre must be on screen and not clipped by a scroll view; delta tells the runner where to scroll
@@ -253,7 +323,7 @@ object MantisAgent {
             val sv = nearestScroller(v)?.let { viewport(it).apply { intersect(screenRect(it)) } }
             done(JSONObject().put("ok", false).put("reason", "not in viewport").put("rect", r2)
               .put("delta", sv?.let { cy - it.exactCenterY() / density } ?: 0f))
-            return@postFrameCallback
+            return@onFrame
           }
           val hit = hitTest(cx, cy)
           val chain = hit.optJSONArray("chain")
@@ -266,31 +336,12 @@ object MantisAgent {
       "Input.tap" -> {
         val x = p.getDouble("x").toFloat() * density
         val y = p.getDouble("y").toFloat() * density
-        val win = windowAt(x, y)
-        val down = SystemClock.uptimeMillis()
-        touch(win, down, down, MotionEvent.ACTION_DOWN, x, y)
+        val win = windowAt(x, y) ?: error("no window at (${x / density}, ${y / density})")
+        val (f, end) = fingerDown(win, x, y, done)
         // hold = until next frame (~16 ms), enough for Pressable / gesture handlers to see DOWN
-        val target = if (p.has("tag")) findView(p.getInt("tag")) else null
-        val trace = JSONArray()
-        fun sample() { target?.let { trace.put(rectOf(it).put("ms", SystemClock.uptimeMillis() - down)) } }
-        sample()
-        Choreographer.getInstance().postFrameCallback {
-          sample()
-          touch(win, down, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP, x, y)
-          done(JSONObject().put("ok", true))
-          // debug: target's rect for 30 frames after UP, as an event (MANTIS_TRACE)
-          if (target != null) {
-            var n = 0
-            val cb = object : Choreographer.FrameCallback {
-              override fun doFrame(t: Long) {
-                sample()
-                if (++n < 30) Choreographer.getInstance().postFrameCallback(this)
-                else ws?.send(JSONObject().put("method", "Debug.tapTrace")
-                  .put("params", JSONObject().put("tag", p.getInt("tag")).put("rects", trace)).toString())
-              }
-            }
-            Choreographer.getInstance().postFrameCallback(cb)
-          }
+        onFrame(end) {
+          move(f, MotionEvent.ACTION_UP, x, y)
+          end(JSONObject().put("ok", true))
         }
       }
 
@@ -301,9 +352,14 @@ object MantisAgent {
         val sv = findView(p.getInt("tag"))
         // JS commit can be ~1 frame ahead of the native mount: not ready yet, the runner retries next frame
         if (sv == null || !sv.isShown) { done(JSONObject().put("ok", false).put("reason", "scroll view not mounted natively")); return }
-        val vp = viewport(sv).apply { intersect(screenRect(sv)) }
+        // Rect.intersect leaves the rect as it was when there is no overlap
+        val vp = viewport(sv)
+        if (!vp.intersect(screenRect(sv)) || vp.isEmpty) { done(JSONObject().put("ok", false).put("reason", "scroll view not on screen")); return }
         val slop = ViewConfiguration.get(sv.context).scaledTouchSlop
         val want = p.getDouble("dy").toFloat() * density
+        // dy 0 would put DOWN and UP on one point: a tap on whatever is under it
+        if (want == 0f) { done(JSONObject().put("ok", false).put("reason", "dy is 0, nothing to scroll")); return }
+        val startY = sv.scrollY
         val amount = (Math.abs(want) + slop).coerceAtMost(vp.height() * 0.8f) * Math.signum(want)
         val x = vp.exactCenterX()
         val y0 = vp.exactCenterY() + amount / 2
@@ -312,30 +368,28 @@ object MantisAgent {
         if (hit == null || (0 until hit.length()).none { hit.getInt(it) == sv.id }) {
           done(JSONObject().put("ok", false).put("reason", "scroll view covered at start point")); return
         }
-        val win = windowAt(x, y0)
-        val down = SystemClock.uptimeMillis()
-        touch(win, down, down, MotionEvent.ACTION_DOWN, x, y0)
-        val moves = p.optInt("moves", 6)
+        val win = windowAt(x, y0) ?: error("no window at the scroll view")
+        val (f, end) = fingerDown(win, x, y0, done)
+        val moves = p.optInt("moves", 6).takeIf { it > 0 } ?: 6
         var frame = 0
-        var lastMove = down
+        var lastMove = f.down
         Choreographer.getInstance().postFrameCallback(object : Choreographer.FrameCallback {
-          override fun doFrame(t: Long) {
+          override fun doFrame(t: Long) = guard(end) {
             frame++
             val now = SystemClock.uptimeMillis()
             if (frame <= moves) {
               val k = 1 - (1 - frame.toFloat() / moves).let { it * it } // ease-out
-              touch(win, down, now, MotionEvent.ACTION_MOVE, x, y0 + (y1 - y0) * k)
+              move(f, MotionEvent.ACTION_MOVE, x, y0 + (y1 - y0) * k)
               lastMove = now
             } else if (now - lastMove < 110) {
-              touch(win, down, now, MotionEvent.ACTION_MOVE, x, y1)
+              move(f, MotionEvent.ACTION_MOVE, x, y1)
             } else {
-              touch(win, down, now, MotionEvent.ACTION_UP, x, y1)
+              move(f, MotionEvent.ACTION_UP, x, y1)
               // 2 frames: lets the scroll events of the UP (momentum begin) reach the JS queue before the runner
               // queries again, so the "scroll view animating" check cannot miss them
-              Choreographer.getInstance().postFrameCallback {
-                Choreographer.getInstance().postFrameCallback { done(JSONObject().put("ok", true).put("px", amount)) }
-              }
-              return
+              // moved: false = the drag happened but the content didn't move (at its end), the runner stops scrolling
+              onFrame(end) { onFrame(end) { end(JSONObject().put("ok", true).put("px", amount).put("moved", sv.scrollY != startY)) } }
+              return@guard
             }
             Choreographer.getInstance().postFrameCallback(this)
           }
@@ -354,6 +408,15 @@ object MantisAgent {
         done(JSONObject().put("ok", true).put("focusedTag", focused.id))
       }
 
+      // fill on a text input no tap can reach: focus it the way a tap would (iOS: alpha 0; Android never reports it
+      // today, but both agents answer the same methods)
+      "Input.focus" -> {
+        val et = findView(p.getInt("tag"))?.let { editTextIn(it) }
+        val ok = et?.requestFocus() == true
+        if (ok) (app.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(et, 0)
+        done(JSONObject().put("ok", ok))
+      }
+
       // What a user does when the soft keyboard covers the next target (Detox's replaceText never opens it)
       "Input.hideKeyboard" -> {
         val imm = app.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
@@ -363,6 +426,12 @@ object MantisAgent {
 
       else -> error("unknown method $method")
     }
+  }
+
+  private fun editTextIn(v: View): EditText? {
+    if (v is EditText) return v
+    if (v is ViewGroup) for (i in 0 until v.childCount) editTextIn(v.getChildAt(i))?.let { return it }
+    return null
   }
 
   /** x, y in screen px; delivered to [win]'s root view in its own coordinates. */

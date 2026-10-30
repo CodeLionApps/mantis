@@ -13,6 +13,8 @@ Pod::Spec.new do |s|
   s.source       = { :git => "#{package["homepage"]}.git", :tag => s.version.to_s }
   s.source_files = "ios/**/*.{h,m}"
   s.frameworks   = "UIKit", "QuartzCore"
+  # the agent turns exceptions into RPC errors; without this ARC leaks the objects of every frame an exception unwinds
+  s.compiler_flags = "-fobjc-arc-exceptions"
   # Build-time gate: Xcode expands $(MANTIS_E2E) from the build environment, so only `MANTIS_E2E=1 xcodebuild ...`
   # defines MANTIS_E2E_1 and compiles the agent (private UIKit/IOKit API, never for the App Store). Any other build,
   # whatever the environment at `pod install`, compiles MantisAgent.m to nothing.
