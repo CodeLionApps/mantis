@@ -398,7 +398,9 @@ object MantisAgent {
 
       // Text via the IME path (InputConnection), not by setting props. replace = select all first (Playwright fill).
       "Input.typeText" -> {
-        val focused = roots().firstNotNullOfOrNull { it.findFocus() }
+        // the window that has window focus: popups never get it, but keep a focused view of their own (Samsung's text
+        // selection toolbar after select-all: a focused RelativeLayout above the activity)
+        val focused = roots().firstOrNull { it.hasWindowFocus() }?.findFocus()
         if (focused !is EditText) { done(JSONObject().put("ok", false).put("reason", "focused: ${focused?.javaClass?.simpleName}")); return }
         val want = p.optJSONArray("tags")?.let { t -> (0 until t.length()).map { t.optInt(it) } }
         if (want != null && focused.id !in want) { done(JSONObject().put("ok", false).put("reason", "focus still on tag ${focused.id}")); return }
