@@ -43,6 +43,9 @@
   "peerDependenciesMeta": {
     "detox": {
       "optional": true
+    },
+    "react-native": {
+      "optional": true
     }
   },
   "engines": {
