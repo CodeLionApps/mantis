@@ -189,6 +189,7 @@ function checkContract() {
       super(`${URL}/?role=js`);
     }
   };
+  global.XMLHttpRequest = class extends EventTarget { open() {} send() {} }; // RN's dispatches loadend when done
   require("./agent");
   global.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(1, {
     current: { child: root, memoizedState: { element: {} } },
@@ -252,6 +253,17 @@ function checkContract() {
   assert.equal(snap.nodes[by("testID", "back")].parent, by("testID", "screen-b"));
   assert.equal(snap.nodes[by("testID", "minus")].enabled, false);
   assert.equal(snap.focused, true);
+
+  // Agent.ping: ms since the last commit, requests in flight (no query string)
+  const xhr = new XMLHttpRequest();
+  xhr.open("GET", "https://api.example/visits?token=secret");
+  xhr.send();
+  let ping = await app.js.call("Agent.ping");
+  assert(ping.idleMs >= 0 && ping.idleMs < 60_000);
+  assert.deepEqual(ping.net.map((r) => r.url), ["https://api.example/visits"]);
+  xhr.dispatchEvent(new Event("loadend"));
+  ping = await app.js.call("Agent.ping");
+  assert.deepEqual(ping.net, []);
 
   // MANTIS_TRACE never records typed text (passwords)
   const traceFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "mantis-")), "trace.jsonl");

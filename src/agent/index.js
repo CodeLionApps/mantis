@@ -5,6 +5,7 @@
 
 const roots = new Set();
 let commitId = 0;
+let commitAt = 0; // Date.now() of the last commit, for Agent.ping's idleMs
 
 const prev = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
 if (prev) {
@@ -41,6 +42,7 @@ function handleCommit(root) {
     roots.delete(root);
   else roots.add(root);
   commitId++;
+  commitAt = Date.now();
   send({ method: "Tree.committed", params: { commitId } });
 }
 
@@ -302,12 +304,42 @@ function checkInternals() {
   return null;
 }
 
+// ---------- network ----------
+// Requests in flight, for the runner's idle wait: a screen whose data is still on the way is not done. XMLHttpRequest
+// only (RN's fetch is built on it); WebSockets and native SDKs (Firestore, analytics) aren't counted. RN dispatches
+// loadend after load, error, timeout and abort alike.
+const inFlight = new Map(); // xhr -> { at, url }
+try {
+  const XHR = global.XMLHttpRequest.prototype;
+  const { open, send: xhrSend } = XHR;
+  XHR.open = function (method, url, ...rest) {
+    this.__mantisUrl = String(url).split("?")[0]; // no query: tokens live there
+    return open.call(this, method, url, ...rest);
+  };
+  XHR.send = function (...args) {
+    inFlight.set(this, { at: Date.now(), url: this.__mantisUrl });
+    this.addEventListener("loadend", () => inFlight.delete(this));
+    try {
+      return xhrSend.apply(this, args);
+    } catch (e) {
+      inFlight.delete(this);
+      throw e;
+    }
+  };
+} catch (e) {}
+
 // ---------- RPC ----------
 const handlers = {
   "Tree.query": (p) => query(p.selector),
   "Tree.snapshot": snapshot,
   // queued behind any touch events already on the JS thread: the reply means their handlers have run
-  "Agent.ping": () => ({ commitId }),
+  // idleMs: since the last commit; net: requests in flight (age in ms, URL without query)
+  "Agent.ping": () => {
+    const now = Date.now();
+    const net = [];
+    for (const r of inFlight.values()) net.push({ ms: now - r.at, url: r.url });
+    return { commitId, idleMs: now - commitAt, net };
+  },
 };
 
 // Runner port: 9123; on iOS the launch argument `-mantisPort N` (NSUserDefaults argument domain, read through RN
