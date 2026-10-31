@@ -269,6 +269,7 @@ function connect() {
   const { port, token } = getLaunchArgs();
   ws = new WebSocket(`ws://localhost:${port}/?role=js`);
   ws.onopen = () => {
+    touchSeq = 0; // the runner counts this connection's touches from 0 (App.js.onHello), also when it attaches late
     // react-native is loaded by now (connect runs after the entry module), not when this file is evaluated
     const platform = require("react-native").Platform.OS;
     send({
