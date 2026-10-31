@@ -72,6 +72,7 @@ static NSException *MantisError(NSString *reason) {
 
 @implementation MantisAgent {
   NSURLSessionWebSocketTask *_ws;
+  CGRect _keyboard; // last keyboard end frame (UIKeyboardWillChangeFrame), screen points; off screen = none
 }
 
 static MantisAgent *shared;
@@ -81,6 +82,12 @@ static MantisAgent *shared;
   if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) return;
   dispatch_async(dispatch_get_main_queue(), ^{
     shared = [MantisAgent new];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIKeyboardWillChangeFrameNotification object:nil queue:nil
+                                                usingBlock:^(NSNotification *n) {
+      shared->_keyboard = [n.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIKeyboardWillHideNotification object:nil queue:nil
+                                                usingBlock:^(NSNotification *n) { shared->_keyboard = CGRectNull; }];
     [shared connect];
   });
 }
@@ -265,6 +272,22 @@ static NSArray *tagChain(UIView *v) {
   return out;
 }
 
+// Android reaches(): a touch at the centre of v's visible part lands in v, in a view inside v, or in an ancestor of v (a
+// text in a pressable), or in a view of the same window that doesn't cover all of v (a sibling over a corner).
+- (BOOL)reaches:(UIView *)v {
+  if (!v) return NO;
+  CGRect vis = CGRectIntersection(presentedRect(v), UIScreen.mainScreen.bounds);
+  for (UIView *a = v.superview; a && !CGRectIsNull(vis); a = a.superview)
+    if (a.clipsToBounds || [a isKindOfClass:UIScrollView.class]) vis = CGRectIntersection(vis, presentedRect(a));
+  if (CGRectIsNull(vis)) return NO;
+  UIView *hit = [self hitView:CGPointMake(CGRectGetMidX(vis), CGRectGetMidY(vis))];
+  NSArray *chain = tagChain(hit);
+  if ([chain containsObject:@(v.tag)]) return YES;
+  if (chain.count && [tagChain(v) containsObject:chain.firstObject]) return YES;
+  UIView *over = chain.count ? [self viewForTag:[chain.firstObject integerValue]] : nil;
+  return over && over.window == v.window && !CGRectContainsRect(presentedRect(over), vis);
+}
+
 // iOS counterpart of Android's "window has focus": UIKit drops touches while a view controller is being
 // presented / dismissed (RN Modal), and the presented view may still move.
 static NSString *transitionReason(UIWindow *w) {
@@ -330,7 +353,25 @@ static NSString *transitionReason(UIWindow *w) {
       [ratios addObject:@(visibleRatio(v))];
       [shownOut addObject:@(v && shown(v))];
     }
-    done(@{@"ratios": ratios, @"shown": shownOut});
+    if (![p[@"hit"] boolValue]) return done(@{@"ratios": ratios, @"shown": shownOut});
+    // hit: true (App.snapshot), as on Android: per tag whether a touch at the centre of its visible part reaches it, and
+    // once focused (app active, no UIAlertController on top: a system alert makes the app inactive), keyboard (frame
+    // from UIKeyboardWillChangeFrame, screen points, or null) and screen size. Points = dp, density = scale.
+    NSMutableArray *hits = [NSMutableArray array];
+    NSArray *tags = p[@"tags"];
+    for (NSUInteger i = 0; i < tags.count; i++) {
+      UIView *v = [tags[i] isKindOfClass:NSNumber.class] ? [self viewForTag:[tags[i] integerValue]] : nil;
+      [hits addObject:[ratios[i] doubleValue] > 0 && [self reaches:v] ? @YES : @NO];
+    }
+    UIViewController *top = self.windows.firstObject.rootViewController;
+    for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    BOOL focused = UIApplication.sharedApplication.applicationState == UIApplicationStateActive && ![top isKindOfClass:UIAlertController.class];
+    CGRect screen = UIScreen.mainScreen.bounds;
+    CGRect kb = CGRectIntersection(_keyboard, screen);
+    done(@{@"ratios": ratios, @"shown": shownOut, @"hit": hits, @"focused": @(focused),
+           @"keyboard": CGRectIsNull(kb) || kb.size.height < 1 ? NSNull.null : R(kb),
+           @"screen": @{@"width": @(screen.size.width), @"height": @(screen.size.height), @"density": @(UIScreen.mainScreen.scale)}});
   } else if ([method isEqualToString:@"Action.check"]) {
     // Actionability, native half: mounted, stable over 2 frames, in viewport (not clipped by a scroll view; delta
     // tells the runner where to scroll), no VC transition, hit-test reaches it.

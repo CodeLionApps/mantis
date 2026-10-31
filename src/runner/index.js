@@ -318,11 +318,12 @@ class App {
   /**
    * Whole-screen snapshot for an LLM driver: Tree.snapshot (JS agent) joined with Layout.visibility {hit}
    * (native). Keeps the nodes a user can see: visible ratio > 0 (drops screens below, clipped and off-screen ones)
-   * and a touch at their visible centre isn't caught by another view (hit null = can't tell, no resumed activity;
-   * iOS doesn't report it yet), or something inside them is kept. parent is re-pointed past dropped nodes. Tree
+   * and a touch at their visible centre isn't caught by another view (both platforms; hit null = can't tell, no
+   * resumed activity on Android), or something inside them is kept. parent is re-pointed past dropped nodes. Tree
    * order = paint order (later siblings drawn on top; zIndex/elevation aside). rect: dp, React root origin (JS
    * layout; screen dp for an edge-to-edge root).
-   * focused false = a system dialog (permission prompt, Samsung Pass) is over the app; keyboard = IME rect or null.
+   * focused false = a system dialog (permission prompt, Samsung Pass), or on iOS an alert of the app's own, is over
+   * the app; keyboard = IME rect or null.
    */
   async snapshot() {
     const { commitId, nodes } = await this.js.call("Tree.snapshot");
