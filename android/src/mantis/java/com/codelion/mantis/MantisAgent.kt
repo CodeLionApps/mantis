@@ -12,6 +12,8 @@ import android.os.SystemClock
 import android.util.TypedValue
 import android.view.Choreographer
 import android.view.InputDevice
+import android.view.KeyCharacterMap
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
@@ -22,6 +24,7 @@ import android.view.inspector.WindowInspector
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.ScrollView
+import androidx.activity.findViewTreeOnBackPressedDispatcherOwner
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import com.facebook.react.modules.websocket.WebSocketModule
@@ -485,6 +488,33 @@ object MantisAgent {
         val imm = app.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         val hidden = roots().any { imm.hideSoftInputFromWindow(it.windowToken, 0) }
         done(JSONObject().put("ok", hidden))
+      }
+
+      // The back button, in-process (~ms instead of `adb shell input keyevent 4`'s process start), to the window that
+      // has focus: the activity, or a Modal's Dialog (closes like a real back: onRequestClose). First as a key event
+      // (what the system sends without predictive back; a Modal's OnKeyListener takes it either way), then, when nothing
+      // took it (predictive back: targetSdk 36 on Android 16 never calls onBackPressed from a key), the window's
+      // OnBackPressedDispatcher, which the system's OnBackInvokedCallback would call. On the root screen that ends like a
+      // real back too (RN: JS has no handler → invokeDefaultOnBackPressed → the task goes to the background).
+      // ok: false = do it the system's way (adb keyevent): no window of the app has focus (system dialog), the keyboard is
+      // up (a real back closes the IME, which an in-process event never reaches), or nothing in the window took it.
+      // ponytail: non-predictive back with an enabled androidx callback goes key-first, i.e. through
+      // Activity.onBackPressed like a real key; the dispatcher only runs if that one returns unhandled.
+      "Input.back" -> {
+        val win = roots().firstOrNull { it.hasWindowFocus() }
+          ?: run { done(JSONObject().put("ok", false).put("reason", "no window of the app has focus")); return }
+        if (ViewCompat.getRootWindowInsets(win)?.isVisible(WindowInsetsCompat.Type.ime()) == true) {
+          done(JSONObject().put("ok", false).put("reason", "keyboard on screen")); return
+        }
+        val t = SystemClock.uptimeMillis()
+        val key = { action: Int -> win.dispatchKeyEvent(KeyEvent(t, SystemClock.uptimeMillis(), action, KeyEvent.KEYCODE_BACK, 0, 0,
+          KeyCharacterMap.VIRTUAL_KEYBOARD, 0, KeyEvent.FLAG_FROM_SYSTEM or KeyEvent.FLAG_VIRTUAL_HARD_KEY, InputDevice.SOURCE_KEYBOARD)) }
+        key(KeyEvent.ACTION_DOWN)
+        val via = if (key(KeyEvent.ACTION_UP)) "key" else win.findViewTreeOnBackPressedDispatcherOwner()?.let {
+          it.onBackPressedDispatcher.onBackPressed(); "dispatcher"
+        }
+        done(if (via == null) JSONObject().put("ok", false).put("reason", "back not handled by ${win.javaClass.simpleName}")
+          else JSONObject().put("ok", true).put("via", via).put("window", win.javaClass.simpleName))
       }
 
       else -> error("unknown method $method")
