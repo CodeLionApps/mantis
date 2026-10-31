@@ -170,6 +170,12 @@ await app.getByRole("button", { name: "Zaloguj" }).tap();
 await expect(app.getByText(/Cześć/)).toBeVisible();
 ```
 
+`await app.snapshot()` returns the whole screen for an LLM driver: `{ commitId, nodes, focused, keyboard, screen }`.
+Nodes are host views with text, testID, label, role, a text input, a touch handler or a scroll view, in tree (paint)
+order with `parent` indices, kept only when shown natively and not covered (another window, sheet backdrop, keyboard).
+Rects are dp. `focused: false` = a system window (permission dialog, notification shade) is over the app. Android
+reports `hit`, `focused`, `keyboard` and `screen`; iOS only the visible ratio so far.
+
 ## Channel
 
 The runner listens on `127.0.0.1` only (Android reaches it through `adb reverse`). Agents say hello with the

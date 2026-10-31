@@ -284,6 +284,26 @@ object MantisAgent {
       .put("chain", ancestorTags(view).apply { if (view.id != tag) put(tag) })
   }
 
+  /**
+   * [v] is not covered: a touch at the centre of its visible part lands on it, a descendant, its own ancestor (v is
+   * pointerEvents none), or a view of the same window that doesn't cover all of that part (a card's content drawn
+   * over the card).
+   * Covered: by the keyboard, another window (Modal, dialog), or a view over all of it (sheet backdrop).
+   */
+  private fun reaches(v: View): Boolean {
+    val r = Rect()
+    if (!v.getGlobalVisibleRect(r)) return false
+    val o = IntArray(2).also { v.rootView.getLocationOnScreen(it) }
+    r.offset(o[0], o[1])
+    val chain = hitTest(r.exactCenterX() / density, r.exactCenterY() / density).optJSONArray("chain") ?: return false
+    val hit = (0 until chain.length()).map { chain.getInt(it) }
+    if (v.id in hit) return true
+    val up = ancestorTags(v)
+    if ((0 until up.length()).any { up.getInt(it) == hit.firstOrNull() }) return true
+    val over = hit.firstOrNull()?.let { findView(it) } ?: return false
+    return over.rootView === v.rootView && !screenRect(over).contains(r)
+  }
+
   private fun leafAt(v: View, x: Float, y: Float): View {
     if (v is ViewGroup) for (i in v.childCount - 1 downTo 0) {
       val c = v.getChildAt(i)
@@ -294,17 +314,37 @@ object MantisAgent {
 
   private fun handle(method: String, p: JSONObject, done: (Any?) -> Unit) {
     when (method) {
-      // Visible share per tag (Detox semantics, see visibleRatio), for toBeInViewport and filter({ visible })
+      // Visible share per tag (Detox semantics, see visibleRatio), for toBeInViewport and filter({ visible }).
+      // hit: true (App.snapshot) adds per tag whether a touch at the centre of its visible part reaches it (null = no
+      // resumed activity, can't tell), and once: focused (a window of the app has focus; false under a system
+      // dialog), keyboard (IME rect or null) and screen size, all in screen dp.
       "Layout.visibility" -> {
         val tags = p.getJSONArray("tags")
+        val withHit = p.optBoolean("hit")
         val out = JSONArray()
         val shown = JSONArray() // in a window and not hidden: what Detox/Espresso can match (screens below are not)
+        val hits = JSONArray()
         for (i in 0 until tags.length()) {
           val v = if (tags.isNull(i)) null else findView(tags.getInt(i))
-          out.put(visibleRatio(v))
+          val ratio = visibleRatio(v)
+          out.put(ratio)
           shown.put(v?.isShown == true)
+          if (withHit) hits.put(if (ratio == 0.0) false else if (decorOrNull == null) JSONObject.NULL else reaches(v!!))
         }
-        done(JSONObject().put("ratios", out).put("shown", shown))
+        val res = JSONObject().put("ratios", out).put("shown", shown)
+        if (withHit) {
+          val decor = decorOrNull
+          val win = decor ?: roots().lastOrNull() // the activity window is the bottom one
+          val ime = decor?.let { ViewCompat.getRootWindowInsets(it)?.getInsets(WindowInsetsCompat.Type.ime())?.bottom } ?: 0
+          val keyboard = if (decor != null && ime > 0) screenRect(decor).let {
+            JSONObject().put("x", it.left / density).put("y", (it.bottom - ime) / density)
+              .put("width", it.width() / density).put("height", ime / density)
+          } else JSONObject.NULL
+          res.put("hit", hits).put("focused", roots().any { it.hasWindowFocus() }).put("keyboard", keyboard)
+            .put("screen", JSONObject().put("width", (win?.width ?: 0) / density).put("height", (win?.height ?: 0) / density)
+              .put("density", density))
+        }
+        done(res)
       }
 
       // Detox scrollTo(edge): jump the scroll view to its start/end (programmatic, like Detox's edge scroll).

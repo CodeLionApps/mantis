@@ -315,6 +315,38 @@ class App {
     });
   }
 
+  /**
+   * Whole-screen snapshot for an LLM driver: Tree.snapshot (JS agent) joined with Layout.visibility {hit}
+   * (native). Keeps the nodes a user can see: visible ratio > 0 (drops screens below, clipped and off-screen ones)
+   * and a touch at their visible centre isn't caught by another view (hit null = can't tell, no resumed activity;
+   * iOS doesn't report it yet), or something inside them is kept. parent is re-pointed past dropped nodes. Tree
+   * order = paint order (later siblings drawn on top; zIndex/elevation aside). rect: dp, React root origin (JS
+   * layout; screen dp for an edge-to-edge root).
+   * focused false = a system dialog (permission prompt, Samsung Pass) is over the app; keyboard = IME rect or null.
+   */
+  async snapshot() {
+    const { commitId, nodes } = await this.js.call("Tree.snapshot");
+    const vis = await this.native.call("Layout.visibility", { tags: nodes.map((n) => n.tag), hit: true });
+    const seen = nodes.map((_, i) => vis.ratios[i] > 0 && vis.hit?.[i] !== false);
+    // a container is hit-tested at its centre only (e.g. a scroll view whose centre is under the keyboard): it stays
+    // when anything in it is seen (its hit stays false). Nodes come in tree order, so parents before children.
+    for (let i = nodes.length - 1; i >= 0; i--)
+      for (let p = seen[i] ? nodes[i].parent : -1; p >= 0 && !seen[p] && vis.ratios[p] > 0; p = nodes[p].parent)
+        seen[p] = true;
+    const kept = new Map(); // index in nodes -> index in out
+    const out = [];
+    nodes.forEach((n, i) => {
+      const hit = vis.hit?.[i] ?? null;
+      if (!seen[i]) return;
+      let p = n.parent;
+      while (p >= 0 && !kept.has(p)) p = nodes[p].parent;
+      kept.set(i, out.length);
+      out.push({ ...n, parent: p < 0 ? -1 : kept.get(p), ratio: vis.ratios[i], hit });
+    });
+    const { focused = null, keyboard = null, screen = null } = vis;
+    return { commitId, nodes: out, focused, keyboard, screen };
+  }
+
   getByRole(role, { name } = {}) {
     return new Locator(this, { role, name: norm(name) });
   }
