@@ -24,6 +24,7 @@ import android.widget.HorizontalScrollView
 import android.widget.ScrollView
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.facebook.react.modules.websocket.WebSocketModule
 import com.facebook.react.uimanager.RootView
 import com.facebook.react.uimanager.TouchTargetHelper
 import okhttp3.OkHttpClient
@@ -33,7 +34,10 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.InetAddress
+import java.net.Socket
 import java.util.concurrent.TimeUnit
+import javax.net.SocketFactory
 
 /**
  * Mantis native agent. Compiled in only with MANTIS_E2E=1 (src/mantis, see build.gradle) and started by
@@ -46,7 +50,21 @@ import java.util.concurrent.TimeUnit
 object MantisAgent {
   private const val URL = "ws://localhost:9123/?role=native"
   private val main = Handler(Looper.getMainLooper())
-  private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
+  private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).socketFactory(NoDelay).build()
+
+  /**
+   * TCP_NODELAY. Without it a message over 8 KB (OkHttp writes 8 KB segments) waits ~45 ms for the ACK of the first
+   * segment (Nagle vs adbd's delayed ACK; S22, adb reverse): every snapshot of a busy screen.
+   */
+  private object NoDelay : SocketFactory() {
+    private val d = SocketFactory.getDefault()
+    private fun Socket.nd() = apply { tcpNoDelay = true }
+    override fun createSocket() = d.createSocket().nd()
+    override fun createSocket(host: String, port: Int) = d.createSocket(host, port).nd()
+    override fun createSocket(host: String, port: Int, local: InetAddress, localPort: Int) = d.createSocket(host, port, local, localPort).nd()
+    override fun createSocket(host: InetAddress, port: Int) = d.createSocket(host, port).nd()
+    override fun createSocket(host: InetAddress, port: Int, local: InetAddress, localPort: Int) = d.createSocket(host, port, local, localPort).nd()
+  }
   private lateinit var app: Application
   private var activity: Activity? = null
   private var ws: WebSocket? = null
@@ -54,6 +72,9 @@ object MantisAgent {
   @JvmStatic
   fun install(application: Application) {
     app = application
+    // the JS agent's socket is RN's WebSocket: same fix. ponytail: replaces an app's own custom builder (E2E builds
+    // only; RN has no getter to chain it)
+    WebSocketModule.setCustomClientBuilder { it.socketFactory(NoDelay) }
     app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
       override fun onActivityResumed(a: Activity) { activity = a }
       override fun onActivityPaused(a: Activity) { if (activity == a) activity = null }
