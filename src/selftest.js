@@ -10,7 +10,11 @@ const path = require("node:path");
 // agent.js measures through ReactFabric; give it fake boxes instead of the real renderer
 const load = Module._load;
 Module._load = function (request, ...rest) {
-  if (request === "react-native") return { Platform: { OS: "android" } };
+  if (request === "react-native")
+    return {
+      Platform: { OS: "android" },
+      Dimensions: { get: () => ({ width: 400, height: 800 }) },
+    };
   if (request.endsWith("Core/RawEventEmitter"))
     return { default: { addListener: (_type, cb) => (touchStart = cb) } };
   if (request.endsWith("Renderer/shims/ReactFabric")) {
@@ -151,6 +155,12 @@ function checkContract() {
     const result = {
       "Layout.visibility": () => ({
         ratios: params.tags.map((t) => ratios[t] ?? 0.9),
+        // snapshot: cta and row's centre are covered (e.g. by a sheet backdrop), row's texts aren't
+        ...(params.hit && {
+          hit: params.tags.map((t) => ![row, cta].some((f) => f.stateNode.canonical.nativeTag === t)),
+          focused: true,
+          keyboard: null,
+        }),
       }),
       "Action.check": () => ({ ok: true, point: { x: params.tag, y: 0 } }),
       "Input.typeText": () => ({ ok: true }),
@@ -227,6 +237,21 @@ function checkContract() {
   setTimeout(() => (native = connectNative()), 100);
   await id("minus").tap({ force: true });
   assert.equal(taps.length, 10);
+
+  // snapshot: JS lists the screens below and covered nodes too; App.snapshot keeps what's seen (and containers of it)
+  const raw = await app.js.call("Tree.snapshot");
+  assert.equal(raw.nodes.find((n) => n.testID === "row").name, "Lek1 maja");
+  assert.equal(raw.nodes.filter((n) => n.testID === "back").length, 2);
+  const snap = await app.snapshot();
+  const by = (k, v) => snap.nodes.findIndex((n) => n[k] === v);
+  assert.deepEqual(
+    snap.nodes.map((n) => n.testID ?? n.text),
+    ["screen-a", "screen-b", "back", "row", "Lek", "1 maja", "minus", "qty"],
+  );
+  assert.equal(snap.nodes[by("text", "Lek")].parent, by("testID", "row"));
+  assert.equal(snap.nodes[by("testID", "back")].parent, by("testID", "screen-b"));
+  assert.equal(snap.nodes[by("testID", "minus")].enabled, false);
+  assert.equal(snap.focused, true);
 
   // MANTIS_TRACE never records typed text (passwords)
   const traceFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "mantis-")), "trace.jsonl");

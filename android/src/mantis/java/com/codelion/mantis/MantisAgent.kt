@@ -12,6 +12,8 @@ import android.os.SystemClock
 import android.util.TypedValue
 import android.view.Choreographer
 import android.view.InputDevice
+import android.view.KeyCharacterMap
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewConfiguration
@@ -22,8 +24,10 @@ import android.view.inspector.WindowInspector
 import android.widget.EditText
 import android.widget.HorizontalScrollView
 import android.widget.ScrollView
+import androidx.activity.findViewTreeOnBackPressedDispatcherOwner
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.facebook.react.modules.websocket.WebSocketModule
 import com.facebook.react.uimanager.RootView
 import com.facebook.react.uimanager.TouchTargetHelper
 import okhttp3.OkHttpClient
@@ -33,7 +37,10 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.InetAddress
+import java.net.Socket
 import java.util.concurrent.TimeUnit
+import javax.net.SocketFactory
 
 /**
  * Mantis native agent. Compiled in only with MANTIS_E2E=1 (src/mantis, see build.gradle) and started by
@@ -46,7 +53,21 @@ import java.util.concurrent.TimeUnit
 object MantisAgent {
   private const val URL = "ws://localhost:9123/?role=native"
   private val main = Handler(Looper.getMainLooper())
-  private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).build()
+  private val client = OkHttpClient.Builder().readTimeout(0, TimeUnit.MILLISECONDS).socketFactory(NoDelay).build()
+
+  /**
+   * TCP_NODELAY. Without it a message over 8 KB (OkHttp writes 8 KB segments) waits ~45 ms for the ACK of the first
+   * segment (Nagle vs adbd's delayed ACK; S22, adb reverse): every snapshot of a busy screen.
+   */
+  private object NoDelay : SocketFactory() {
+    private val d = SocketFactory.getDefault()
+    private fun Socket.nd() = apply { tcpNoDelay = true }
+    override fun createSocket() = d.createSocket().nd()
+    override fun createSocket(host: String, port: Int) = d.createSocket(host, port).nd()
+    override fun createSocket(host: String, port: Int, local: InetAddress, localPort: Int) = d.createSocket(host, port, local, localPort).nd()
+    override fun createSocket(host: InetAddress, port: Int) = d.createSocket(host, port).nd()
+    override fun createSocket(host: InetAddress, port: Int, local: InetAddress, localPort: Int) = d.createSocket(host, port, local, localPort).nd()
+  }
   private lateinit var app: Application
   private var activity: Activity? = null
   private var ws: WebSocket? = null
@@ -54,6 +75,9 @@ object MantisAgent {
   @JvmStatic
   fun install(application: Application) {
     app = application
+    // the JS agent's socket is RN's WebSocket: same fix. ponytail: replaces an app's own custom builder (E2E builds
+    // only; RN has no getter to chain it)
+    WebSocketModule.setCustomClientBuilder { it.socketFactory(NoDelay) }
     app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
       override fun onActivityResumed(a: Activity) { activity = a }
       override fun onActivityPaused(a: Activity) { if (activity == a) activity = null }
@@ -263,6 +287,26 @@ object MantisAgent {
       .put("chain", ancestorTags(view).apply { if (view.id != tag) put(tag) })
   }
 
+  /**
+   * [v] is not covered: a touch at the centre of its visible part lands on it, a descendant, its own ancestor (v is
+   * pointerEvents none), or a view of the same window that doesn't cover all of that part (a card's content drawn
+   * over the card).
+   * Covered: by the keyboard, another window (Modal, dialog), or a view over all of it (sheet backdrop).
+   */
+  private fun reaches(v: View): Boolean {
+    val r = Rect()
+    if (!v.getGlobalVisibleRect(r)) return false
+    val o = IntArray(2).also { v.rootView.getLocationOnScreen(it) }
+    r.offset(o[0], o[1])
+    val chain = hitTest(r.exactCenterX() / density, r.exactCenterY() / density).optJSONArray("chain") ?: return false
+    val hit = (0 until chain.length()).map { chain.getInt(it) }
+    if (v.id in hit) return true
+    val up = ancestorTags(v)
+    if ((0 until up.length()).any { up.getInt(it) == hit.firstOrNull() }) return true
+    val over = hit.firstOrNull()?.let { findView(it) } ?: return false
+    return over.rootView === v.rootView && !screenRect(over).contains(r)
+  }
+
   private fun leafAt(v: View, x: Float, y: Float): View {
     if (v is ViewGroup) for (i in v.childCount - 1 downTo 0) {
       val c = v.getChildAt(i)
@@ -273,17 +317,37 @@ object MantisAgent {
 
   private fun handle(method: String, p: JSONObject, done: (Any?) -> Unit) {
     when (method) {
-      // Visible share per tag (Detox semantics, see visibleRatio), for toBeInViewport and filter({ visible })
+      // Visible share per tag (Detox semantics, see visibleRatio), for toBeInViewport and filter({ visible }).
+      // hit: true (App.snapshot) adds per tag whether a touch at the centre of its visible part reaches it (null = no
+      // resumed activity, can't tell), and once: focused (a window of the app has focus; false under a system
+      // dialog), keyboard (IME rect or null) and screen size, all in screen dp.
       "Layout.visibility" -> {
         val tags = p.getJSONArray("tags")
+        val withHit = p.optBoolean("hit")
         val out = JSONArray()
         val shown = JSONArray() // in a window and not hidden: what Detox/Espresso can match (screens below are not)
+        val hits = JSONArray()
         for (i in 0 until tags.length()) {
           val v = if (tags.isNull(i)) null else findView(tags.getInt(i))
-          out.put(visibleRatio(v))
+          val ratio = visibleRatio(v)
+          out.put(ratio)
           shown.put(v?.isShown == true)
+          if (withHit) hits.put(if (ratio == 0.0) false else if (decorOrNull == null) JSONObject.NULL else reaches(v!!))
         }
-        done(JSONObject().put("ratios", out).put("shown", shown))
+        val res = JSONObject().put("ratios", out).put("shown", shown)
+        if (withHit) {
+          val decor = decorOrNull
+          val win = decor ?: roots().lastOrNull() // the activity window is the bottom one
+          val ime = decor?.let { ViewCompat.getRootWindowInsets(it)?.getInsets(WindowInsetsCompat.Type.ime())?.bottom } ?: 0
+          val keyboard = if (decor != null && ime > 0) screenRect(decor).let {
+            JSONObject().put("x", it.left / density).put("y", (it.bottom - ime) / density)
+              .put("width", it.width() / density).put("height", ime / density)
+          } else JSONObject.NULL
+          res.put("hit", hits).put("focused", roots().any { it.hasWindowFocus() }).put("keyboard", keyboard)
+            .put("screen", JSONObject().put("width", (win?.width ?: 0) / density).put("height", (win?.height ?: 0) / density)
+              .put("density", density))
+        }
+        done(res)
       }
 
       // Detox scrollTo(edge): jump the scroll view to its start/end (programmatic, like Detox's edge scroll).
@@ -398,7 +462,9 @@ object MantisAgent {
 
       // Text via the IME path (InputConnection), not by setting props. replace = select all first (Playwright fill).
       "Input.typeText" -> {
-        val focused = roots().firstNotNullOfOrNull { it.findFocus() }
+        // the window that has window focus: popups never get it, but keep a focused view of their own (Samsung's text
+        // selection toolbar after select-all: a focused RelativeLayout above the activity)
+        val focused = roots().firstOrNull { it.hasWindowFocus() }?.findFocus()
         if (focused !is EditText) { done(JSONObject().put("ok", false).put("reason", "focused: ${focused?.javaClass?.simpleName}")); return }
         val want = p.optJSONArray("tags")?.let { t -> (0 until t.length()).map { t.optInt(it) } }
         if (want != null && focused.id !in want) { done(JSONObject().put("ok", false).put("reason", "focus still on tag ${focused.id}")); return }
@@ -422,6 +488,33 @@ object MantisAgent {
         val imm = app.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
         val hidden = roots().any { imm.hideSoftInputFromWindow(it.windowToken, 0) }
         done(JSONObject().put("ok", hidden))
+      }
+
+      // The back button, in-process (~ms instead of `adb shell input keyevent 4`'s process start), to the window that
+      // has focus: the activity, or a Modal's Dialog (closes like a real back: onRequestClose). First as a key event
+      // (what the system sends without predictive back; a Modal's OnKeyListener takes it either way), then, when nothing
+      // took it (predictive back: targetSdk 36 on Android 16 never calls onBackPressed from a key), the window's
+      // OnBackPressedDispatcher, which the system's OnBackInvokedCallback would call. On the root screen that ends like a
+      // real back too (RN: JS has no handler → invokeDefaultOnBackPressed → the task goes to the background).
+      // ok: false = do it the system's way (adb keyevent): no window of the app has focus (system dialog), the keyboard is
+      // up (a real back closes the IME, which an in-process event never reaches), or nothing in the window took it.
+      // ponytail: non-predictive back with an enabled androidx callback goes key-first, i.e. through
+      // Activity.onBackPressed like a real key; the dispatcher only runs if that one returns unhandled.
+      "Input.back" -> {
+        val win = roots().firstOrNull { it.hasWindowFocus() }
+          ?: run { done(JSONObject().put("ok", false).put("reason", "no window of the app has focus")); return }
+        if (ViewCompat.getRootWindowInsets(win)?.isVisible(WindowInsetsCompat.Type.ime()) == true) {
+          done(JSONObject().put("ok", false).put("reason", "keyboard on screen")); return
+        }
+        val t = SystemClock.uptimeMillis()
+        val key = { action: Int -> win.dispatchKeyEvent(KeyEvent(t, SystemClock.uptimeMillis(), action, KeyEvent.KEYCODE_BACK, 0, 0,
+          KeyCharacterMap.VIRTUAL_KEYBOARD, 0, KeyEvent.FLAG_FROM_SYSTEM or KeyEvent.FLAG_VIRTUAL_HARD_KEY, InputDevice.SOURCE_KEYBOARD)) }
+        key(KeyEvent.ACTION_DOWN)
+        val via = if (key(KeyEvent.ACTION_UP)) "key" else win.findViewTreeOnBackPressedDispatcherOwner()?.let {
+          it.onBackPressedDispatcher.onBackPressed(); "dispatcher"
+        }
+        done(if (via == null) JSONObject().put("ok", false).put("reason", "back not handled by ${win.javaClass.simpleName}")
+          else JSONObject().put("ok", true).put("via", via).put("window", win.javaClass.simpleName))
       }
 
       else -> error("unknown method $method")
