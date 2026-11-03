@@ -115,7 +115,7 @@ static MantisAgent *shared;
   _ws = [NSURLSession.sharedSession webSocketTaskWithURL:[NSURL URLWithString:url]];
   [_ws resume];
   // v: src/runner PROTOCOL; token: proves to the runner that it launched this app (simulators share localhost)
-  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @1, @"token": token}}];
+  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @2, @"token": token}}];
   [self receive];
 }
 

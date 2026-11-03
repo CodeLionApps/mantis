@@ -15,7 +15,7 @@ const PORT =
 const DEFAULT_TIMEOUT = 10000;
 const CONNECT_TIMEOUT = 15000;
 // bumped on incompatible changes; agents send it in Agent.hello (an app built with another Mantis version)
-const PROTOCOL = 1;
+const PROTOCOL = 2;
 
 /** Detox's toBeVisible threshold (≥ 75% of the view shown), for toBeInViewport. */
 const DETOX_VISIBLE = Object.freeze({ ratio: 0.75 });

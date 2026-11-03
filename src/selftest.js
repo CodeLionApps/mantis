@@ -140,7 +140,7 @@ function checkContract() {
   const old = new NodeWS(`${URL}/?role=native`);
   old.onopen = () => old.send(hello("native", { v: 0 }));
   await closed(old);
-  await assert.rejects(app.native.ready(50), /protocol v0, runner v1/);
+  await assert.rejects(app.native.ready(50), new RegExp(`protocol v0, runner v${PROTOCOL}`));
 
   // a frame ws rejects (RSV1 without permessage-deflate) emits "error" on the socket; the runner must survive it
   await new Promise((resolve) => {

@@ -413,7 +413,7 @@ function getLaunchArgs() {
   return launchArgs;
 }
 
-const PROTOCOL = 1; // src/runner PROTOCOL
+const PROTOCOL = 2; // src/runner PROTOCOL
 let ws = null;
 let retries = 0;
 const CTX = Math.random().toString(36).slice(2); // JS context identity
