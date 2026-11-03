@@ -9,3 +9,5 @@ example/android/app/build/
 example/android/build/
 example/android/.gradle/
 example/vendor/
+example/ios/build-device/
+local-docs/
