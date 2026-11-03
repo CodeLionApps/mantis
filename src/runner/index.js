@@ -361,10 +361,11 @@ class App {
 
   /**
    * The back button, as on Android: { ok, via, reason }. Android: the native agent's Input.back (a back key to the window
-   * with focus). iOS has none, so the steps of Android's in its order: no back when the app is not active or an alert of
-   * its own is on top (focused false; the caller does it another way); the keyboard closes (a first back closes the IME);
-   * else the JS agent's Input.back (the topmost Modal's onRequestClose, then the BackHandler listeners, last first); else
-   * a native navigation controller pops (a native stack no BackHandler listener knows). ok: false = nothing took it
+   * with focus). iOS has none, so the steps of Android's in its order: no back when the app is not active (the caller
+   * does it another way); the keyboard closes (a first back closes the IME); else an alert of the app's own on top
+   * (focused false) runs its cancel-style action, as back cancels a cancelable AlertDialog; else the JS agent's
+   * Input.back (the topmost Modal's onRequestClose, then the BackHandler listeners, last first); else a native
+   * navigation controller pops (a native stack no BackHandler listener knows). ok: false = nothing took it
    * (Android would leave the app). Settles after a back that was taken, as tap and fill do.
    */
   async back() {
@@ -372,20 +373,69 @@ class App {
     if (this.platform !== "ios") r = await this.native.call("Input.back");
     else {
       const { focused, keyboard, appState } = await this.native.call("Layout.visibility", { tags: [], hit: true });
-      if (!focused)
-        return { ok: false, reason: appState ? "app not active (a system alert or another app in front)" : "an alert of the app" };
+      if (!focused && appState) return { ok: false, reason: "app not active (a system alert or another app in front)" };
       if (keyboard)
         r = (await this.native.call("Input.hideKeyboard")).ok ? { ok: true, via: "keyboard" } : { ok: false, reason: "keyboard on screen" };
       else {
-        r = await this.js.call("Input.back");
-        if (!r.ok) {
-          const nav = await this.native.call("Input.back");
-          r = nav.ok ? nav : { ok: false, reason: `${r.reason}; ${nav.reason}` };
+        // an alert of the app's own: the native agent runs its cancel-style action (Android's back on a cancelable
+        // dialog); "no alert" = it closed since Layout.visibility: the usual steps, no pop in its place
+        if (!focused) r = await this.native.call("Input.back", { alert: true });
+        if (!r || r.reason === "no alert") {
+          r = await this.js.call("Input.back");
+          if (!r.ok) {
+            const nav = await this.native.call("Input.back");
+            r = nav.ok ? nav : { ok: false, reason: `${r.reason}; ${nav.reason}` };
+          }
         }
       }
     }
     if (r.ok) await this.settle();
     return r;
+  }
+
+  /**
+   * Waits until the app stands still: no React commit and nothing changed on screen for quietMs, no request in flight.
+   * Screen: Android, a window of the app drew; iOS, a layer changed or an animation runs (transitions, native-driver
+   * and Reanimated frames, scrolling). Throws on timeout, naming what is still busy (a spinner never stops).
+   * ponytail: Android's clock can't tell which view drew, so a focused text field's caret (a draw every 500 ms) keeps
+   * quietMs >= 500 from ever passing; blur the field first.
+   */
+  async idle({ quietMs = 100, timeout = DEFAULT_TIMEOUT } = {}) {
+    const t0 = performance.now();
+    // a ping waits for what's left of timeout (at least 100 ms, so one sent at the end can still answer): a stalled
+    // thread throws this TimeoutError, not the RPC's after 15 s
+    const ping = (peer, thread) => {
+      const ms = Math.max(100, t0 + timeout - performance.now());
+      let timer;
+      return Promise.race([
+        peer.call("Agent.ping").finally(() => clearTimeout(timer)),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new TimeoutError(`app not idle after ${timeout}ms: the ${thread} thread didn't answer`)),
+            ms,
+          );
+        }),
+      ]);
+    };
+    for (;;) {
+      const iter = performance.now();
+      const [js, ui] = await Promise.all([
+        ping(this.js, "JS"),
+        // an iOS agent older than the draw clock: the JS clock alone
+        ping(this.native, "main").catch((e) => {
+          if (/unknown method/.test(e.message)) return {};
+          throw e;
+        }),
+      ]);
+      const busy = (js.net ?? []).map((r) => `request in flight for ${r.ms}ms: ${r.url}`);
+      if (js.idleMs < quietMs) busy.push(`React committed ${js.idleMs}ms ago`);
+      if (ui.idleMs < quietMs) busy.push(`screen changed ${Math.round(ui.idleMs)}ms ago${ui.busy ? ` (${ui.busy})` : ""}`);
+      if (!busy.length) return timing("idle", t0, iter);
+      if (performance.now() - t0 > timeout)
+        throw new TimeoutError(`app not idle after ${timeout}ms: ${busy.join("; ")}`);
+      // until both clocks can be quiet
+      await sleep(Math.max(16, quietMs - Math.min(js.idleMs ?? quietMs, ui.idleMs ?? quietMs)));
+    }
   }
 
   getByRole(role, { name } = {}) {
