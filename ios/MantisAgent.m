@@ -56,6 +56,20 @@ static __weak UIResponder *mantisFR;
 @implementation UIResponder (MantisFirstResponder)
 - (void)mantis_captureFirstResponder:(id)sender { mantisFR = self; }
 @end
+// The deepest shown navigation controller with more than one screen (tab → selected, navigation → top, containers →
+// their shown children, last first), or nil: what a back button would pop.
+static UINavigationController *backStack(UIViewController *vc) {
+  NSArray<UIViewController *> *next = [vc isKindOfClass:UITabBarController.class] ? @[((UITabBarController *)vc).selectedViewController ?: vc]
+    : [vc isKindOfClass:UINavigationController.class] ? @[((UINavigationController *)vc).topViewController ?: vc]
+    : vc.childViewControllers.reverseObjectEnumerator.allObjects;
+  for (UIViewController *c in next) {
+    if (c == vc || !c.isViewLoaded || !c.view.window || c.view.isHidden) continue;
+    UINavigationController *deeper = backStack(c);
+    if (deeper) return deeper;
+  }
+  return [vc isKindOfClass:UINavigationController.class] && ((UINavigationController *)vc).viewControllers.count > 1 ? (UINavigationController *)vc : nil;
+}
+
 static UIResponder *MantisFirstResponder(void) {
   mantisFR = nil;
   [UIApplication.sharedApplication sendAction:@selector(mantis_captureFirstResponder:) to:nil from:nil forEvent:nil];
@@ -532,6 +546,23 @@ static NSString *transitionReason(UIWindow *w) {
       }
     }];
     done(@{@"ok": @YES, @"fallbacks": @(fallbacks), @"windows": drawn, @"png": [UIImagePNGRepresentation(img) base64EncodedStringWithOptions:0]});
+  } else if ([method isEqualToString:@"Input.back"]) {
+    // The back button, in-process, as Input.back on Android: pops the topmost navigation controller that can go back (a
+    // native stack: the pop its back button or edge swipe does). iOS has no system back: a JS stack (@react-navigation/stack)
+    // or a presented RN Modal has no such controller (ok: false). ok: false also when the app is not active (a system
+    // alert over it) or the keyboard is up; the caller does it another way then.
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive)
+      return done(@{@"ok": @NO, @"reason": @"app not active (a system alert or another app in front)"});
+    CGRect kb = CGRectIntersection(_keyboard, UIScreen.mainScreen.bounds);
+    if (!CGRectIsNull(kb) && kb.size.height >= 1) return done(@{@"ok": @NO, @"reason": @"keyboard on screen"});
+    UIViewController *top = self.windows.firstObject.rootViewController;
+    for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if ([top isKindOfClass:UIAlertController.class]) return done(@{@"ok": @NO, @"reason": @"an alert of the app"});
+    UINavigationController *nav = backStack(top);
+    if (!nav) return done(@{@"ok": @NO, @"reason": @"no native navigation stack to pop"});
+    [nav popViewControllerAnimated:YES];
+    done(@{@"ok": @YES, @"via": @"navigation", @"controller": NSStringFromClass(nav.class)});
   } else if ([method isEqualToString:@"Input.hideKeyboard"]) {
     // what a user does when the keyboard covers the next target (Detox's replaceText never opens it)
     done(@{@"ok": @([UIApplication.sharedApplication sendAction:@selector(resignFirstResponder) to:nil from:nil forEvent:nil])});
