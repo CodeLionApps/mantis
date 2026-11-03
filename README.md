@@ -190,6 +190,13 @@ without XCTest: no status bar, keyboard or system alerts.
   alert is over the app, a native push or pop is still animating, or nothing took it (Android would leave the app). RN's `BackHandler` is a no-op on iOS; the
   JS agent keeps the listeners, but only for `app.back()`.
 
+`await app.idle({ quietMs = 100, timeout })` waits until the app stands still: no React commit and nothing changed on
+screen for `quietMs`, and no XHR / `fetch` in flight. On screen: Android, a window of the app drew; iOS, a layer changed
+or an animation runs (stack transitions, native-driver and Reanimated frames, scrolling, Modal fades; not the keyboard
+or a text cursor). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a
+transition. On timeout it throws, naming what is still busy: a spinner or a looping animation never stops. JS timers
+are not tracked.
+
 ## Channel
 
 The runner listens on `127.0.0.1` only (Android reaches it through `adb reverse`). Agents say hello with the

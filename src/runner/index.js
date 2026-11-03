@@ -378,6 +378,34 @@ class App {
     return r;
   }
 
+  /**
+   * Waits until the app stands still: no React commit and nothing changed on screen for quietMs, no request in flight.
+   * Screen: Android, a window of the app drew; iOS, a layer changed or an animation runs (transitions, native-driver
+   * and Reanimated frames, scrolling). Throws on timeout, naming what is still busy (a spinner never stops).
+   */
+  async idle({ quietMs = 100, timeout = DEFAULT_TIMEOUT } = {}) {
+    const t0 = performance.now();
+    for (;;) {
+      const iter = performance.now();
+      const [js, ui] = await Promise.all([
+        this.js.call("Agent.ping"),
+        // an iOS agent older than the draw clock: the JS clock alone
+        this.native.call("Agent.ping").catch((e) => {
+          if (/unknown method/.test(e.message)) return {};
+          throw e;
+        }),
+      ]);
+      const busy = (js.net ?? []).map((r) => `request in flight for ${r.ms}ms: ${r.url}`);
+      if (js.idleMs < quietMs) busy.push(`React committed ${js.idleMs}ms ago`);
+      if (ui.idleMs < quietMs) busy.push(`screen changed ${Math.round(ui.idleMs)}ms ago${ui.busy ? ` (${ui.busy})` : ""}`);
+      if (!busy.length) return timing("idle", t0, iter);
+      if (performance.now() - t0 > timeout)
+        throw new TimeoutError(`app not idle after ${timeout}ms: ${busy.join("; ")}`);
+      // until both clocks can be quiet
+      await sleep(Math.max(16, quietMs - Math.min(js.idleMs ?? quietMs, ui.idleMs ?? quietMs)));
+    }
+  }
+
   getByRole(role, { name } = {}) {
     return new Locator(this, { role, name: norm(name) });
   }
