@@ -290,9 +290,10 @@ object MantisAgent {
 
   /**
    * [v] is not covered: a touch at the centre of its visible part lands on it, a descendant, its own ancestor (v is
-   * pointerEvents none), or a view of the same window that doesn't cover all of that part (a card's content drawn
-   * over the card).
-   * Covered: by the keyboard, another window (Modal, dialog), or a view over all of it (sheet backdrop).
+   * pointerEvents none), or a view of the same window that, with every parent below the common ancestor, doesn't
+   * cover all of that part (a card's content drawn over the card).
+   * Covered: by the keyboard, another window (Modal, dialog), or a view over all of it (sheet backdrop, a sheet whose
+   * QR code took the touch). ponytail: a pointerEvents box-none wrapper on that path still counts as covering.
    */
   private fun reaches(v: View): Boolean {
     val r = Rect()
@@ -305,7 +306,11 @@ object MantisAgent {
     val up = ancestorTags(v)
     if ((0 until up.length()).any { up.getInt(it) == hit.firstOrNull() }) return true
     val over = hit.firstOrNull()?.let { findView(it) } ?: return false
-    return over.rootView === v.rootView && !screenRect(over).contains(r)
+    if (over.rootView !== v.rootView) return false
+    val vUp: Set<Any> = generateSequence(v.parent) { it.parent }.toSet()
+    var a: Any? = over
+    while (a is View && a !in vUp) { if (screenRect(a).contains(r)) return false; a = a.parent }
+    return true
   }
 
   private fun leafAt(v: View, x: Float, y: Float): View {
