@@ -4,6 +4,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Animated,
   BackHandler,
   FlatList,
@@ -241,6 +242,29 @@ function Gestures({ onBack }: { onBack: () => void }) {
   );
 }
 
+// Alert lab for app.back(): back runs the cancel-style button, an alert without one stays
+function Alerts({ onBack }: { onBack: () => void }) {
+  const [log, setLog] = useState<string[]>([]);
+  const add = (s: string) => () => setLog(l => [...l, s]);
+  return (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Alerty</Text>
+      <Button
+        title="Usuń"
+        onPress={() =>
+          Alert.alert('Usunąć?', undefined, [
+            { text: 'Anuluj', style: 'cancel', onPress: add('anulowano') },
+            { text: 'Usuń', style: 'destructive', onPress: add('usunięto') },
+          ])
+        }
+      />
+      <Button title="Info" onPress={() => Alert.alert('Gotowe', undefined, [{ text: 'OK', onPress: add('ok') }])} />
+      <Text style={styles.body}>Log: {log.join(', ') || 'pusty'}</Text>
+      <Button title="Wstecz" onPress={onBack} />
+    </View>
+  );
+}
+
 const SCREENS = {
   Logowanie: LoginFlow,
   Licznik: Counter,
@@ -250,6 +274,7 @@ const SCREENS = {
   Formularz: Form,
   Gesty: Gestures,
   Przewijanie: Scrolling,
+  Alerty: Alerts,
 };
 
 export default function App() {
