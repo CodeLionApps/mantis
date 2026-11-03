@@ -30,15 +30,17 @@
 // installed at load. A property set to a new value on the main thread: a mount, a native-driver / Reanimated frame, a
 // scroll or fling, an image landing. And addAnimation:forKey:, as UIKit transitions, UIView animations,
 // react-native-screens and spinners move in the render server, where no setter fires: the screen counts as changing
-// until the animation's end, and a loop (a spinner) keeps its layer for the ping to check.
+// until the animation's end, and a loop (a spinner) until it stops; the ping checks both are still on their layer.
 static CFTimeInterval mantisChangedAt; // CACurrentMediaTime of the last change
 static NSUInteger mantisChanges;
 static Class mantisChangedClass; // what the last change was: its view's class and tag, the setter
 static NSInteger mantisChangedTag;
 static const char *mantisChangedHow;
-static CFTimeInterval mantisAnimEnd; // when the last-ending animation stops
-static NSString *mantisAnimWhat; // ...and what it animates
-static NSHashTable<CALayer *> *mantisLoops; // weak: layers given a loop; a ping drops the ones without animations
+static CFTimeInterval mantisAnimEnd; // when the last-ending animation that a ping saw finish stopped
+// weak layer -> animation key (@"": none) -> when it stops (INFINITY: a loop). A ping drops what ended, was removed or
+// replaced, or left the window. ponytail: setHidden, backgroundColor and drawRect aren't hooked; RN sets them with a
+// mount, which moves a layer too, but a native view that only recolours or redraws isn't seen.
+static NSMapTable<CALayer *, NSMutableDictionary<NSString *, NSNumber *> *> *mantisAnims;
 
 static void mantisChanged(CALayer *l, const char *how) {
   mantisChanges++;
@@ -58,12 +60,14 @@ static void mantisChanged(CALayer *l, const char *how) {
   })); \
 } while (0)
 
-// Seconds an animation moves: 0 for one that never progresses (infinite duration: iOS 26's keyboard glass layers
-// that follow another layer), more than a minute for a loop (a spinner, a text cursor).
-static double mantisActive(CAAnimation *a) {
-  if (isinf(a.duration)) return 0;
-  if (a.repeatDuration > 0) return a.repeatDuration;
-  return (a.duration ?: 0.25) * MAX(a.repeatCount, 1) * (a.autoreverses ? 2 : 1);
+// Seconds an animation on l moves: 0 for one that never progresses (infinite duration: iOS 26's keyboard glass layers
+// that follow another layer; speed 0), more than a minute for a loop (a spinner, a text cursor). Called while it's
+// added: an implicit animation (duration 0) takes its transaction's duration, 0.25 s unless set.
+static double mantisActive(CAAnimation *a, CALayer *l) {
+  float speed = fabsf(a.speed * l.speed);
+  if (isinf(a.duration) || speed == 0) return 0;
+  if (a.repeatDuration > 0) return a.repeatDuration / speed;
+  return (a.duration ?: CATransaction.animationDuration) * MAX(a.repeatCount, 1) * (a.autoreverses ? 2 : 1) / speed;
 }
 
 // The keyboard's windows don't count: its bar's labels morph for a second after each field, and the keyboard is
@@ -79,7 +83,7 @@ static BOOL mantisKeyboardLayer(CALayer *l) {
 
 static void mantisHookLayers(void) {
   mantisChangedAt = CACurrentMediaTime();
-  mantisLoops = [NSHashTable weakObjectsHashTable];
+  mantisAnims = [NSMapTable weakToStrongObjectsMapTable];
   MANTIS_HOOK(setPosition, CGPoint, CGPointEqualToPoint(l.position, v));
   MANTIS_HOOK(setBounds, CGRect, CGRectEqualToRect(l.bounds, v));
   MANTIS_HOOK(setTransform, CATransform3D, CATransform3DEqualToTransform(l.transform, v));
@@ -91,25 +95,25 @@ static void mantisHookLayers(void) {
     if (pthread_main_np() && !mantisKeyboardLayer(l)) {
       mantisChanged(l, "addAnimation");
       CFTimeInterval now = mantisChangedAt;
-      double active = mantisActive(a);
+      double active = mantisActive(a, l);
       // beginTime: 0 = now, else in the layer's time (UIKit's delay)
       CFTimeInterval end = (a.beginTime > 0 ? now + a.beginTime - [l convertTime:now fromLayer:nil] : now) + active;
-      if (active > 60) [mantisLoops addObject:l];
-      else if (end > mantisAnimEnd) {
-        mantisAnimEnd = end;
-        mantisAnimWhat = [NSString stringWithFormat:@"%@ animating %@", NSStringFromClass([(l.delegate ?: l) class]), k];
-      }
+      NSMutableDictionary<NSString *, NSNumber *> *ends = [mantisAnims objectForKey:l];
+      if (!ends) [mantisAnims setObject:(ends = [NSMutableDictionary new]) forKey:l];
+      ends[k ?: @""] = @(active > 60 ? INFINITY : end);
     }
     orig(l, @selector(addAnimation:forKey:), a, k);
   }));
 }
 
-// A loop on screen: in a window, not hidden, and not a text cursor (a focused input's caret blinks forever; Android's
-// blink draws are 500 ms apart, so they never hold the idle wait either)
-static BOOL mantisLoopShown(CALayer *l) {
-  for (; l; l = l.superlayer) {
-    if (l.hidden || [l.delegate conformsToProtocol:@protocol(UITextInput)]) return NO;
-    if ([l.delegate isKindOfClass:UIWindow.class]) return YES;
+// An animation on screen: its layer is in a window. A loop must also be seen: not hidden or transparent, itself or an
+// ancestor (a loading overlay faded out but mounted), its rect inside the window, and not a text cursor (a focused
+// input's caret blinks forever). Model values: a fade or slide still running is an animation of its own.
+static BOOL mantisShown(CALayer *l, BOOL loop) {
+  for (CALayer *s = l; s; s = s.superlayer) {
+    if (loop && (s.hidden || s.opacity < 0.01 || [s.delegate conformsToProtocol:@protocol(UITextInput)])) return NO;
+    if ([s.delegate isKindOfClass:UIWindow.class])
+      return !loop || CGRectIntersectsRect([l convertRect:l.bounds toLayer:s], s.bounds);
   }
   return NO;
 }
@@ -664,18 +668,25 @@ static NSString *transitionReason(UIWindow *w) {
     // Draw clock for the runner's idle wait, as on Android: idleMs = ms since something in the app's windows last
     // changed on screen, draws = how many changes so far. busy, for the runner's error: the animation still running,
     // else the last change (its view's class and React tag, the setter).
-    CFTimeInterval now = CACurrentMediaTime(), last = MAX(mantisChangedAt, MIN(mantisAnimEnd, now));
-    NSString *busy = mantisAnimEnd > now ? mantisAnimWhat : nil;
-    for (CALayer *l in mantisLoops.allObjects) {
-      NSArray<NSString *> *keys = l.animationKeys;
-      if (!keys.count) [mantisLoops removeObject:l];
-      else if (mantisLoopShown(l))
-        for (NSString *k in keys)
-          if (mantisActive([l animationForKey:k]) > 60) {
-            last = now;
-            busy = busy ?: [NSString stringWithFormat:@"%@ animating %@ in a loop", NSStringFromClass([(l.delegate ?: l) class]), k];
-          }
+    CFTimeInterval now = CACurrentMediaTime();
+    NSString *busy;
+    for (CALayer *l in mantisAnims.keyEnumerator.allObjects) {
+      NSMutableDictionary<NSString *, NSNumber *> *ends = [mantisAnims objectForKey:l];
+      for (NSString *k in ends.allKeys) {
+        CFTimeInterval end = ends[k].doubleValue;
+        // still on the layer; one added without a key can't be looked up (a loop's dropped, a finite one trusted)
+        BOOL there = k.length ? [l animationForKey:k] != nil : !isinf(end);
+        if (end <= now) mantisAnimEnd = MAX(mantisAnimEnd, end);
+        else if (there && mantisShown(l, isinf(end))) {
+          busy = busy ?: [NSString stringWithFormat:@"%@ animating %@%s", NSStringFromClass([((id)l.delegate ?: l) class]), k,
+                          isinf(end) ? " in a loop" : ""];
+          continue;
+        } else if (there && isinf(end)) continue; // a loop out of sight may come back
+        [ends removeObjectForKey:k];
+      }
+      if (!ends.count) [mantisAnims removeObjectForKey:l];
     }
+    CFTimeInterval last = busy ? now : MAX(mantisChangedAt, mantisAnimEnd);
     busy = busy ?: [NSString stringWithFormat:@"%@ tag %ld %s", mantisChangedClass, (long)mantisChangedTag, mantisChangedHow];
     done(@{@"draws": @(mantisChanges), @"idleMs": @((now - last) * 1000), @"busy": busy});
   } else if ([method isEqualToString:@"Input.hideKeyboard"]) {
