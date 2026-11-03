@@ -43,8 +43,9 @@ function Login({ onLogin, onBack }: { onLogin: (name: string) => void; onBack: (
   return (
     <View style={styles.screen}>
       <Text style={styles.title}>Logowanie</Text>
-      <TextInput testID="email" accessibilityLabel="E-mail" style={styles.input} value={email} onChangeText={setEmail} autoCapitalize="none" />
-      <TextInput testID="password" accessibilityLabel="Hasło" style={styles.input} value={password} onChangeText={setPassword} secureTextEntry />
+      <TextInput testID="email" accessibilityLabel="E-mail" placeholder="ala@example.com" style={styles.input} value={email} onChangeText={setEmail} autoCapitalize="none" />
+      <Text nativeID="password-label" style={styles.body}>Hasło do konta</Text>
+      <TextInput testID="password" accessibilityLabelledBy="password-label" placeholder="Hasło" style={styles.input} value={password} onChangeText={setPassword} secureTextEntry />
       <Button title={busy ? 'Logowanie…' : 'Zaloguj'} disabled={busy || !email || !password} onPress={submit} />
       {/* tap counter for spike Q4 (XCUITest tap latency + delivery) */}
       <Button title={`Licznik ${taps}`} onPress={() => setTaps(n => n + 1)} />
