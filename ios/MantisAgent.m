@@ -561,6 +561,8 @@ static NSString *transitionReason(UIWindow *w) {
     if ([top isKindOfClass:UIAlertController.class]) return done(@{@"ok": @NO, @"reason": @"an alert of the app"});
     UINavigationController *nav = backStack(top);
     if (!nav) return done(@{@"ok": @NO, @"reason": @"no native navigation stack to pop"});
+    // a pop during a push or pop leaves the stack and its bar out of step; ok: false, back again once it is over
+    if (nav.transitionCoordinator) return done(@{@"ok": @NO, @"reason": @"a navigation transition is in progress"});
     [nav popViewControllerAnimated:YES];
     done(@{@"ok": @YES, @"via": @"navigation", @"controller": NSStringFromClass(nav.class)});
   } else if ([method isEqualToString:@"Input.hideKeyboard"]) {

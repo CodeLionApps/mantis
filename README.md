@@ -178,15 +178,16 @@ an alert of the app's own. Both platforms report `hit`, `focused`, `keyboard` an
 screen scale). On iOS, `app.native.call("Page.screenshot")` returns `{ png }` (base64) of the app's own windows,
 without XCTest: no status bar, keyboard or system alerts.
 
-`await app.back()` is the back button: `{ ok, via, reason }`, ~ms, in-process.
+`await app.back()` is the back button: `{ ok, via, reason }`, ~ms, in-process, settled like `tap`.
 
 - Android: a back key to the window with focus (`via: "key"`, or `"dispatcher"` under predictive back). `ok: false`
-  when a system dialog has focus, the keyboard is up, or nothing took it: press back the system's way then.
+  when a system dialog has focus or the keyboard is up: press back the system's way then. An RN Activity always takes
+  the key, so a back no JS listener takes is still `ok: true, via: "key"` while the app leaves, as a real back would.
 - iOS has no back button, so Android's steps in Android's order: the keyboard closes (`via: "keyboard"`); the topmost
   visible `<Modal>` gets `onRequestClose` (`via: "modal"`; without one the back is swallowed, as on Android); the
   `BackHandler` `hardwareBackPress` listeners run last first until one returns `true` (`via: "backHandler"`;
   react-navigation registers one); a native `UINavigationController` pops (`via: "navigation"`). `ok: false` when an
-  alert is over the app or nothing took it (Android would leave the app). RN's `BackHandler` is a no-op on iOS; the
+  alert is over the app, a native push or pop is still animating, or nothing took it (Android would leave the app). RN's `BackHandler` is a no-op on iOS; the
   JS agent keeps the listeners, but only for `app.back()`.
 
 ## Channel

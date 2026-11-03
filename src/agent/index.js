@@ -340,15 +340,17 @@ try {
   const platform = require("react-native/Libraries/Utilities/Platform");
   if ((platform.default || platform).OS === "ios") {
     const m = require("react-native/Libraries/Utilities/BackHandler");
-    (m.default || m).addEventListener = (_eventName, handler) => {
-      if (!backListeners.includes(handler)) backListeners.push(handler);
-      return {
-        remove: () => {
-          const i = backListeners.indexOf(handler);
-          if (i !== -1) backListeners.splice(i, 1);
-        },
-      };
+    const bh = m.default || m;
+    const remove = (handler) => {
+      const i = backListeners.indexOf(handler);
+      if (i !== -1) backListeners.splice(i, 1);
     };
+    bh.addEventListener = (_eventName, handler) => {
+      if (!backListeners.includes(handler)) backListeners.push(handler);
+      return { remove: () => remove(handler) };
+    };
+    // RN 0.76 still has a no-op removeEventListener (removed later): a listener taken off that way must not stay here
+    if (bh.removeEventListener) bh.removeEventListener = (_eventName, handler) => remove(handler);
     try {
       HardwareBackPressEvent = require("react-native/Libraries/Utilities/HardwareBackPressEvent").HardwareBackPressEvent;
     } catch (e) {} // older RN: listeners get no argument
@@ -357,7 +359,8 @@ try {
 
 // What Android's back does once it reaches the app's JS, in its order. A shown <Modal> first: on Android it is a Dialog,
 // the window with focus, and takes the back whether or not it has an onRequestClose (without one nothing happens).
-// ponytail: the topmost Modal = the last shown one in tree order (a nested Modal comes after its parent).
+// ponytail: the topmost Modal = the last shown one in tree order (a nested Modal comes after its parent). Sibling
+// visible Modals: the last in tree order, not necessarily the one presented last; track presentation order if it matters.
 // Then the hardwareBackPress listeners, last registered first, until one returns true. None: Android leaves the app.
 function back() {
   let modal = null;
@@ -370,6 +373,7 @@ function back() {
     return { ok: true, via: "modal", handler: typeof close === "function" };
   }
   const event = HardwareBackPressEvent ? new HardwareBackPressEvent() : undefined;
+  // ponytail: a listener doing BackHandler.exitApp(); return true reports ok, though iOS's exitApp is a no-op
   for (let i = backListeners.length - 1; i >= 0; i--)
     if (backListeners[i]?.(event)) return { ok: true, via: "backHandler" };
   return { ok: false, reason: `no BackHandler listener took it (${backListeners.length} registered; Android would leave the app)` };

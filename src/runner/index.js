@@ -355,19 +355,27 @@ class App {
    * its own is on top (focused false; the caller does it another way); the keyboard closes (a first back closes the IME);
    * else the JS agent's Input.back (the topmost Modal's onRequestClose, then the BackHandler listeners, last first); else
    * a native navigation controller pops (a native stack no BackHandler listener knows). ok: false = nothing took it
-   * (Android would leave the app).
+   * (Android would leave the app). Settles after a back that was taken, as tap and fill do.
    */
   async back() {
-    if (this.platform !== "ios") return this.native.call("Input.back");
-    const { focused, keyboard, appState } = await this.native.call("Layout.visibility", { tags: [], hit: true });
-    if (!focused)
-      return { ok: false, reason: appState ? "app not active (a system alert or another app in front)" : "an alert of the app" };
-    if (keyboard)
-      return (await this.native.call("Input.hideKeyboard")).ok ? { ok: true, via: "keyboard" } : { ok: false, reason: "keyboard on screen" };
-    const js = await this.js.call("Input.back");
-    if (js.ok) return js;
-    const nav = await this.native.call("Input.back");
-    return nav.ok ? nav : { ok: false, reason: `${js.reason}; ${nav.reason}` };
+    let r;
+    if (this.platform !== "ios") r = await this.native.call("Input.back");
+    else {
+      const { focused, keyboard, appState } = await this.native.call("Layout.visibility", { tags: [], hit: true });
+      if (!focused)
+        return { ok: false, reason: appState ? "app not active (a system alert or another app in front)" : "an alert of the app" };
+      if (keyboard)
+        r = (await this.native.call("Input.hideKeyboard")).ok ? { ok: true, via: "keyboard" } : { ok: false, reason: "keyboard on screen" };
+      else {
+        r = await this.js.call("Input.back");
+        if (!r.ok) {
+          const nav = await this.native.call("Input.back");
+          r = nav.ok ? nav : { ok: false, reason: `${r.reason}; ${nav.reason}` };
+        }
+      }
+    }
+    if (r.ok) await this.settle();
+    return r;
   }
 
   getByRole(role, { name } = {}) {
