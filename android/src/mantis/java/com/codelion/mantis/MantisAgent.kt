@@ -438,7 +438,10 @@ object MantisAgent {
         // 0 would put DOWN and UP on one point: a tap on whatever is under it
         if (want == 0f) { done(JSONObject().put("ok", false).put("reason", "dx/dy is 0, nothing to scroll")); return }
         val start = sv.scrollX to sv.scrollY
-        val amount = (Math.abs(want) + slop).coerceAtMost((if (horizontal) vp.width() else vp.height()) * 0.8f) * Math.signum(want)
+        // the first MOVE goes just past the touch slop: ScrollView starts dragging on it but doesn't scroll by it (a
+        // child had the DOWN: onInterceptTouchEvent drops that whole move; none: onTouchEvent subtracts the slop)
+        val amount = (Math.abs(want) + slop + 1).coerceAtMost((if (horizontal) vp.width() else vp.height()) * 0.8f) * Math.signum(want)
+        val q = (slop + 1) / Math.abs(amount)
         // the drag: (x0, y0) -> (x1, y1) through the visible centre, along the axis
         val (ax, ay) = if (horizontal) amount / 2 to 0f else 0f to amount / 2
         val x0 = vp.exactCenterX() + ax
@@ -458,8 +461,8 @@ object MantisAgent {
           override fun doFrame(t: Long) = guard(end) {
             frame++
             val now = SystemClock.uptimeMillis()
-            if (frame <= moves) {
-              val k = 1 - (1 - frame.toFloat() / moves).let { it * it } // ease-out
+            if (frame <= moves + 1) {
+              val k = q + (1 - q) * (1 - (1 - (frame - 1f) / moves).let { it * it }) // slop, then ease-out
               move(f, MotionEvent.ACTION_MOVE, x0 + (x1 - x0) * k, y0 + (y1 - y0) * k)
               lastMove = now
             } else if (now - lastMove < 110) {
