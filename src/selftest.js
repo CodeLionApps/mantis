@@ -183,7 +183,7 @@ function checkContract() {
       }),
       "Action.check": () => checks.get(params.tag)?.() ?? { ok: true, point: { x: params.tag, y: 0 } },
       "Input.scroll": () => (scrolled.push(params), onScroll(params), { ok: true }),
-      "Input.typeText": () => ({ ok: true }),
+      "Input.typeText": () => ({ ok: true, focusedTag: params.tags?.[0] }),
       "Input.hideKeyboard": () => ({ ok: true }),
       "Input.back": () => (params.alert ? alert ?? { ok: false, reason: "no alert" } : nativeBack),
       "Input.tap": () => {
@@ -384,6 +384,94 @@ function checkContract() {
   shelf.type = "RCTScrollView";
   shelf.memoizedProps = { horizontal: true };
   assert.deepEqual((await id("card").all())[0].scrolls.map((s) => s.horizontal), [false, true]);
+
+  // text inputs without testIDs: by placeholder (Playwright: case-insensitive substring unless exact), by label, also
+  // through accessibilityLabelledBy (a Text's nativeID); the snapshot shows placeholder and value, never a password
+  const comp = (props, child) => Object.assign(host("", props, [child]), { tag: 0, stateNode: null }); // a component
+  const zero = { x: 0, y: 0, width: 0, height: 0 };
+  const email = host("RCTSinglelineTextInputView", { placeholder: "Adres e-mail", text: "ala@example.com" });
+  const password = host("RCTSinglelineTextInputView", { placeholder: "Hasło", accessibilityLabelledBy: "pw", secureTextEntry: true, text: "hunter2" });
+  global.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(1, {
+    current: {
+      child: host("RCTView", {}, [
+        email,
+        text("Hasło konta", { nativeID: "pw" }),
+        password,
+        // an icon button: its label is its text; a labelled view with a Text inside isn't a second match
+        host("RCTView", { accessibilityLabel: "Zamknij", onPress() {} }, [host("RNSVGSvgView", {})]),
+        host("RCTView", { accessibilityLabel: "Zapisz", onPress() {} }, [text("Zapisz")]),
+        // touch targets without press props: a role, onAccessibilityTap, gesture-handler's GestureDetector (v2 API: a
+        // Wrap component around the view; v3 hooks: a display: contents host view in between). A pan is no target.
+        host("RCTView", { testID: "role", role: "button" }),
+        host("RCTView", { testID: "a11y-tap", accessible: true, onAccessibilityTap() {} }),
+        comp({ gesture: { toGestureArray: () => [{ handlerName: "TapGestureHandler" }] } }, comp({}, host("RCTView", { testID: "gh-v2" }))),
+        comp(
+          { gesture: { type: "RaceGesture", gestures: [{ type: "PanGestureHandler" }, { type: "LongPressGestureHandler" }] } },
+          host("RNGestureHandlerDetector", { onStartShouldSetResponder() {} }, [host("RCTView", { testID: "gh-v3" })], zero),
+        ),
+        comp({ gesture: { type: "PanGestureHandler" } }, host("RNGestureHandlerDetector", {}, [host("RCTView", { testID: "gh-pan" })], zero)),
+        // someone else's gesture prop that throws doesn't fail the snapshot
+        comp({ get gesture() { throw new Error("getter"); } }, host("RCTView", { testID: "throws" })),
+        comp({ gesture: new Proxy({}, { get() { throw new Error("proxy"); } }) }, host("RCTView", { testID: "proxy" })),
+        // an icon in a button, both labelled the same: one match, the button
+        host("RCTView", { testID: "back-button", accessibilityLabel: "Wróć", onPress() {} }, [host("RNSVGSvgView", { accessibilityLabel: "Wróć" })]),
+        // a show-password toggle (secureTextEntry off) and a one-time code: masked by what they are for; the Text RN
+        // wraps an input's children in is never listed
+        host("RCTSinglelineTextInputView", { testID: "shown-password", textContentType: "password", text: "visible-secret" }, [text("child-secret")]),
+        host("RCTSinglelineTextInputView", { testID: "otp", autoComplete: "sms-otp", text: "123456" }),
+        // one nativeID on two screens (pushed twice): the label from the input's own screen
+        host("RCTView", {}, [text("Ekran A", { nativeID: "dup" }), host("RCTSinglelineTextInputView", { testID: "in-a", accessibilityLabelledBy: "dup" })]),
+        host("RCTView", {}, [text("Ekran B", { nativeID: "dup" }), host("RCTSinglelineTextInputView", { testID: "in-b", "aria-labelledby": "dup" })]),
+      ]),
+    },
+  });
+  const tagOfNode = async (l) => (await l.resolve())?.tag;
+  assert.equal(await tagOfNode(app.getByPlaceholder("E-MAIL")), tagOf(email));
+  assert.equal(await tagOfNode(app.getByPlaceholder(/^Has/)), tagOf(password));
+  await expect(app.getByPlaceholder("e-mail", { exact: true })).toHaveCount(0);
+  await expect(app.getByPlaceholder("Adres e-mail", { exact: true })).toHaveCount(1);
+  await expect(app.getByPlaceholder("a.")).toHaveCount(0); // a string, not a regex
+  assert.equal(await tagOfNode(app.getByLabel("Hasło konta")), tagOf(password));
+  await app.getByLabel("Hasło konta").fill("nowe");
+  await app.getByPlaceholder("e-mail").fill("ola@example.com");
+  await expect(app.getByText("Zamknij")).toHaveCount(1);
+  assert.equal((await app.getByText("Wróć").resolve()).tag, (await id("back-button").resolve()).tag);
+  // Detox by.text sends no labels flag: text only, as before
+  assert.equal((await app.js.call("Tree.query", { selector: { text: "Zamknij" } })).count, 0);
+  assert.equal((await app.getByLabel("Ekran B").resolve()).tag, (await id("in-b").resolve()).tag);
+  await expect(app.getByLabel("Ekran A")).toHaveCount(1);
+  await expect(app.getByText("child-secret")).toHaveCount(0);
+  assert.equal((await app.getByText("Zapisz").resolve()).type, "RCTText");
+  const form = (await app.js.call("Tree.snapshot")).nodes;
+  const node = (k, v) => form.find((n) => n[k] === v);
+  assert.deepEqual([node("tag", tagOf(email)).placeholder, node("tag", tagOf(email)).value], ["Adres e-mail", "ala@example.com"]);
+  assert.deepEqual([node("tag", tagOf(password)).label, node("tag", tagOf(password)).value], ["Hasło konta", "••••••••"]);
+  assert.doesNotMatch(JSON.stringify(form), /hunter2|visible-secret|child-secret|123456/);
+  assert.deepEqual(["shown-password", "otp"].map((t) => node("testID", t).value), ["••••••••", "••••••••"]);
+  assert(node("testID", "throws") && node("testID", "proxy"));
+  assert.equal(node("label", "Zamknij").name, "Zamknij");
+  assert.deepEqual(
+    ["role", "a11y-tap", "gh-v2", "gh-v3", "gh-pan"].map((t) => node("testID", t).pressable),
+    [true, true, true, true, false],
+  );
+  assert(!form.some((n) => n.type === "RNGestureHandlerDetector")); // display: contents, no box
+
+  // labelledBy targets: one nativeID map per commit, not a tree walk per labelled node
+  let idReads = 0;
+  const counted = new Proxy({}, { get: (t, k) => (k === "nativeID" && idReads++, t[k]) });
+  const labelled = () => host("RCTSinglelineTextInputView", { accessibilityLabelledBy: "pw" });
+  const commitLabelled = () =>
+    global.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(1, {
+      current: { child: host("RCTView", counted, [labelled(), labelled(), labelled()]) },
+    });
+  commitLabelled();
+  await app.js.call("Tree.snapshot");
+  await app.js.call("Tree.snapshot");
+  await expect(app.getByLabel("Hasło konta")).toHaveCount(4); // three here, the password input above
+  assert.equal(idReads, 1);
+  commitLabelled(); // a new commit builds it again
+  await app.js.call("Tree.snapshot");
+  assert(idReads > 1);
 
   // MANTIS_TRACE never records typed text (passwords)
   const traceFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "mantis-")), "trace.jsonl");

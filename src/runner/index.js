@@ -441,8 +441,9 @@ class App {
   getByRole(role, { name } = {}) {
     return new Locator(this, { role, name: norm(name) });
   }
+  /** Text, or a labelled view with no text inside by its own label (icon button); Detox by.text is text only. */
   getByText(text) {
-    return new Locator(this, { text: norm(text) });
+    return new Locator(this, { text: norm(text), labels: true });
   }
   getByLabel(label) {
     return new Locator(this, { label: norm(label) });
@@ -450,10 +451,16 @@ class App {
   getByTestId(testId) {
     return new Locator(this, { testId });
   }
+  /** A text input by its placeholder, as Playwright: a case-insensitive substring unless exact (getByText is exact). */
+  getByPlaceholder(text, { exact = false } = {}) {
+    return new Locator(this, { placeholder: exact ? norm(text) : loose(text) });
+  }
 }
 
 const norm = (v) =>
   v instanceof RegExp ? { regex: v.source, flags: v.flags } : v;
+const loose = (v) =>
+  typeof v === "string" ? { regex: v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), flags: "i" } : norm(v);
 
 class Locator {
   // visible: only matches with some part on screen natively; shown: only matches in a window and not hidden
@@ -502,7 +509,7 @@ class Locator {
   // chaining = descendant of this locator's selector (Detox withAncestor). ponytail: ignores this locator's
   // nth/filter, the ancestor is matched by selector only.
   getByText(text) {
-    return new Locator(this.app, { text: norm(text), within: this.selector });
+    return new Locator(this.app, { text: norm(text), labels: true, within: this.selector });
   }
   getByTestId(testId) {
     return new Locator(this.app, { testId, within: this.selector });

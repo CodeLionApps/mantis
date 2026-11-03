@@ -50,18 +50,73 @@ function handleCommit(root) {
 const HostComponent = 5;
 const HostText = 6;
 
+const isInput = (f) => f.type.includes("TextInput");
+// A password or one-time code: never sent to the runner (MANTIS_TRACE logs results). Also with secureTextEntry off
+// (a "show password" toggle), by what the input is for.
+const SECRET = /password|otp|one-?time/i;
+const isSecret = (f) => {
+  const p = f.memoizedProps || {};
+  return isInput(f) && (!!p.secureTextEntry || SECRET.test(p.textContentType ?? "") || SECRET.test(p.autoComplete ?? ""));
+};
+
+// a secret input's children (RN wraps them in a Text) are skipped, here and in hostFibers
 function hostChildrenText(fiber) {
   let out = "";
   for (let c = fiber.child; c; c = c.sibling) {
     if (c.tag === HostText) out += c.memoizedProps;
-    else out += hostChildrenText(c);
+    else if (!(c.tag === HostComponent && isSecret(c))) out += hostChildrenText(c);
   }
   return out;
 }
 
-function accessibleName(fiber) {
+// nativeID -> host fibers, once per commit (labelledBy targets)
+let idsOf = { commitId: -1, map: null };
+function nativeIds() {
+  if (idsOf.commitId === commitId) return idsOf.map;
+  const map = new Map();
+  for (const root of roots)
+    for (const [f] of hostFibers(root.current.child, [])) {
+      const id = (f.memoizedProps || {}).nativeID;
+      if (id != null) map.set(id, [...(map.get(id) || []), f]);
+    }
+  idsOf = { commitId, map };
+  return map;
+}
+
+// of several views with one nativeID (a screen pushed twice, list rows): the one sharing the deepest ancestor with fiber
+function nearest(fiber, candidates) {
+  if (candidates.length === 1) return candidates[0];
+  const up = new Map();
+  for (let a = fiber, d = 0; a; a = a.return, d++) up.set(a, d);
+  let best = null;
+  let bestD = Infinity;
+  for (const c of candidates)
+    for (let a = c; a; a = a.return)
+      if (up.has(a)) {
+        if (up.get(a) < bestD) (best = c), (bestD = up.get(a));
+        break;
+      }
+  return best ?? candidates[0];
+}
+
+// aria-label / accessibilityLabel, else the text of the views aria-labelledby / accessibilityLabelledBy point to (their
+// nativeID; RN takes a string or an array, aria-labelledby comma-separated)
+function labelOf(fiber) {
   const p = fiber.memoizedProps || {};
-  return p["aria-label"] ?? p.accessibilityLabel ?? hostChildrenText(fiber);
+  const own = p["aria-label"] ?? p.accessibilityLabel;
+  const by = p["aria-labelledby"] ?? p.accessibilityLabelledBy;
+  if (own != null || by == null) return own ?? null;
+  const ids = Array.isArray(by) ? by : String(by).split(/\s*,\s*/);
+  const texts = [];
+  for (const id of ids) {
+    const found = nativeIds().get(id);
+    if (found) texts.push(hostChildrenText(nearest(fiber, found)));
+  }
+  return texts.length ? texts.join(" ") : null;
+}
+
+function accessibleName(fiber) {
+  return labelOf(fiber) ?? hostChildrenText(fiber);
 }
 
 function roleOf(p) {
@@ -91,13 +146,24 @@ function matchesSelf(fiber, sel) {
   if (sel.testId != null) return p.testID === sel.testId;
   if (sel.role != null)
     return roleOf(p) === sel.role && matchText(accessibleName(fiber), sel.name);
-  if (sel.label != null)
-    return matchText(p["aria-label"] ?? p.accessibilityLabel, sel.label);
-  if (sel.text != null)
-    return (
-      fiber.type === "RCTText" && matchText(hostChildrenText(fiber), sel.text)
-    );
+  if (sel.label != null) return matchText(labelOf(fiber), sel.label);
+  if (sel.placeholder != null) return isInput(fiber) && matchText(p.placeholder, sel.placeholder);
+  if (sel.text != null) {
+    if (fiber.type === "RCTText") return matchText(hostChildrenText(fiber), sel.text);
+    if (!sel.labels || !labelAsText(fiber, sel.text)) return false;
+    // an icon inside a labelled button, both labelled the same: the button only
+    for (let a = fiber.return; a; a = a.return) if (a.tag === HostComponent && labelAsText(a, sel.text)) return false;
+    return true;
+  }
   return false;
+}
+
+// getByText (not Detox by.text): a view with its own label and no text inside (icon button, labelled image or SVG)
+// matches by its label
+function labelAsText(fiber, text) {
+  const p = fiber.memoizedProps || {};
+  const label = p["aria-label"] ?? p.accessibilityLabel;
+  return label != null && !isInput(fiber) && !hostChildrenText(fiber) && matchText(label, text);
 }
 
 // `within` = some host ancestor matches that selector (Detox withAncestor, Playwright locator chaining); nests.
@@ -114,7 +180,7 @@ function* hostFibers(fiber, ancestors) {
   for (let f = fiber; f; f = f.sibling) {
     if (f.tag === HostComponent) {
       yield [f, ancestors];
-      yield* hostFibers(f.child, [...ancestors, f]);
+      if (!isSecret(f)) yield* hostFibers(f.child, [...ancestors, f]);
     } else {
       yield* hostFibers(f.child, ancestors);
     }
@@ -211,11 +277,31 @@ function query(sel) {
 // <Modal>'s host: "ModalHostView" (its codegen name, Fabric), "RCTModalHostView" before RN dropped the Paper name
 const isModal = (f) => f.type === "ModalHostView" || f.type === "RCTModalHostView";
 const PRESS_PROPS = ["onPress", "onClick", "onLongPress", "onStartShouldSetResponder", "onResponderRelease"];
+const PRESS_ROLES = ["button", "link", "tab", "switch", "checkbox", "menuitem"];
+// react-native-gesture-handler's GestureDetector attaches its recognizers natively, by view tag: the view it wraps has
+// no handler props. Its gesture prop says what it recognizes: v2 API (Gesture.Tap(), Gesture.Race(...)) toGestureArray()
+// with handlerName, v3 hooks (useTapGesture) type, composed ones (useCompetingGestures...) gestures. Pans don't count.
+const TAP_GESTURES = ["TapGestureHandler", "LongPressGestureHandler"];
+const gestureNames = (g) =>
+  typeof g?.toGestureArray === "function" ? g.toGestureArray().map((x) => x.handlerName)
+  : Array.isArray(g?.gestures) ? g.gestures.flatMap(gestureNames)
+  : [g?.type];
+// someone else's gesture prop may throw (a getter, a Proxy): not a detector then, the snapshot goes on
+const tapDetector = (p) => {
+  try {
+    return p.gesture != null && typeof p.gesture === "object" && gestureNames(p.gesture).some((n) => TAP_GESTURES.includes(n));
+  } catch (e) {
+    return false;
+  }
+};
+// v3's detector is a host view of its own (box-none) around the wrapped one
+const DETECTOR = "RNGestureHandlerDetector";
 function snapshot() {
   const screen = require("react-native").Dimensions.get("screen");
   const nodes = [];
-  // returns the subtree's host text, so accessibleName's fallback costs nothing extra
-  const walk = (fiber, parent) => {
+  // returns the subtree's host text, so accessibleName's fallback costs nothing extra.
+  // tap: inside a tap GestureDetector, the next host view below is its target
+  const walk = (fiber, parent, tap) => {
     let text = "";
     for (let f = fiber; f; f = f.sibling) {
       if (f.tag === HostText) {
@@ -223,18 +309,20 @@ function snapshot() {
         continue;
       }
       if (f.tag !== HostComponent) {
-        text += walk(f.child, parent);
+        text += walk(f.child, parent, tap || tapDetector(f.memoizedProps || {}));
         continue;
       }
       const p = f.memoizedProps || {};
       const isText = f.type === "RCTText";
       const own = isText ? hostChildrenText(f) : null;
-      const input = f.type.includes("TextInput");
-      const label = p["aria-label"] ?? p.accessibilityLabel;
+      const input = isInput(f);
+      const label = labelOf(f);
       const role = roleOf(p);
-      // gesture-handler buttons keep their handlers in RNGH, not in the host's props
+      const detector = f.type === DETECTOR;
+      // gesture-handler buttons keep their handlers in RNGH, not in the host's props; so do GestureDetector's views
       const pressable =
-        f.type === "RNGestureHandlerButton" || PRESS_PROPS.some((k) => typeof p[k] === "function");
+        f.type === "RNGestureHandlerButton" || (tap && !detector) || PRESS_PROPS.some((k) => typeof p[k] === "function") ||
+        PRESS_ROLES.includes(role) || (p.accessible === true && typeof p.onAccessibilityTap === "function");
       const scroll = isScroller(f);
       let i = -1;
       // a Modal's host sits where <Modal> is in the tree, not where its window is: only its content counts
@@ -254,7 +342,9 @@ function snapshot() {
             name: null, // below, once the subtree's text is known
             text: own,
             role: role ?? null,
-            value: input ? (p.text ?? p.value ?? null) : null,
+            // RN passes value ?? defaultValue as text: an uncontrolled input shows its default, not what was typed since
+            // (that lives natively). Never a password or code: a mask when there is one.
+            value: !input ? null : isSecret(f) && (p.text ?? p.value) ? "••••••••" : (p.text ?? p.value ?? null),
             placeholder: input ? (p.placeholder ?? null) : null,
             editable: input && p.editable !== false,
             pressable,
@@ -266,7 +356,7 @@ function snapshot() {
           }) - 1;
         }
       }
-      const sub = isText ? own : walk(f.child, i < 0 ? parent : i);
+      const sub = isText ? own : isSecret(f) ? "" : walk(f.child, i < 0 ? parent : i, tap && detector);
       if (i >= 0) nodes[i].name = label ?? sub;
       text += sub;
     }

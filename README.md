@@ -170,6 +170,14 @@ await app.getByRole("button", { name: "Zaloguj" }).tap();
 await expect(app.getByText(/Cześć/)).toBeVisible();
 ```
 
+Without testIDs: `getByLabel` matches `aria-label` / `accessibilityLabel`, or the text of the views `aria-labelledby` /
+`accessibilityLabelledBy` point to (by `nativeID`). `getByPlaceholder` matches a text input's placeholder, as in
+Playwright: a case-insensitive substring, `{ exact: true }` for the whole string, or a RegExp. `getByText`, `getByLabel`
+and `getByRole`'s `name` match the whole string (trimmed) or a RegExp. `getByText` also matches a view with no text
+inside (an icon button, a labelled image or SVG) by its own label (not a labelledBy one), the outermost of nested ones
+labelled the same; Detox's `by.text` stays text only. An icon font draws its glyph in a Text, so such a button has text:
+find it with `getByLabel`.
+
 Auto-scroll: tap and fill drag the target's scroll views (`ScrollView`, `FlatList`, `SectionList`, FlashList; vertical
 or horizontal) until it is in view; nested ones outermost first (a horizontal list in a vertical page). An item a
 virtualized list hasn't rendered yet isn't in the tree at all: the locator waits, then fails with "not found". Scroll
@@ -179,6 +187,11 @@ the list there first: Detox's `waitFor(...).whileElement(list).scroll(...)`, or 
 `await app.snapshot()` returns the whole screen for an LLM driver: `{ commitId, nodes, focused, keyboard, screen }`.
 Nodes are host views with text, testID, label, role, a text input, a touch handler or a scroll view, in tree (paint)
 order with `parent` indices, kept only when shown natively and not covered (another window, sheet backdrop, keyboard).
+Text inputs carry `placeholder` and `value`: a mask for a password or one-time code (`secureTextEntry`, or a
+`textContentType` / `autoComplete` for one, so also with a "show password" toggle on); an uncontrolled input shows its
+`defaultValue`, not what was typed since (that lives natively). `pressable`: a press handler prop, a role of button, link, tab, switch, checkbox or menuitem,
+`onAccessibilityTap`, a gesture-handler button, or a view a gesture-handler `GestureDetector` with a tap or long press
+wraps.
 Rects are dp. `focused: false` = a system window (permission dialog, notification shade) is over the app, or on iOS
 an alert of the app's own. Both platforms report `hit`, `focused`, `keyboard` and `screen` (iOS: points, `density` =
 screen scale). On iOS, `app.native.call("Page.screenshot")` returns `{ png }` (base64) of the app's own windows,
