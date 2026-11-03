@@ -161,9 +161,13 @@ function checkContract() {
     const result = {
       "Layout.visibility": () => ({
         ratios: params.tags.map((t) => ratios[t] ?? 0.9),
-        // snapshot: cta and row's centre are covered (e.g. by a sheet backdrop), row's texts aren't
+        // snapshot: cta's centre is covered (e.g. by a sheet backdrop), row's lands on its own text "Lek" (Fabric
+        // hoists the text out of row natively), row's texts aren't covered
         ...(params.hit && {
           hit: params.tags.map((t) => ![row, cta].some((f) => f.stateNode.canonical.nativeTag === t)),
+          at: params.tags.map((t) =>
+            t === row.stateNode.canonical.nativeTag ? row.child.stateNode.canonical.nativeTag
+            : t === cta.stateNode.canonical.nativeTag ? topBack.stateNode.canonical.nativeTag : t),
           focused: true,
           keyboard,
         }),
@@ -258,6 +262,7 @@ function checkContract() {
     ["screen-a", "screen-b", "back", "row", "Lek", "1 maja", "minus", "qty"],
   );
   assert.equal(snap.nodes[by("text", "Lek")].parent, by("testID", "row"));
+  assert.equal(snap.nodes[by("testID", "row")].hit, true); // the touch lands on its own (hoisted) text
   assert.equal(snap.nodes[by("testID", "back")].parent, by("testID", "screen-b"));
   assert.equal(snap.nodes[by("testID", "minus")].enabled, false);
   assert.equal(snap.focused, true);
