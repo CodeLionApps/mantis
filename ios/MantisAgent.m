@@ -369,7 +369,10 @@ static NSString *transitionReason(UIWindow *w) {
     BOOL focused = UIApplication.sharedApplication.applicationState == UIApplicationStateActive && ![top isKindOfClass:UIAlertController.class];
     CGRect screen = UIScreen.mainScreen.bounds;
     CGRect kb = CGRectIntersection(_keyboard, screen);
+    // appState (UIApplicationState: 0 active, 1 inactive = a system alert / Control Center / the lock screen over it, 2 background),
+    // why focused is false: an alert of the app's own or the system's, or a screen that is off.
     done(@{@"ratios": ratios, @"shown": shownOut, @"hit": hits, @"focused": @(focused),
+           @"appState": @(UIApplication.sharedApplication.applicationState), @"top": NSStringFromClass(top.class) ?: NSNull.null,
            @"keyboard": CGRectIsNull(kb) || kb.size.height < 1 ? NSNull.null : R(kb),
            @"screen": @{@"width": @(screen.size.width), @"height": @(screen.size.height), @"density": @(UIScreen.mainScreen.scale)}});
   } else if ([method isEqualToString:@"Action.check"]) {
@@ -498,6 +501,37 @@ static NSString *transitionReason(UIWindow *w) {
     // fill on a text input no tap can reach (see transparent): focus it the way a tap would
     UIView *t = textInputIn([self viewForTag:[p[@"tag"] integerValue]]);
     done(@{@"ok": @([t becomeFirstResponder])});
+  } else if ([method isEqualToString:@"Page.screenshot"]) {
+    // The app's own windows, bottom-up, as PNG base64: a screenshot without XCTest. No system UI: status bar, alerts,
+    // the Control Center are not the app's. scale: px per point (default 1).
+    // A window drawViewHierarchy cannot draw (it returns NO; seen as black frames on a physical iPhone) is drawn by
+    // layer.renderInContext instead: works off screen, but misdraws transformed text (tab bar labels) and has no
+    // blur/video/Metal content. render: renderInContext only. `fallbacks`: windows drawn that way.
+    CGRect screen = UIScreen.mainScreen.bounds;
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat preferredFormat];
+    f.scale = [p[@"scale"] doubleValue] > 0 ? [p[@"scale"] doubleValue] : 1;
+    f.opaque = YES;
+    BOOL render = [p[@"render"] boolValue], after = [p[@"afterUpdates"] boolValue];
+    __block int fallbacks = 0;
+    NSMutableArray *drawn = [NSMutableArray array];
+    UIImage *img = [[[UIGraphicsImageRenderer alloc] initWithSize:screen.size format:f] imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+      [UIColor.blackColor setFill];
+      [ctx fillRect:screen];
+      for (UIWindow *w in self.windows.reverseObjectEnumerator) {
+        // The keyboard's windows (UIRemoteKeyboardWindow, UITextEffectsWindow) stay after the first text entry and draw
+        // as an opaque black screen: the keyboard is another process. ponytail: no keyboard on the picture.
+        NSString *cls = NSStringFromClass(w.class);
+        if ([cls containsString:@"Keyboard"] || [cls containsString:@"TextEffects"]) continue;
+        [drawn addObject:cls];
+        if (!render && [w drawViewHierarchyInRect:w.frame afterScreenUpdates:after]) continue;
+        if (!render) fallbacks++;
+        CGContextSaveGState(ctx.CGContext);
+        CGContextTranslateCTM(ctx.CGContext, w.frame.origin.x, w.frame.origin.y);
+        [w.layer renderInContext:ctx.CGContext];
+        CGContextRestoreGState(ctx.CGContext);
+      }
+    }];
+    done(@{@"ok": @YES, @"fallbacks": @(fallbacks), @"windows": drawn, @"png": [UIImagePNGRepresentation(img) base64EncodedStringWithOptions:0]});
   } else if ([method isEqualToString:@"Input.hideKeyboard"]) {
     // what a user does when the keyboard covers the next target (Detox's replaceText never opens it)
     done(@{@"ok": @([UIApplication.sharedApplication sendAction:@selector(resignFirstResponder) to:nil from:nil forEvent:nil])});
