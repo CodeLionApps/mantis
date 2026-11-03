@@ -33,6 +33,7 @@ Module._load = function (request, ...rest) {
 const backHandler = { addEventListener() {}, removeEventListener() {} }; // RN 0.76: removeEventListener a no-op too
 let keyboard = null; // the fake native agent's keyboard rect
 let nativeBack = { ok: false, reason: "no native navigation stack to pop" };
+let screen = () => ({ draws: 0, idleMs: 1000, busy: null }); // the fake native agent's draw clock; null: no Agent.ping
 const { App, DETOX_VISIBLE, PROTOCOL, expect } = require("./runner");
 
 let nextTag = 1;
@@ -161,7 +162,10 @@ function checkContract() {
   // fake native agent
   const nativeHandler = (native) => (e) => {
     const { id, method, params } = JSON.parse(e.data);
+    if (method === "Agent.ping" && !screen)
+      return native.send(JSON.stringify({ id, error: { message: "MantisAgent: unknown method Agent.ping" } }));
     const result = {
+      "Agent.ping": () => screen(),
       "Layout.visibility": () => ({
         ratios: params.tags.map((t) => ratios[t] ?? 0.9),
         // snapshot: cta's centre is covered (e.g. by a sheet backdrop), row's lands on its own text "Lek" (Fabric
@@ -189,6 +193,7 @@ function checkContract() {
         return { ok: true };
       },
     }[method]();
+    if (result === undefined) return; // a stalled main thread doesn't answer
     native.send(JSON.stringify({ id, result }));
   };
   const connectNative = () => {
@@ -281,6 +286,33 @@ function checkContract() {
   xhr.dispatchEvent(new Event("loadend"));
   ping = await app.js.call("Agent.ping");
   assert.deepEqual(ping.net, []);
+
+  // idle: both clocks quiet for quietMs and nothing in flight; on timeout, what is still busy
+  const waited = async (o) => {
+    const t = performance.now();
+    await app.idle(o);
+    return performance.now() - t;
+  };
+  assert(await waited() < 100); // the last commit was long ago, nothing on screen moves
+  const moving = performance.now() + 200; // a transition: the screen changes for 200 ms
+  screen = () => ({ draws: 1, idleMs: performance.now() < moving ? 0 : performance.now() - moving, busy: "UIView animating position" });
+  assert((await waited()) >= 250); // its end + quietMs
+  const commit = () => global.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(1, { current: { child: root, memoizedState: { element: {} } } });
+  commit();
+  assert((await waited({ quietMs: 50 })) >= 40);
+  xhr.send();
+  await assert.rejects(app.idle({ timeout: 100 }), /not idle after 100ms: request in flight for \d+ms: https:\/\/api\.example\/visits$/);
+  xhr.dispatchEvent(new Event("loadend"));
+  screen = () => ({ draws: 2, idleMs: 0, busy: "UIImageView animating contents in a loop" }); // a spinner
+  await assert.rejects(app.idle({ timeout: 100 }), /screen changed 0ms ago \(UIImageView animating contents in a loop\)/);
+  screen = () => undefined; // the main thread stalls: idle's own timeout, not the RPC's 15 s
+  const stalled = performance.now();
+  await assert.rejects(app.idle({ timeout: 200 }), (e) =>
+    e.constructor.name === "TimeoutError" && /not idle after 200ms: the main thread didn't answer$/.test(e.message));
+  assert(performance.now() - stalled < 500);
+  screen = null; // an iOS agent from before the draw clock: the JS clock alone
+  await app.idle();
+  screen = () => ({ draws: 2, idleMs: 1000, busy: null });
 
   // iOS back, in Android's order: keyboard, the topmost Modal, BackHandler listeners last first, a native pop
   app.platform = "ios";
