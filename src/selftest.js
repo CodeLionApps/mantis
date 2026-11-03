@@ -85,6 +85,9 @@ const ratios = {
   [cta.stateNode.canonical.nativeTag]: 0.5,
 };
 const taps = [];
+const checks = new Map(); // tag -> the fake native agent's Action.check answer, when not ok
+const scrolled = []; // Input.scroll params
+let onScroll = () => {};
 let touchStart; // the agent's touch listener; the fake native tap feeds it, like RN would
 let drop = 0; // next n touches land on a view React already replaced
 let silent = false; // touches never reach JS
@@ -168,7 +171,8 @@ function checkContract() {
           keyboard,
         }),
       }),
-      "Action.check": () => ({ ok: true, point: { x: params.tag, y: 0 } }),
+      "Action.check": () => checks.get(params.tag)?.() ?? { ok: true, point: { x: params.tag, y: 0 } },
+      "Input.scroll": () => (scrolled.push(params), onScroll(params), { ok: true }),
       "Input.typeText": () => ({ ok: true }),
       "Input.hideKeyboard": () => ({ ok: true }),
       "Input.back": () => nativeBack,
@@ -306,6 +310,28 @@ function checkContract() {
   assert.deepEqual(await app.back(), { ok: true, via: "keyboard" });
   keyboard = null;
   app.platform = "android";
+
+  // auto-scroll, nested: a horizontal list (Android's host) below the fold of a vertical page. The page first (JS
+  // layout: the card is outside it), then the list by the native dx (the card is inside the page by then)
+  const card = host("RCTView", { testID: "card" }, [], { x: 900, y: 1000, width: 100, height: 100 });
+  const shelf = host("AndroidHorizontalScrollView", {}, [card], { x: 0, y: 1000, width: 400, height: 100 });
+  const page = host("RCTScrollView", {}, [shelf], { x: 0, y: 0, width: 400, height: 800 });
+  const tagOf = (f) => f.stateNode.canonical.nativeTag;
+  global.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(1, { current: { child: page } });
+  onScroll = ({ tag, dx = 0, dy = 0 }) => {
+    for (const f of tag === tagOf(page) ? [shelf, card] : [card]) (f.box.x -= dx), (f.box.y -= dy);
+  };
+  checks.set(tagOf(card), () =>
+    card.box.x > 400 || card.box.y > 800 ? { ok: false, reason: "not in viewport", delta: 999, dx: 740 } : null,
+  );
+  await id("card").tap();
+  assert.deepEqual(scrolled, [{ tag: tagOf(page), dy: 650 }, { tag: tagOf(shelf), dx: 740 }]);
+  const scrollers = (await app.js.call("Tree.snapshot")).nodes.filter((n) => n.scroll).map((n) => n.type);
+  assert.deepEqual(scrollers, ["RCTScrollView", "AndroidHorizontalScrollView"]);
+  // iOS: one host for both axes, the axis is the horizontal prop
+  shelf.type = "RCTScrollView";
+  shelf.memoizedProps = { horizontal: true };
+  assert.deepEqual((await id("card").all())[0].scrolls.map((s) => s.horizontal), [false, true]);
 
   // MANTIS_TRACE never records typed text (passwords)
   const traceFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "mantis-")), "trace.jsonl");

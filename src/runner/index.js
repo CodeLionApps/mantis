@@ -516,24 +516,28 @@ class Locator {
     );
   }
 
-  // Playwright's scrollIntoViewIfNeeded, done the user's way: a real drag on the nearest scroll view.
-  // Returns true if the content moved. ponytail: vertical only; horizontal lists need dx + 'AndroidHorizontalScrollView'.
+  // Playwright's scrollIntoViewIfNeeded, done the user's way: a real drag on a scroll view, along its axis.
+  // Returns true if the content moved. Nested (a horizontal list in a vertical page): the outermost scroll view the
+  // target lies outside of (JS layout), so the inner list is brought on screen before it is scrolled; else the nearest,
+  // by the native delta (target centre - its visible centre).
+  // ponytail: an item a virtualized list hasn't rendered yet isn't in the tree at all: "not found", no scrolling.
   async scrollToward(n, c) {
-    if (!n.scroll) return false;
-    let dy;
-    if (c.reason === "not in viewport")
-      dy = c.delta; // native: target centre - scroll viewport centre
-    else if (c.reason === "not mounted natively") {
-      // clipped away (removeClippedSubviews): only the JS layout knows where it is
-      dy =
-        n.rect.y +
-        n.rect.height / 2 -
-        (n.scroll.rect.y + n.scroll.rect.height / 2);
-      if (Math.abs(dy) < n.scroll.rect.height / 2) return false; // inside the viewport, just not mounted yet
-    } else return false;
+    const inViewport = c.reason === "not in viewport";
+    if (!n.scrolls.length || (!inViewport && c.reason !== "not mounted natively")) return false;
+    const mid = (r, h) => (h ? r.x + r.width / 2 : r.y + r.height / 2);
+    // how far the target's centre is outside sc's box along sc's axis (0 = inside)
+    const outside = (sc) => {
+      const d = mid(n.rect, sc.horizontal) - mid(sc.rect, sc.horizontal);
+      return Math.abs(d) < (sc.horizontal ? sc.rect.width : sc.rect.height) / 2 ? 0 : d;
+    };
+    const nearest = n.scrolls.at(-1);
+    const sc = n.scrolls.find(outside) ?? nearest;
+    // clipped away (removeClippedSubviews) or an outer scroll view: only the JS layout knows where it is
+    const d = sc === nearest && inViewport ? (sc.horizontal ? c.dx : c.delta) : outside(sc);
+    if (!d) return false; // inside the viewport, just not mounted yet
     const r = await this.app.native.call("Input.scroll", {
-      tag: n.scroll.tag,
-      dy,
+      tag: sc.tag,
+      ...(sc.horizontal ? { dx: d } : { dy: d }),
     });
     return r.ok && r.moved !== false;
   }

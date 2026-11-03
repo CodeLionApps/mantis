@@ -76,13 +76,14 @@ class Element {
     return this.locator.fill("");
   }
 
-  // ponytail: start point ignored (Mantis drags through the scroll view's centre), vertical only
+  // ponytail: start point ignored (Mantis drags through the scroll view's centre)
   async scroll(offset, direction = "down") {
     const n = await this.locator.resolve();
     if (!n) throw new Error(`${this.locator}: not found`);
+    const d = direction === "up" || direction === "left" ? -offset : offset;
     const r = await app.native.call("Input.scroll", {
       tag: n.tag,
-      dy: direction === "up" ? -offset : offset,
+      ...(direction === "left" || direction === "right" ? { dx: d } : { dy: d }),
     });
     if (!r.ok) throw new Error(`${this.locator}: scroll failed: ${r.reason}`);
     await app.settle();
