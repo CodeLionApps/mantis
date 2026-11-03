@@ -193,6 +193,7 @@ class Peer {
 class App {
   constructor(port = PORT, platform = "android") {
     this.port = port;
+    this.platform = platform;
     this.token = randomUUID();
     this.js = new Peer("js", platform, this.token);
     this.native = new Peer("native", platform, this.token);
@@ -346,6 +347,27 @@ class App {
     });
     const { focused = null, keyboard = null, screen = null } = vis;
     return { commitId, nodes: out, focused, keyboard, screen };
+  }
+
+  /**
+   * The back button, as on Android: { ok, via, reason }. Android: the native agent's Input.back (a back key to the window
+   * with focus). iOS has none, so the steps of Android's in its order: no back when the app is not active or an alert of
+   * its own is on top (focused false; the caller does it another way); the keyboard closes (a first back closes the IME);
+   * else the JS agent's Input.back (the topmost Modal's onRequestClose, then the BackHandler listeners, last first); else
+   * a native navigation controller pops (a native stack no BackHandler listener knows). ok: false = nothing took it
+   * (Android would leave the app).
+   */
+  async back() {
+    if (this.platform !== "ios") return this.native.call("Input.back");
+    const { focused, keyboard, appState } = await this.native.call("Layout.visibility", { tags: [], hit: true });
+    if (!focused)
+      return { ok: false, reason: appState ? "app not active (a system alert or another app in front)" : "an alert of the app" };
+    if (keyboard)
+      return (await this.native.call("Input.hideKeyboard")).ok ? { ok: true, via: "keyboard" } : { ok: false, reason: "keyboard on screen" };
+    const js = await this.js.call("Input.back");
+    if (js.ok) return js;
+    const nav = await this.native.call("Input.back");
+    return nav.ok ? nav : { ok: false, reason: `${js.reason}; ${nav.reason}` };
   }
 
   getByRole(role, { name } = {}) {

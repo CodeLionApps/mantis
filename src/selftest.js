@@ -15,6 +15,9 @@ Module._load = function (request, ...rest) {
       Platform: { OS: "android" },
       Dimensions: { get: () => ({ width: 400, height: 800 }) },
     };
+  // iOS's no-op BackHandler: the agent keeps its listeners for Input.back
+  if (request.endsWith("Utilities/Platform")) return { OS: "ios" };
+  if (request.endsWith("Utilities/BackHandler")) return { default: backHandler };
   if (request.endsWith("Core/RawEventEmitter"))
     return { default: { addListener: (_type, cb) => (touchStart = cb) } };
   if (request.endsWith("Renderer/shims/ReactFabric")) {
@@ -27,6 +30,9 @@ Module._load = function (request, ...rest) {
   return load.call(this, request, ...rest);
 };
 
+const backHandler = { addEventListener() {} };
+let keyboard = null; // the fake native agent's keyboard rect
+let nativeBack = { ok: false, reason: "no native navigation stack to pop" };
 const { App, DETOX_VISIBLE, PROTOCOL, expect } = require("./runner");
 
 let nextTag = 1;
@@ -159,11 +165,13 @@ function checkContract() {
         ...(params.hit && {
           hit: params.tags.map((t) => ![row, cta].some((f) => f.stateNode.canonical.nativeTag === t)),
           focused: true,
-          keyboard: null,
+          keyboard,
         }),
       }),
       "Action.check": () => ({ ok: true, point: { x: params.tag, y: 0 } }),
       "Input.typeText": () => ({ ok: true }),
+      "Input.hideKeyboard": () => ({ ok: true }),
+      "Input.back": () => nativeBack,
       "Input.tap": () => {
         taps.push(params.x);
         if (!silent)
@@ -264,6 +272,32 @@ function checkContract() {
   xhr.dispatchEvent(new Event("loadend"));
   ping = await app.js.call("Agent.ping");
   assert.deepEqual(ping.net, []);
+
+  // iOS back, in Android's order: keyboard, the topmost Modal, BackHandler listeners last first, a native pop
+  app.platform = "ios";
+  assert.match((await app.back()).reason, /0 registered.*; no native navigation stack/);
+  const called = [];
+  const listen = (name, took) => backHandler.addEventListener("hardwareBackPress", () => (called.push(name), took));
+  listen("first", false);
+  const second = listen("second", true);
+  assert.deepEqual(await app.back(), { ok: true, via: "backHandler" });
+  assert.deepEqual(called, ["second"]);
+  second.remove();
+  nativeBack = { ok: true, via: "navigation" };
+  assert.equal((await app.back()).via, "navigation");
+  assert.deepEqual(called, ["second", "first"]);
+  let closes = 0;
+  const modal = (props) => host("ModalHostView", props, [host("RCTView", { testID: "sheet" })]);
+  global.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(1, {
+    current: { child: host("RCTView", {}, [modal({ visible: true }), modal({ visible: true, onRequestClose: () => closes++ }), modal({ visible: false })]) },
+  });
+  assert.deepEqual(await app.back(), { ok: true, via: "modal", handler: true });
+  assert.equal(closes, 1);
+  assert.equal(called.length, 2);
+  keyboard = { x: 0, y: 500, width: 400, height: 300 };
+  assert.deepEqual(await app.back(), { ok: true, via: "keyboard" });
+  keyboard = null;
+  app.platform = "android";
 
   // MANTIS_TRACE never records typed text (passwords)
   const traceFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "mantis-")), "trace.jsonl");
