@@ -46,6 +46,13 @@ test('back on an alert without a cancel button: ok false, the alert stays', ios,
   assert.equal((await app.snapshot()).focused, false);
 });
 
+test('back on an alert without buttons: RN\'s OK is cancel-style, so it goes', ios, async () => {
+  await app.getByText('Bez przycisków').tap();
+  await focused(false);
+  assert.deepEqual(await app.back(), { ok: true, via: 'alert', action: 'OK' });
+  await focused(true);
+});
+
 test('back with no alert: unchanged (the BackHandler listener goes to the menu)', ios, async () => {
   assert.deepEqual(await app.back(), { ok: true, via: 'backHandler' });
   await expect(app.getByText('Menu')).toBeVisible();

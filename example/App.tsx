@@ -259,6 +259,7 @@ function Alerts({ onBack }: { onBack: () => void }) {
         }
       />
       <Button title="Info" onPress={() => Alert.alert('Gotowe', undefined, [{ text: 'OK', onPress: add('ok') }])} />
+      <Button title="Bez przycisków" onPress={() => Alert.alert('Uwaga')} />
       <Text style={styles.body}>Log: {log.join(', ') || 'pusty'}</Text>
       <Button title="Wstecz" onPress={onBack} />
     </View>

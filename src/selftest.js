@@ -181,7 +181,7 @@ function checkContract() {
       "Input.scroll": () => (scrolled.push(params), onScroll(params), { ok: true }),
       "Input.typeText": () => ({ ok: true }),
       "Input.hideKeyboard": () => ({ ok: true }),
-      "Input.back": () => alert ?? nativeBack,
+      "Input.back": () => (params.alert ? alert ?? { ok: false, reason: "no alert" } : nativeBack),
       "Input.tap": () => {
         taps.push(params.x);
         if (!silent)
@@ -324,6 +324,10 @@ function checkContract() {
   settled = 0;
   assert.deepEqual(await app.back(), alert);
   assert.equal(settled, 0);
+  // the alert closed between Layout.visibility and Input.back: the usual steps (the Modal), not a native pop
+  alert = { ok: false, reason: "no alert" };
+  assert.deepEqual(await app.back(), { ok: true, via: "modal", handler: true });
+  assert.equal(closes, 2);
   alert = null;
   app.platform = "android";
 

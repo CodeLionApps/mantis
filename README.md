@@ -191,7 +191,9 @@ without XCTest: no status bar, keyboard or system alerts.
   the key, so a back no JS listener takes is still `ok: true, via: "key"` while the app leaves, as a real back would.
 - iOS has no back button, so Android's steps in Android's order: the keyboard closes (`via: "keyboard"`); an `Alert`
   of the app's own runs its `style: "cancel"` button as a tap would (`via: "alert"`, `action`: its text), as back cancels
-  a cancelable dialog on Android; without one it stays (`ok: false`, as on a dialog that is not cancelable); the topmost
+  a cancelable dialog on Android; without one it stays (`ok: false`, as on a dialog that is not cancelable). RN gives
+  `Alert.alert(title)` without buttons a cancel-style OK, so back closes it on iOS while on Android (not cancelable by
+  default) it stays. `ActionSheetIOS` and any `UIAlertController` the app presents natively count too. Then the topmost
   visible `<Modal>` gets `onRequestClose` (`via: "modal"`; without one the back is swallowed, as on Android); the
   `BackHandler` `hardwareBackPress` listeners run last first until one returns `true` (`via: "backHandler"`;
   react-navigation registers one); a native `UINavigationController` pops (`via: "navigation"`). `ok: false` when a

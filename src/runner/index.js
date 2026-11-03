@@ -376,13 +376,16 @@ class App {
       if (!focused && appState) return { ok: false, reason: "app not active (a system alert or another app in front)" };
       if (keyboard)
         r = (await this.native.call("Input.hideKeyboard")).ok ? { ok: true, via: "keyboard" } : { ok: false, reason: "keyboard on screen" };
-      // an alert of the app's own: the native agent runs its cancel-style action (Android's back on a cancelable dialog)
-      else if (!focused) r = await this.native.call("Input.back");
       else {
-        r = await this.js.call("Input.back");
-        if (!r.ok) {
-          const nav = await this.native.call("Input.back");
-          r = nav.ok ? nav : { ok: false, reason: `${r.reason}; ${nav.reason}` };
+        // an alert of the app's own: the native agent runs its cancel-style action (Android's back on a cancelable
+        // dialog); "no alert" = it closed since Layout.visibility: the usual steps, no pop in its place
+        if (!focused) r = await this.native.call("Input.back", { alert: true });
+        if (!r || r.reason === "no alert") {
+          r = await this.js.call("Input.back");
+          if (!r.ok) {
+            const nav = await this.native.call("Input.back");
+            r = nav.ok ? nav : { ok: false, reason: `${r.reason}; ${nav.reason}` };
+          }
         }
       }
     }

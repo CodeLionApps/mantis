@@ -564,7 +564,7 @@ static NSString *transitionReason(UIWindow *w) {
     // native stack: the pop its back button or edge swipe does). iOS has no system back: a JS stack (@react-navigation/stack)
     // or a presented RN Modal has no such controller (ok: false). An alert of the app's own on top: its cancel action.
     // ok: false also when the app is not active (a system alert over it) or the keyboard is up; the caller does it
-    // another way then.
+    // another way then. alert: true = the alert only (ok: false "no alert" when there is none; no pop).
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive)
       return done(@{@"ok": @NO, @"reason": @"app not active (a system alert or another app in front)"});
     CGRect kb = CGRectIntersection(_keyboard, UIScreen.mainScreen.bounds);
@@ -572,6 +572,7 @@ static NSString *transitionReason(UIWindow *w) {
     UIViewController *top = self.windows.firstObject.rootViewController;
     for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
     while (top.presentedViewController) top = top.presentedViewController;
+    if ([p[@"alert"] boolValue] && ![top isKindOfClass:UIAlertController.class]) return done(@{@"ok": @NO, @"reason": @"no alert"});
     if ([top isKindOfClass:UIAlertController.class]) {
       // An alert of the app's own (RN's Alert: a UIAlertController presented in a window of its own, made key; a system
       // alert makes the app inactive, above). Back runs its cancel-style action, as back cancels a cancelable AlertDialog
@@ -587,14 +588,18 @@ static NSString *transitionReason(UIWindow *w) {
         return done(@{@"ok": @NO, @"reason": @"UIAlertAction has no handler (UIKit changed)"});
       void (^handler)(UIAlertAction *) = [cancel valueForKey:@"handler"];
       void (^back)(void) = ^{
+        // a second back queued during the same presentation: its dismiss would be dropped and never answer
+        if (alert.isBeingDismissed || !alert.presentingViewController)
+          return done(@{@"ok": @NO, @"reason": @"the alert is being dismissed"});
         [alert dismissViewControllerAnimated:YES completion:^{
           if (handler) handler(cancel);
           done(@{@"ok": @YES, @"via": @"alert", @"action": cancel.title ?: NSNull.null});
         }];
       };
-      // still coming in (focused turns false as it starts): once it is in, a dismiss during the presentation is dropped
-      if (alert.transitionCoordinator) [alert.transitionCoordinator animateAlongsideTransition:nil completion:^(id c) { back(); }];
-      else back();
+      // still coming in (focused turns false as it starts): once it is in, a dismiss during the presentation is dropped.
+      // Not queued (NO: the completion may never run): now.
+      id<UIViewControllerTransitionCoordinator> tc = alert.transitionCoordinator;
+      if (!tc || ![tc animateAlongsideTransition:nil completion:^(id c) { back(); }]) back();
       return;
     }
     UINavigationController *nav = backStack(top);
