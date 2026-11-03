@@ -195,7 +195,8 @@ screen for `quietMs`, and no XHR / `fetch` in flight. On screen: Android, a wind
 or an animation runs (stack transitions, native-driver and Reanimated frames, scrolling, Modal fades; not the keyboard
 or a text cursor). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a
 transition. On timeout it throws, naming what is still busy: a spinner or a looping animation never stops. JS timers
-are not tracked.
+are not tracked. On Android a focused text field's caret draws every 500 ms, so `quietMs` of 500 or more never passes
+while a field is focused.
 
 ## Channel
 

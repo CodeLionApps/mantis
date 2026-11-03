@@ -382,15 +382,32 @@ class App {
    * Waits until the app stands still: no React commit and nothing changed on screen for quietMs, no request in flight.
    * Screen: Android, a window of the app drew; iOS, a layer changed or an animation runs (transitions, native-driver
    * and Reanimated frames, scrolling). Throws on timeout, naming what is still busy (a spinner never stops).
+   * ponytail: Android's clock can't tell which view drew, so a focused text field's caret (a draw every 500 ms) keeps
+   * quietMs >= 500 from ever passing; blur the field first.
    */
   async idle({ quietMs = 100, timeout = DEFAULT_TIMEOUT } = {}) {
     const t0 = performance.now();
+    // a ping waits for what's left of timeout (at least 100 ms, so one sent at the end can still answer): a stalled
+    // thread throws this TimeoutError, not the RPC's after 15 s
+    const ping = (peer, thread) => {
+      const ms = Math.max(100, t0 + timeout - performance.now());
+      let timer;
+      return Promise.race([
+        peer.call("Agent.ping").finally(() => clearTimeout(timer)),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new TimeoutError(`app not idle after ${timeout}ms: the ${thread} thread didn't answer`)),
+            ms,
+          );
+        }),
+      ]);
+    };
     for (;;) {
       const iter = performance.now();
       const [js, ui] = await Promise.all([
-        this.js.call("Agent.ping"),
+        ping(this.js, "JS"),
         // an iOS agent older than the draw clock: the JS clock alone
-        this.native.call("Agent.ping").catch((e) => {
+        ping(this.native, "main").catch((e) => {
           if (/unknown method/.test(e.message)) return {};
           throw e;
         }),

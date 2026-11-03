@@ -185,6 +185,7 @@ function checkContract() {
         return { ok: true };
       },
     }[method]();
+    if (result === undefined) return; // a stalled main thread doesn't answer
     native.send(JSON.stringify({ id, result }));
   };
   const connectNative = () => {
@@ -295,6 +296,11 @@ function checkContract() {
   xhr.dispatchEvent(new Event("loadend"));
   screen = () => ({ draws: 2, idleMs: 0, busy: "UIImageView animating contents in a loop" }); // a spinner
   await assert.rejects(app.idle({ timeout: 100 }), /screen changed 0ms ago \(UIImageView animating contents in a loop\)/);
+  screen = () => undefined; // the main thread stalls: idle's own timeout, not the RPC's 15 s
+  const stalled = performance.now();
+  await assert.rejects(app.idle({ timeout: 200 }), (e) =>
+    e.constructor.name === "TimeoutError" && /not idle after 200ms: the main thread didn't answer$/.test(e.message));
+  assert(performance.now() - stalled < 500);
   screen = null; // an iOS agent from before the draw clock: the JS clock alone
   await app.idle();
   screen = () => ({ draws: 2, idleMs: 1000, busy: null });
