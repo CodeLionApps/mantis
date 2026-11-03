@@ -329,7 +329,17 @@ class App {
   async snapshot() {
     const { commitId, nodes } = await this.js.call("Tree.snapshot");
     const vis = await this.native.call("Layout.visibility", { tags: nodes.map((n) => n.tag), hit: true });
-    const seen = nodes.map((_, i) => vis.ratios[i] > 0 && vis.hit?.[i] !== false);
+    // Fabric mounts the children of a View that only forms a view (a testID, no stacking context) on the nearest
+    // ancestor that forms one: natively its own Text is a sibling drawn over it and takes the touch. A touch that lands
+    // on a node's React descendant reaches it (events bubble the React tree). ponytail: the landing tag must be a listed
+    // node; an unlisted wrapper with a background, say, still reads as covering.
+    const index = new Map(nodes.map((n, i) => [n.tag, i]));
+    const inside = (j, i) => {
+      while (j != null && j > i) j = nodes[j].parent;
+      return j === i;
+    };
+    const hits = nodes.map((_, i) => (vis.hit?.[i] === false && inside(index.get(vis.at?.[i]), i) ? true : vis.hit?.[i]));
+    const seen = nodes.map((_, i) => vis.ratios[i] > 0 && hits[i] !== false);
     // a container is hit-tested at its centre only (e.g. a scroll view whose centre is under the keyboard): it stays
     // when anything in it is seen (its hit stays false). Nodes come in tree order, so parents before children.
     for (let i = nodes.length - 1; i >= 0; i--)
@@ -338,7 +348,7 @@ class App {
     const kept = new Map(); // index in nodes -> index in out
     const out = [];
     nodes.forEach((n, i) => {
-      const hit = vis.hit?.[i] ?? null;
+      const hit = hits[i] ?? null;
       if (!seen[i]) return;
       let p = n.parent;
       while (p >= 0 && !kept.has(p)) p = nodes[p].parent;
@@ -561,24 +571,29 @@ class Locator {
     );
   }
 
-  // Playwright's scrollIntoViewIfNeeded, done the user's way: a real drag on the nearest scroll view.
-  // Returns true if the content moved. ponytail: vertical only; horizontal lists need dx + 'AndroidHorizontalScrollView'.
+  // Playwright's scrollIntoViewIfNeeded, done the user's way: a real drag on a scroll view, along its axis.
+  // Returns true if the content moved. Nested (a horizontal list in a vertical page): the outermost scroll view the
+  // target lies outside of (JS layout), so the inner list is brought on screen before it is scrolled; else the nearest,
+  // by the native delta (target centre - its visible centre).
+  // ponytail: an item a virtualized list hasn't rendered yet isn't in the tree at all: "not found", no scrolling.
   async scrollToward(n, c) {
-    if (!n.scroll) return false;
-    let dy;
-    if (c.reason === "not in viewport")
-      dy = c.delta; // native: target centre - scroll viewport centre
-    else if (c.reason === "not mounted natively") {
-      // clipped away (removeClippedSubviews): only the JS layout knows where it is
-      dy =
-        n.rect.y +
-        n.rect.height / 2 -
-        (n.scroll.rect.y + n.scroll.rect.height / 2);
-      if (Math.abs(dy) < n.scroll.rect.height / 2) return false; // inside the viewport, just not mounted yet
-    } else return false;
+    const inViewport = c.reason === "not in viewport";
+    n.scrolls ??= n.scroll ? [n.scroll] : []; // an app built with an older Mantis: only the nearest, vertical
+    if (!n.scrolls.length ||(!inViewport && c.reason !== "not mounted natively")) return false;
+    const mid = (r, h) => (h ? r.x + r.width / 2 : r.y + r.height / 2);
+    // how far the target's centre is outside sc's box along sc's axis (0 = inside)
+    const outside = (sc) => {
+      const d = mid(n.rect, sc.horizontal) - mid(sc.rect, sc.horizontal);
+      return Math.abs(d) < (sc.horizontal ? sc.rect.width : sc.rect.height) / 2 ? 0 : d;
+    };
+    const nearest = n.scrolls.at(-1);
+    const sc = n.scrolls.find(outside) ?? nearest;
+    // clipped away (removeClippedSubviews) or an outer scroll view: only the JS layout knows where it is
+    const d = sc === nearest && inViewport ? (sc.horizontal ? c.dx : c.delta) : outside(sc);
+    if (!d) return false; // inside the viewport, just not mounted yet
     const r = await this.app.native.call("Input.scroll", {
-      tag: n.scroll.tag,
-      dy,
+      tag: sc.tag,
+      ...(sc.horizontal ? { dx: d } : { dy: d }),
     });
     return r.ok && r.moved !== false;
   }

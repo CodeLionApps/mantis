@@ -295,13 +295,14 @@ object MantisAgent {
    * Covered: by the keyboard, another window (Modal, dialog), or a view over all of it (sheet backdrop, a sheet whose
    * QR code took the touch). ponytail: a pointerEvents box-none wrapper on that path still counts as covering.
    */
-  private fun reaches(v: View): Boolean {
+  private fun reaches(v: View, at: JSONArray): Boolean {
     val r = Rect()
     if (!v.getGlobalVisibleRect(r)) return false
     val o = IntArray(2).also { v.rootView.getLocationOnScreen(it) }
     r.offset(o[0], o[1])
     val chain = hitTest(r.exactCenterX() / density, r.exactCenterY() / density).optJSONArray("chain") ?: return false
     val hit = (0 until chain.length()).map { chain.getInt(it) }
+    hit.firstOrNull()?.let { at.put(at.length() - 1, it) }
     if (v.id in hit) return true
     val up = ancestorTags(v)
     if ((0 until up.length()).any { up.getInt(it) == hit.firstOrNull() }) return true
@@ -333,12 +334,16 @@ object MantisAgent {
         val out = JSONArray()
         val shown = JSONArray() // in a window and not hidden: what Detox/Espresso can match (screens below are not)
         val hits = JSONArray()
+        val at = JSONArray() // tag the touch at the centre landed on (null = none): the runner maps it to the React tree
         for (i in 0 until tags.length()) {
           val v = if (tags.isNull(i)) null else findView(tags.getInt(i))
           val ratio = visibleRatio(v)
           out.put(ratio)
           shown.put(v?.isShown == true)
-          if (withHit) hits.put(if (ratio == 0.0) false else if (decorOrNull == null) JSONObject.NULL else reaches(v!!))
+          if (withHit) {
+            at.put(JSONObject.NULL)
+            hits.put(if (ratio == 0.0) false else if (decorOrNull == null) JSONObject.NULL else reaches(v!!, at))
+          }
         }
         val res = JSONObject().put("ratios", out).put("shown", shown)
         if (withHit) {
@@ -349,7 +354,7 @@ object MantisAgent {
             JSONObject().put("x", it.left / density).put("y", (it.bottom - ime) / density)
               .put("width", it.width() / density).put("height", ime / density)
           } else JSONObject.NULL
-          res.put("hit", hits).put("focused", roots().any { it.hasWindowFocus() }).put("keyboard", keyboard)
+          res.put("hit", hits).put("at", at).put("focused", roots().any { it.hasWindowFocus() }).put("keyboard", keyboard)
             .put("screen", JSONObject().put("width", (win?.width ?: 0) / density).put("height", (win?.height ?: 0) / density)
               .put("density", density))
         }
@@ -392,7 +397,8 @@ object MantisAgent {
           if (!vp.contains((cx * density).toInt(), (cy * density).toInt())) {
             val sv = nearestScroller(v)?.let { viewport(it).apply { intersect(screenRect(it)) } }
             done(JSONObject().put("ok", false).put("reason", "not in viewport").put("rect", r2)
-              .put("delta", sv?.let { cy - it.exactCenterY() / density } ?: 0f))
+              .put("delta", sv?.let { cy - it.exactCenterY() / density } ?: 0f)
+              .put("dx", sv?.let { cx - it.exactCenterX() / density } ?: 0f))
             return@onFrame
           }
           val hit = hitTest(cx, cy)
@@ -417,7 +423,8 @@ object MantisAgent {
 
       // Scroll = a real drag on the scroll view: DOWN, eased MOVEs (one per frame), finger held still (MOVEs at the
       // end point) for > 100 ms = VelocityTracker's horizon, then UP. Velocity at UP is 0: no fling, deterministic.
-      // dy (dp) = how far content should move up (positive = reveal content below).
+      // dy (dp) = how far content should move up (positive = reveal content below); dx instead: left (positive = reveal
+      // content on the right), for a HorizontalScrollView.
       "Input.scroll" -> {
         val sv = findView(p.getInt("tag"))
         // JS commit can be ~1 frame ahead of the native mount: not ready yet, the runner retries next frame
@@ -426,20 +433,24 @@ object MantisAgent {
         val vp = viewport(sv)
         if (!vp.intersect(screenRect(sv)) || vp.isEmpty) { done(JSONObject().put("ok", false).put("reason", "scroll view not on screen")); return }
         val slop = ViewConfiguration.get(sv.context).scaledTouchSlop
-        val want = p.getDouble("dy").toFloat() * density
-        // dy 0 would put DOWN and UP on one point: a tap on whatever is under it
-        if (want == 0f) { done(JSONObject().put("ok", false).put("reason", "dy is 0, nothing to scroll")); return }
-        val startY = sv.scrollY
-        val amount = (Math.abs(want) + slop).coerceAtMost(vp.height() * 0.8f) * Math.signum(want)
-        val x = vp.exactCenterX()
-        val y0 = vp.exactCenterY() + amount / 2
-        val y1 = vp.exactCenterY() - amount / 2
-        val hit = hitTest(x / density, y0 / density).optJSONArray("chain")
+        val horizontal = p.has("dx")
+        val want = p.getDouble(if (horizontal) "dx" else "dy").toFloat() * density
+        // 0 would put DOWN and UP on one point: a tap on whatever is under it
+        if (want == 0f) { done(JSONObject().put("ok", false).put("reason", "dx/dy is 0, nothing to scroll")); return }
+        val start = sv.scrollX to sv.scrollY
+        val amount = (Math.abs(want) + slop).coerceAtMost((if (horizontal) vp.width() else vp.height()) * 0.8f) * Math.signum(want)
+        // the drag: (x0, y0) -> (x1, y1) through the visible centre, along the axis
+        val (ax, ay) = if (horizontal) amount / 2 to 0f else 0f to amount / 2
+        val x0 = vp.exactCenterX() + ax
+        val y0 = vp.exactCenterY() + ay
+        val x1 = vp.exactCenterX() - ax
+        val y1 = vp.exactCenterY() - ay
+        val hit = hitTest(x0 / density, y0 / density).optJSONArray("chain")
         if (hit == null || (0 until hit.length()).none { hit.getInt(it) == sv.id }) {
           done(JSONObject().put("ok", false).put("reason", "scroll view covered at start point")); return
         }
-        val win = windowAt(x, y0) ?: error("no window at the scroll view")
-        val (f, end) = fingerDown(win, x, y0, done)
+        val win = windowAt(x0, y0) ?: error("no window at the scroll view")
+        val (f, end) = fingerDown(win, x0, y0, done)
         val moves = p.optInt("moves", 6).takeIf { it > 0 } ?: 6
         var frame = 0
         var lastMove = f.down
@@ -449,16 +460,16 @@ object MantisAgent {
             val now = SystemClock.uptimeMillis()
             if (frame <= moves) {
               val k = 1 - (1 - frame.toFloat() / moves).let { it * it } // ease-out
-              move(f, MotionEvent.ACTION_MOVE, x, y0 + (y1 - y0) * k)
+              move(f, MotionEvent.ACTION_MOVE, x0 + (x1 - x0) * k, y0 + (y1 - y0) * k)
               lastMove = now
             } else if (now - lastMove < 110) {
-              move(f, MotionEvent.ACTION_MOVE, x, y1)
+              move(f, MotionEvent.ACTION_MOVE, x1, y1)
             } else {
-              move(f, MotionEvent.ACTION_UP, x, y1)
+              move(f, MotionEvent.ACTION_UP, x1, y1)
               // 2 frames: lets the scroll events of the UP (momentum begin) reach the JS queue before the runner
               // queries again, so the "scroll view animating" check cannot miss them
               // moved: false = the drag happened but the content didn't move (at its end), the runner stops scrolling
-              onFrame(end) { onFrame(end) { end(JSONObject().put("ok", true).put("px", amount).put("moved", sv.scrollY != startY)) } }
+              onFrame(end) { onFrame(end) { end(JSONObject().put("ok", true).put("px", amount).put("moved", (sv.scrollX to sv.scrollY) != start)) } }
               return@guard
             }
             Choreographer.getInstance().postFrameCallback(this)

@@ -163,6 +163,11 @@ function rectOf(fiber) {
   return { x: r.x, y: r.y, width: r.width, height: r.height };
 }
 
+// ScrollView's hosts: RCTScrollView (iOS: both axes, `horizontal` prop), Android's horizontal one has its own name.
+// FlatList, SectionList and FlashList (v2: JS only) render a ScrollView, so they are these too.
+const isScroller = (f) => f.type === "RCTScrollView" || f.type === "AndroidHorizontalScrollView";
+const isHorizontal = (f) => f.type === "AndroidHorizontalScrollView" || (f.memoizedProps || {}).horizontal === true;
+
 function query(sel) {
   const nodes = [];
   for (const root of roots) {
@@ -174,11 +179,15 @@ function query(sel) {
       const visible = rect.width > 0 && rect.height > 0;
       // RN: only the element's own state; a disabled parent (e.g. a non-pressable card) doesn't block children
       const enabled = !disabledOf(f.memoizedProps || {});
-      // nearest scroll container, so the runner can scroll the element into view (vertical only for now)
-      const sc = ancestors.findLast((a) => a.type === "RCTScrollView");
+      // scroll containers, outermost first, so the runner can scroll the element into view along each one's axis
+      const scrolls = ancestors.filter(isScroller).map((a) => ({
+        tag: nativeTagOf(a),
+        rect: rectOf(a),
+        horizontal: isHorizontal(a),
+      }));
       nodes.push({
-        scroll: sc ? { tag: nativeTagOf(sc), rect: rectOf(sc) } : null,
-        busy: sc && scrollerAnimating(f) ? "scroll view animating" : null,
+        scrolls,
+        busy: scrolls.length && scrollerAnimating(f) ? "scroll view animating" : null,
         tag: nativeTagOf(f),
         type: f.type,
         name: accessibleName(f),
@@ -226,7 +235,7 @@ function snapshot() {
       // gesture-handler buttons keep their handlers in RNGH, not in the host's props
       const pressable =
         f.type === "RNGestureHandlerButton" || PRESS_PROPS.some((k) => typeof p[k] === "function");
-      const scroll = f.type === "RCTScrollView";
+      const scroll = isScroller(f);
       let i = -1;
       // a Modal's host sits where <Modal> is in the tree, not where its window is: only its content counts
       if (!isModal(f) && (own || p.testID != null || label != null || role != null || input || pressable || scroll)) {

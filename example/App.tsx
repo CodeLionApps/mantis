@@ -119,6 +119,41 @@ function List({ onBack }: { onBack: () => void }) {
   );
 }
 
+// Auto-scroll lab: a horizontal list, a long virtualized vertical list, and a horizontal shelf nested in it (row 40)
+const TILES = Array.from({ length: 30 }, (_, i) => `Kafel ${i + 1}`);
+const ROWS = Array.from({ length: 200 }, (_, i) => `Wiersz ${i + 1}`);
+const SHELF = Array.from({ length: 20 }, (_, i) => `Półka ${i + 1}`);
+
+function Scrolling({ onBack }: { onBack: () => void }) {
+  const [picked, setPicked] = useState('nic');
+  const pick = (id: string, item: string) => (
+    <Pressable testID={id} accessibilityRole="button" onPress={() => setPicked(item)} style={styles.tile}>
+      <Text style={styles.rowText}>{item}</Text>
+    </Pressable>
+  );
+  return (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Wybrano: {picked}</Text>
+      <Button title="Wstecz" onPress={onBack} />
+      <FlatList testID="tiles" horizontal data={TILES} keyExtractor={x => x} renderItem={({ item, index }) => pick(`tile-${index + 1}`, item)} style={styles.shelf} />
+      <FlatList
+        testID="rows"
+        data={ROWS}
+        keyExtractor={x => x}
+        renderItem={({ item, index }) =>
+          index === 39 ? (
+            <FlatList testID="shelf" horizontal data={SHELF} keyExtractor={x => x} renderItem={s => pick(`shelf-${s.index + 1}`, s.item)} style={styles.shelf} />
+          ) : (
+            <Pressable testID={`row-${index + 1}`} accessibilityRole="button" onPress={() => setPicked(item)} style={styles.row}>
+              <Text style={styles.rowText}>{item}</Text>
+            </Pressable>
+          )
+        }
+      />
+    </View>
+  );
+}
+
 function Details({ onBack }: { onBack: () => void }) {
   return (
     <View style={styles.screen}>
@@ -248,6 +283,7 @@ const SCREENS = {
   Formularz: Form,
   Gesty: Gestures,
   Nakładka: Overlay,
+  Przewijanie: Scrolling,
 };
 
 export default function App() {
@@ -291,6 +327,8 @@ const styles = StyleSheet.create({
   toastText: { color: '#fff' },
   row: { paddingVertical: 14, borderBottomWidth: 1, borderColor: '#eee' },
   rowText: { fontSize: 16, color: '#111' },
+  tile: { width: 110, paddingVertical: 14, marginRight: 8, alignItems: 'center', backgroundColor: '#e5e7eb', borderRadius: 6 },
+  shelf: { flexGrow: 0, marginBottom: 12 },
   switchRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 },
   modalBackdrop: { flex: 1, backgroundColor: '#0006', justifyContent: 'center', padding: 24 },
   modal: { backgroundColor: '#fff', borderRadius: 8, padding: 24 },
