@@ -75,8 +75,9 @@ object MantisAgent {
   @JvmStatic
   fun install(application: Application) {
     app = application
-    // the JS agent's socket is RN's WebSocket: same fix. ponytail: replaces an app's own custom builder (E2E builds
-    // only; RN has no getter to chain it)
+    // the JS agent's socket is RN's WebSocket: same fix. Installed before Application.onCreate (MantisInitProvider), so
+    // an app that sets its own custom builder replaces this one and only loses TCP_NODELAY. ponytail: RN has no getter
+    // to chain the two
     WebSocketModule.setCustomClientBuilder { it.socketFactory(NoDelay) }
     app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
       override fun onActivityResumed(a: Activity) { activity = a }
