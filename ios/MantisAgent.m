@@ -287,7 +287,9 @@ static NSArray *tagChain(UIView *v) {
 }
 
 // Android reaches(): a touch at the centre of v's visible part lands in v, in a view inside v, or in an ancestor of v (a
-// text in a pressable), or in a view of the same window that doesn't cover all of v (a sibling over a corner).
+// text in a pressable), or in a view of the same window that, with every superview below the common ancestor, doesn't
+// cover all of v (a sibling over a corner; not a QR code in a sheet over v, nor a text in a Modal: the sheet or the
+// Modal's root takes the rest). ponytail: a pointerEvents box-none wrapper on that path still counts as covering.
 - (BOOL)reaches:(UIView *)v {
   if (!v) return NO;
   CGRect vis = CGRectIntersection(presentedRect(v), UIScreen.mainScreen.bounds);
@@ -298,8 +300,10 @@ static NSArray *tagChain(UIView *v) {
   NSArray *chain = tagChain(hit);
   if ([chain containsObject:@(v.tag)]) return YES;
   if (chain.count && [tagChain(v) containsObject:chain.firstObject]) return YES;
-  UIView *over = chain.count ? [self viewForTag:[chain.firstObject integerValue]] : nil;
-  return over && over.window == v.window && !CGRectContainsRect(presentedRect(over), vis);
+  if (!hit || hit.window != v.window) return NO;
+  for (UIView *a = hit; a && ![v isDescendantOfView:a]; a = a.superview)
+    if (CGRectContainsRect(presentedRect(a), vis)) return NO;
+  return YES;
 }
 
 // iOS counterpart of Android's "window has focus": UIKit drops touches while a view controller is being
