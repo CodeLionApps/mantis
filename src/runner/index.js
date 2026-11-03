@@ -393,6 +393,51 @@ class App {
     return r;
   }
 
+  /**
+   * Waits until the app stands still: no React commit and nothing changed on screen for quietMs, no request in flight.
+   * Screen: Android, a window of the app drew; iOS, a layer changed or an animation runs (transitions, native-driver
+   * and Reanimated frames, scrolling). Throws on timeout, naming what is still busy (a spinner never stops).
+   * ponytail: Android's clock can't tell which view drew, so a focused text field's caret (a draw every 500 ms) keeps
+   * quietMs >= 500 from ever passing; blur the field first.
+   */
+  async idle({ quietMs = 100, timeout = DEFAULT_TIMEOUT } = {}) {
+    const t0 = performance.now();
+    // a ping waits for what's left of timeout (at least 100 ms, so one sent at the end can still answer): a stalled
+    // thread throws this TimeoutError, not the RPC's after 15 s
+    const ping = (peer, thread) => {
+      const ms = Math.max(100, t0 + timeout - performance.now());
+      let timer;
+      return Promise.race([
+        peer.call("Agent.ping").finally(() => clearTimeout(timer)),
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new TimeoutError(`app not idle after ${timeout}ms: the ${thread} thread didn't answer`)),
+            ms,
+          );
+        }),
+      ]);
+    };
+    for (;;) {
+      const iter = performance.now();
+      const [js, ui] = await Promise.all([
+        ping(this.js, "JS"),
+        // an iOS agent older than the draw clock: the JS clock alone
+        ping(this.native, "main").catch((e) => {
+          if (/unknown method/.test(e.message)) return {};
+          throw e;
+        }),
+      ]);
+      const busy = (js.net ?? []).map((r) => `request in flight for ${r.ms}ms: ${r.url}`);
+      if (js.idleMs < quietMs) busy.push(`React committed ${js.idleMs}ms ago`);
+      if (ui.idleMs < quietMs) busy.push(`screen changed ${Math.round(ui.idleMs)}ms ago${ui.busy ? ` (${ui.busy})` : ""}`);
+      if (!busy.length) return timing("idle", t0, iter);
+      if (performance.now() - t0 > timeout)
+        throw new TimeoutError(`app not idle after ${timeout}ms: ${busy.join("; ")}`);
+      // until both clocks can be quiet
+      await sleep(Math.max(16, quietMs - Math.min(js.idleMs ?? quietMs, ui.idleMs ?? quietMs)));
+    }
+  }
+
   getByRole(role, { name } = {}) {
     return new Locator(this, { role, name: norm(name) });
   }

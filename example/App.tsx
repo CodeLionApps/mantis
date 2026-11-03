@@ -266,6 +266,39 @@ function Alerts({ onBack }: { onBack: () => void }) {
   );
 }
 
+// idle() lab: a loading overlay with a spinner that is hidden but stays mounted, faded to opacity 0 (native driver) or
+// moved off screen. Its spinner keeps looping natively; idle() must not wait for it.
+function Overlay({ onBack }: { onBack: () => void }) {
+  const [mode, setMode] = useState<'fade' | 'away' | null>(null);
+  const [hidden, setHidden] = useState(false);
+  const opacity = useRef(new Animated.Value(1)).current;
+  const show = (m: 'fade' | 'away') => {
+    setHidden(false);
+    opacity.setValue(1);
+    setMode(m);
+    setTimeout(() => {
+      if (m === 'away') return setHidden(true);
+      Animated.timing(opacity, { toValue: 0, duration: 300, useNativeDriver: true }).start(() => setHidden(true));
+    }, 300);
+  };
+  return (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Nakładka: {mode == null ? 'brak' : hidden ? 'ukryta' : 'widoczna'}</Text>
+      <Button title="Zanikanie" onPress={() => show('fade')} />
+      <Button title="Poza ekran" onPress={() => show('away')} />
+      <Button title="Wstecz" onPress={onBack} />
+      {mode && (
+        <Animated.View
+          testID="overlay"
+          pointerEvents="none"
+          style={[styles.overlay, { opacity }, mode === 'away' && hidden && { left: -2000, right: 2000 }]}>
+          <ActivityIndicator testID="overlay-spinner" size="large" />
+        </Animated.View>
+      )}
+    </View>
+  );
+}
+
 const SCREENS = {
   Logowanie: LoginFlow,
   Licznik: Counter,
@@ -274,6 +307,7 @@ const SCREENS = {
   Ładowanie: Loading,
   Formularz: Form,
   Gesty: Gestures,
+  Nakładka: Overlay,
   Przewijanie: Scrolling,
   Alerty: Alerts,
 };
@@ -326,4 +360,5 @@ const styles = StyleSheet.create({
   modal: { backgroundColor: '#fff', borderRadius: 8, padding: 24 },
   ghBox: { height: 120, backgroundColor: '#16a34a', borderRadius: 8, justifyContent: 'center', alignItems: 'center', marginBottom: 12 },
   ghPan: { backgroundColor: '#9333ea' },
+  overlay: { ...StyleSheet.absoluteFill, backgroundColor: '#0008', justifyContent: 'center', alignItems: 'center' },
 });
