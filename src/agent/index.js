@@ -5,6 +5,7 @@
 
 const roots = new Set();
 let commitId = 0;
+let commitAt = Date.now(); // of the last commit (agent start before the first), for Agent.ping's idleMs
 
 const prev = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
 if (prev) {
@@ -41,6 +42,7 @@ function handleCommit(root) {
     roots.delete(root);
   else roots.add(root);
   commitId++;
+  commitAt = Date.now();
   send({ method: "Tree.committed", params: { commitId } });
 }
 
@@ -192,6 +194,77 @@ function query(sel) {
   return { commitId, count: nodes.length, nodes };
 }
 
+// Whole-screen snapshot for an LLM driver: one pass over the fibers, host nodes worth showing (text,
+// testID, label, role, text input, touch handler, scroll view). parent = index of the nearest included host
+// ancestor. rect = getBoundingClientRect: dp from the React root's origin (= screen dp for an edge-to-edge root).
+// Empty boxes and boxes fully outside the screen are dropped; what's covered or on screens below is the native
+// half's job (App.snapshot joins both). ponytail: a <Text> is one node, links nested in it aren't listed.
+const PRESS_PROPS = ["onPress", "onClick", "onLongPress", "onStartShouldSetResponder", "onResponderRelease"];
+function snapshot() {
+  const screen = require("react-native").Dimensions.get("screen");
+  const nodes = [];
+  // returns the subtree's host text, so accessibleName's fallback costs nothing extra
+  const walk = (fiber, parent) => {
+    let text = "";
+    for (let f = fiber; f; f = f.sibling) {
+      if (f.tag === HostText) {
+        text += f.memoizedProps;
+        continue;
+      }
+      if (f.tag !== HostComponent) {
+        text += walk(f.child, parent);
+        continue;
+      }
+      const p = f.memoizedProps || {};
+      const isText = f.type === "RCTText";
+      const own = isText ? hostChildrenText(f) : null;
+      const input = f.type.includes("TextInput");
+      const label = p["aria-label"] ?? p.accessibilityLabel;
+      const role = roleOf(p);
+      // gesture-handler buttons keep their handlers in RNGH, not in the host's props
+      const pressable =
+        f.type === "RNGestureHandlerButton" || PRESS_PROPS.some((k) => typeof p[k] === "function");
+      const scroll = f.type === "RCTScrollView";
+      let i = -1;
+      // a Modal's host sits where <Modal> is in the tree, not where its window is: only its content counts
+      if (f.type !== "RCTModalHostView" && (own || p.testID != null || label != null || role != null || input || pressable || scroll)) {
+        const rect = rectOf(f);
+        const onScreen =
+          rect.width > 0 && rect.height > 0 && rect.x < screen.width && rect.y < screen.height &&
+          rect.x + rect.width > 0 && rect.y + rect.height > 0;
+        if (onScreen) {
+          const s = p.accessibilityState || {};
+          i = nodes.push({
+            tag: nativeTagOf(f),
+            parent,
+            type: f.type,
+            testID: p.testID ?? null,
+            label: label ?? null,
+            name: null, // below, once the subtree's text is known
+            text: own,
+            role: role ?? null,
+            value: input ? (p.text ?? p.value ?? null) : null,
+            placeholder: input ? (p.placeholder ?? null) : null,
+            editable: input && p.editable !== false,
+            pressable,
+            enabled: !disabledOf(p),
+            selected: s.selected ?? p["aria-selected"] ?? null,
+            checked: s.checked ?? p["aria-checked"] ?? null,
+            scroll,
+            rect,
+          }) - 1;
+        }
+      }
+      const sub = isText ? own : walk(f.child, i < 0 ? parent : i);
+      if (i >= 0) nodes[i].name = label ?? sub;
+      text += sub;
+    }
+    return text;
+  };
+  for (const root of roots) walk(root.current.child, -1);
+  return { commitId, nodes };
+}
+
 // ---------- touches ----------
 // RN drops a touch whose target view React already replaced by the time the (busy) JS thread gets to it, e.g. a
 // re-render with late session data right as the tap lands. Report each touch start and whether its target was
@@ -231,11 +304,42 @@ function checkInternals() {
   return null;
 }
 
+// ---------- network ----------
+// Requests in flight, for the runner's idle wait: a screen whose data is still on the way is not done. XMLHttpRequest
+// only (RN's fetch is built on it); WebSockets and native SDKs (Firestore, analytics) aren't counted. RN dispatches
+// loadend after load, error, timeout and abort alike.
+const inFlight = new Map(); // xhr -> { at, url }
+try {
+  const XHR = global.XMLHttpRequest.prototype;
+  const { open, send: xhrSend } = XHR;
+  XHR.open = function (method, url, ...rest) {
+    this.__mantisUrl = String(url).split("?")[0]; // no query: tokens live there
+    return open.call(this, method, url, ...rest);
+  };
+  XHR.send = function (...args) {
+    inFlight.set(this, { at: Date.now(), url: this.__mantisUrl });
+    this.addEventListener("loadend", () => inFlight.delete(this));
+    try {
+      return xhrSend.apply(this, args);
+    } catch (e) {
+      inFlight.delete(this);
+      throw e;
+    }
+  };
+} catch (e) {}
+
 // ---------- RPC ----------
 const handlers = {
   "Tree.query": (p) => query(p.selector),
+  "Tree.snapshot": snapshot,
   // queued behind any touch events already on the JS thread: the reply means their handlers have run
-  "Agent.ping": () => ({ commitId }),
+  // idleMs: since the last commit; net: requests in flight (age in ms, URL without query)
+  "Agent.ping": () => {
+    const now = Date.now();
+    const net = [];
+    for (const r of inFlight.values()) net.push({ ms: now - r.at, url: r.url });
+    return { commitId, idleMs: now - commitAt, net };
+  },
 };
 
 // Runner port: 9123; on iOS the launch argument `-mantisPort N` (NSUserDefaults argument domain, read through RN
@@ -269,6 +373,7 @@ function connect() {
   const { port, token } = getLaunchArgs();
   ws = new WebSocket(`ws://localhost:${port}/?role=js`);
   ws.onopen = () => {
+    touchSeq = 0; // the runner counts this connection's touches from 0 (App.js.onHello), also when it attaches late
     // react-native is loaded by now (connect runs after the entry module), not when this file is evaluated
     const platform = require("react-native").Platform.OS;
     send({
