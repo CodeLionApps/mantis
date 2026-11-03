@@ -23,6 +23,96 @@
 #import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
+#import <objc/runtime.h>
+#import <pthread.h>
+
+// Draw clock for Agent.ping (Android: an OnDrawListener per window). iOS has no draw callback, so two hooks on CALayer,
+// installed at load. A property set to a new value on the main thread: a mount, a native-driver / Reanimated frame, a
+// scroll or fling, an image landing. And addAnimation:forKey:, as UIKit transitions, UIView animations,
+// react-native-screens and spinners move in the render server, where no setter fires: the screen counts as changing
+// until the animation's end, and a loop (a spinner) keeps its layer for the ping to check.
+static CFTimeInterval mantisChangedAt; // CACurrentMediaTime of the last change
+static NSUInteger mantisChanges;
+static Class mantisChangedClass; // what the last change was: its view's class and tag, the setter
+static NSInteger mantisChangedTag;
+static const char *mantisChangedHow;
+static CFTimeInterval mantisAnimEnd; // when the last-ending animation stops
+static NSString *mantisAnimWhat; // ...and what it animates
+static NSHashTable<CALayer *> *mantisLoops; // weak: layers given a loop; a ping drops the ones without animations
+
+static void mantisChanged(CALayer *l, const char *how) {
+  mantisChanges++;
+  mantisChangedAt = CACurrentMediaTime();
+  id d = l.delegate;
+  mantisChangedClass = object_getClass(d ?: l);
+  mantisChangedTag = [d isKindOfClass:UIView.class] ? ((UIView *)d).tag : 0;
+  mantisChangedHow = how;
+}
+
+#define MANTIS_HOOK(setter, T, same) do { \
+  Method m = class_getInstanceMethod(CALayer.class, @selector(setter:)); \
+  void (*orig)(CALayer *, SEL, T) = (void *)method_getImplementation(m); \
+  method_setImplementation(m, imp_implementationWithBlock(^(CALayer *l, T v) { \
+    if (pthread_main_np() && !(same)) mantisChanged(l, #setter); \
+    orig(l, @selector(setter:), v); \
+  })); \
+} while (0)
+
+// Seconds an animation moves: 0 for one that never progresses (infinite duration: iOS 26's keyboard glass layers
+// that follow another layer), more than a minute for a loop (a spinner, a text cursor).
+static double mantisActive(CAAnimation *a) {
+  if (isinf(a.duration)) return 0;
+  if (a.repeatDuration > 0) return a.repeatDuration;
+  return (a.duration ?: 0.25) * MAX(a.repeatCount, 1) * (a.autoreverses ? 2 : 1);
+}
+
+// The keyboard's windows don't count: its bar's labels morph for a second after each field, and the keyboard is
+// another process's, as on Android (snapshot already reports its end frame)
+static BOOL mantisKeyboardLayer(CALayer *l) {
+  for (; l; l = l.superlayer)
+    if ([l.delegate isKindOfClass:UIWindow.class]) {
+      NSString *w = NSStringFromClass([l.delegate class]);
+      return [w containsString:@"Keyboard"] || [w containsString:@"TextEffects"];
+    }
+  return NO;
+}
+
+static void mantisHookLayers(void) {
+  mantisChangedAt = CACurrentMediaTime();
+  mantisLoops = [NSHashTable weakObjectsHashTable];
+  MANTIS_HOOK(setPosition, CGPoint, CGPointEqualToPoint(l.position, v));
+  MANTIS_HOOK(setBounds, CGRect, CGRectEqualToRect(l.bounds, v));
+  MANTIS_HOOK(setTransform, CATransform3D, CATransform3DEqualToTransform(l.transform, v));
+  MANTIS_HOOK(setOpacity, float, l.opacity == v);
+  MANTIS_HOOK(setContents, id, l.contents == v);
+  Method m = class_getInstanceMethod(CALayer.class, @selector(addAnimation:forKey:));
+  void (*orig)(CALayer *, SEL, CAAnimation *, NSString *) = (void *)method_getImplementation(m);
+  method_setImplementation(m, imp_implementationWithBlock(^(CALayer *l, CAAnimation *a, NSString *k) {
+    if (pthread_main_np() && !mantisKeyboardLayer(l)) {
+      mantisChanged(l, "addAnimation");
+      CFTimeInterval now = mantisChangedAt;
+      double active = mantisActive(a);
+      // beginTime: 0 = now, else in the layer's time (UIKit's delay)
+      CFTimeInterval end = (a.beginTime > 0 ? now + a.beginTime - [l convertTime:now fromLayer:nil] : now) + active;
+      if (active > 60) [mantisLoops addObject:l];
+      else if (end > mantisAnimEnd) {
+        mantisAnimEnd = end;
+        mantisAnimWhat = [NSString stringWithFormat:@"%@ animating %@", NSStringFromClass([(l.delegate ?: l) class]), k];
+      }
+    }
+    orig(l, @selector(addAnimation:forKey:), a, k);
+  }));
+}
+
+// A loop on screen: in a window, not hidden, and not a text cursor (a focused input's caret blinks forever; Android's
+// blink draws are 500 ms apart, so they never hold the idle wait either)
+static BOOL mantisLoopShown(CALayer *l) {
+  for (; l; l = l.superlayer) {
+    if (l.hidden || [l.delegate conformsToProtocol:@protocol(UITextInput)]) return NO;
+    if ([l.delegate isKindOfClass:UIWindow.class]) return YES;
+  }
+  return NO;
+}
 
 static UITouch *_touch; // synthesized finger between Began and Ended/Cancelled; nil = no gesture in progress
 static NSUInteger _gestureId; // bumped by every gesture, so callbacks of an earlier one can tell they're stale
@@ -94,6 +184,7 @@ static MantisAgent *shared;
 + (void)load {
   // app extensions and logic test bundles load this binary too (use_frameworks!): no UIApplication there
   if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) return;
+  mantisHookLayers();
   dispatch_async(dispatch_get_main_queue(), ^{
     shared = [MantisAgent new];
     [NSNotificationCenter.defaultCenter addObserverForName:UIKeyboardWillChangeFrameNotification object:nil queue:nil
@@ -569,6 +660,24 @@ static NSString *transitionReason(UIWindow *w) {
     if (nav.transitionCoordinator) return done(@{@"ok": @NO, @"reason": @"a navigation transition is in progress"});
     [nav popViewControllerAnimated:YES];
     done(@{@"ok": @YES, @"via": @"navigation", @"controller": NSStringFromClass(nav.class)});
+  } else if ([method isEqualToString:@"Agent.ping"]) {
+    // Draw clock for the runner's idle wait, as on Android: idleMs = ms since something in the app's windows last
+    // changed on screen, draws = how many changes so far. busy, for the runner's error: the animation still running,
+    // else the last change (its view's class and React tag, the setter).
+    CFTimeInterval now = CACurrentMediaTime(), last = MAX(mantisChangedAt, MIN(mantisAnimEnd, now));
+    NSString *busy = mantisAnimEnd > now ? mantisAnimWhat : nil;
+    for (CALayer *l in mantisLoops.allObjects) {
+      NSArray<NSString *> *keys = l.animationKeys;
+      if (!keys.count) [mantisLoops removeObject:l];
+      else if (mantisLoopShown(l))
+        for (NSString *k in keys)
+          if (mantisActive([l animationForKey:k]) > 60) {
+            last = now;
+            busy = busy ?: [NSString stringWithFormat:@"%@ animating %@ in a loop", NSStringFromClass([(l.delegate ?: l) class]), k];
+          }
+    }
+    busy = busy ?: [NSString stringWithFormat:@"%@ tag %ld %s", mantisChangedClass, (long)mantisChangedTag, mantisChangedHow];
+    done(@{@"draws": @(mantisChanges), @"idleMs": @((now - last) * 1000), @"busy": busy});
   } else if ([method isEqualToString:@"Input.hideKeyboard"]) {
     // what a user does when the keyboard covers the next target (Detox's replaceText never opens it)
     done(@{@"ok": @([UIApplication.sharedApplication sendAction:@selector(resignFirstResponder) to:nil from:nil forEvent:nil])});
