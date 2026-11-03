@@ -50,34 +50,74 @@ function handleCommit(root) {
 const HostComponent = 5;
 const HostText = 6;
 
+const isInput = (f) => f.type.includes("TextInput");
+// A password or one-time code: never sent to the runner (MANTIS_TRACE logs results). Also with secureTextEntry off
+// (a "show password" toggle), by what the input is for.
+const SECRET = /password|otp|one-?time/i;
+const isSecret = (f) => {
+  const p = f.memoizedProps || {};
+  return isInput(f) && (!!p.secureTextEntry || SECRET.test(p.textContentType ?? "") || SECRET.test(p.autoComplete ?? ""));
+};
+
+// a secret input's children (RN wraps them in a Text) are skipped, here and in hostFibers
 function hostChildrenText(fiber) {
   let out = "";
   for (let c = fiber.child; c; c = c.sibling) {
     if (c.tag === HostText) out += c.memoizedProps;
-    else out += hostChildrenText(c);
+    else if (!(c.tag === HostComponent && isSecret(c))) out += hostChildrenText(c);
   }
   return out;
 }
 
+// nativeID -> host fibers, once per commit (labelledBy targets)
+let idsOf = { commitId: -1, map: null };
+function nativeIds() {
+  if (idsOf.commitId === commitId) return idsOf.map;
+  const map = new Map();
+  for (const root of roots)
+    for (const [f] of hostFibers(root.current.child, [])) {
+      const id = (f.memoizedProps || {}).nativeID;
+      if (id != null) map.set(id, [...(map.get(id) || []), f]);
+    }
+  idsOf = { commitId, map };
+  return map;
+}
+
+// of several views with one nativeID (a screen pushed twice, list rows): the one sharing the deepest ancestor with fiber
+function nearest(fiber, candidates) {
+  if (candidates.length === 1) return candidates[0];
+  const up = new Map();
+  for (let a = fiber, d = 0; a; a = a.return, d++) up.set(a, d);
+  let best = null;
+  let bestD = Infinity;
+  for (const c of candidates)
+    for (let a = c; a; a = a.return)
+      if (up.has(a)) {
+        if (up.get(a) < bestD) (best = c), (bestD = up.get(a));
+        break;
+      }
+  return best ?? candidates[0];
+}
+
 // aria-label / accessibilityLabel, else the text of the views aria-labelledby / accessibilityLabelledBy point to (their
-// nativeID; RN takes a string or an array, aria-labelledby comma-separated). ponytail: a whole-tree walk per labelledBy node.
-function labelOf(p) {
+// nativeID; RN takes a string or an array, aria-labelledby comma-separated)
+function labelOf(fiber) {
+  const p = fiber.memoizedProps || {};
   const own = p["aria-label"] ?? p.accessibilityLabel;
   const by = p["aria-labelledby"] ?? p.accessibilityLabelledBy;
   if (own != null || by == null) return own ?? null;
   const ids = Array.isArray(by) ? by : String(by).split(/\s*,\s*/);
   const texts = [];
-  for (const root of roots)
-    for (const [f] of hostFibers(root.current.child, []))
-      if (ids.includes((f.memoizedProps || {}).nativeID)) texts.push(hostChildrenText(f));
+  for (const id of ids) {
+    const found = nativeIds().get(id);
+    if (found) texts.push(hostChildrenText(nearest(fiber, found)));
+  }
   return texts.length ? texts.join(" ") : null;
 }
 
 function accessibleName(fiber) {
-  return labelOf(fiber.memoizedProps || {}) ?? hostChildrenText(fiber);
+  return labelOf(fiber) ?? hostChildrenText(fiber);
 }
-
-const isInput = (f) => f.type.includes("TextInput");
 
 function roleOf(p) {
   return p.role ?? p.accessibilityRole;
@@ -106,15 +146,24 @@ function matchesSelf(fiber, sel) {
   if (sel.testId != null) return p.testID === sel.testId;
   if (sel.role != null)
     return roleOf(p) === sel.role && matchText(accessibleName(fiber), sel.name);
-  if (sel.label != null) return matchText(labelOf(p), sel.label);
+  if (sel.label != null) return matchText(labelOf(fiber), sel.label);
   if (sel.placeholder != null) return isInput(fiber) && matchText(p.placeholder, sel.placeholder);
   if (sel.text != null) {
     if (fiber.type === "RCTText") return matchText(hostChildrenText(fiber), sel.text);
-    // a view with a label and no text of its own (icon button, labelled image or SVG): its label is its text
-    const label = p["aria-label"] ?? p.accessibilityLabel;
-    return label != null && !isInput(fiber) && !hostChildrenText(fiber) && matchText(label, sel.text);
+    if (!sel.labels || !labelAsText(fiber, sel.text)) return false;
+    // an icon inside a labelled button, both labelled the same: the button only
+    for (let a = fiber.return; a; a = a.return) if (a.tag === HostComponent && labelAsText(a, sel.text)) return false;
+    return true;
   }
   return false;
+}
+
+// getByText (not Detox by.text): a view with its own label and no text inside (icon button, labelled image or SVG)
+// matches by its label
+function labelAsText(fiber, text) {
+  const p = fiber.memoizedProps || {};
+  const label = p["aria-label"] ?? p.accessibilityLabel;
+  return label != null && !isInput(fiber) && !hostChildrenText(fiber) && matchText(label, text);
 }
 
 // `within` = some host ancestor matches that selector (Detox withAncestor, Playwright locator chaining); nests.
@@ -131,7 +180,7 @@ function* hostFibers(fiber, ancestors) {
   for (let f = fiber; f; f = f.sibling) {
     if (f.tag === HostComponent) {
       yield [f, ancestors];
-      yield* hostFibers(f.child, [...ancestors, f]);
+      if (!isSecret(f)) yield* hostFibers(f.child, [...ancestors, f]);
     } else {
       yield* hostFibers(f.child, ancestors);
     }
@@ -237,8 +286,14 @@ const gestureNames = (g) =>
   typeof g?.toGestureArray === "function" ? g.toGestureArray().map((x) => x.handlerName)
   : Array.isArray(g?.gestures) ? g.gestures.flatMap(gestureNames)
   : [g?.type];
-const tapDetector = (p) =>
-  p.gesture != null && typeof p.gesture === "object" && gestureNames(p.gesture).some((n) => TAP_GESTURES.includes(n));
+// someone else's gesture prop may throw (a getter, a Proxy): not a detector then, the snapshot goes on
+const tapDetector = (p) => {
+  try {
+    return p.gesture != null && typeof p.gesture === "object" && gestureNames(p.gesture).some((n) => TAP_GESTURES.includes(n));
+  } catch (e) {
+    return false;
+  }
+};
 // v3's detector is a host view of its own (box-none) around the wrapped one
 const DETECTOR = "RNGestureHandlerDetector";
 function snapshot() {
@@ -261,7 +316,7 @@ function snapshot() {
       const isText = f.type === "RCTText";
       const own = isText ? hostChildrenText(f) : null;
       const input = isInput(f);
-      const label = labelOf(p);
+      const label = labelOf(f);
       const role = roleOf(p);
       const detector = f.type === DETECTOR;
       // gesture-handler buttons keep their handlers in RNGH, not in the host's props; so do GestureDetector's views
@@ -287,9 +342,9 @@ function snapshot() {
             name: null, // below, once the subtree's text is known
             text: own,
             role: role ?? null,
-            // RN passes value ?? defaultValue as text; an uncontrolled input's typed text lives natively only.
-            // Never a password: a mask when there is one.
-            value: !input ? null : p.secureTextEntry && (p.text ?? p.value) ? "••••••••" : (p.text ?? p.value ?? null),
+            // RN passes value ?? defaultValue as text: an uncontrolled input shows its default, not what was typed since
+            // (that lives natively). Never a password or code: a mask when there is one.
+            value: !input ? null : isSecret(f) && (p.text ?? p.value) ? "••••••••" : (p.text ?? p.value ?? null),
             placeholder: input ? (p.placeholder ?? null) : null,
             editable: input && p.editable !== false,
             pressable,
@@ -301,7 +356,7 @@ function snapshot() {
           }) - 1;
         }
       }
-      const sub = isText ? own : walk(f.child, i < 0 ? parent : i, tap && detector);
+      const sub = isText ? own : isSecret(f) ? "" : walk(f.child, i < 0 ? parent : i, tap && detector);
       if (i >= 0) nodes[i].name = label ?? sub;
       text += sub;
     }
