@@ -15,7 +15,7 @@ const PORT =
 const DEFAULT_TIMEOUT = 10000;
 const CONNECT_TIMEOUT = 15000;
 // bumped on incompatible changes; agents send it in Agent.hello (an app built with another Mantis version)
-const PROTOCOL = 1;
+const PROTOCOL = 2;
 
 /** Detox's toBeVisible threshold (≥ 75% of the view shown), for toBeInViewport. */
 const DETOX_VISIBLE = Object.freeze({ ratio: 0.75 });
@@ -193,6 +193,7 @@ class Peer {
 class App {
   constructor(port = PORT, platform = "android") {
     this.port = port;
+    this.platform = platform;
     this.token = randomUUID();
     this.js = new Peer("js", platform, this.token);
     this.native = new Peer("native", platform, this.token);
@@ -318,11 +319,12 @@ class App {
   /**
    * Whole-screen snapshot for an LLM driver: Tree.snapshot (JS agent) joined with Layout.visibility {hit}
    * (native). Keeps the nodes a user can see: visible ratio > 0 (drops screens below, clipped and off-screen ones)
-   * and a touch at their visible centre isn't caught by another view (hit null = can't tell, no resumed activity;
-   * iOS doesn't report it yet), or something inside them is kept. parent is re-pointed past dropped nodes. Tree
+   * and a touch at their visible centre isn't caught by another view (both platforms; hit null = can't tell, no
+   * resumed activity on Android), or something inside them is kept. parent is re-pointed past dropped nodes. Tree
    * order = paint order (later siblings drawn on top; zIndex/elevation aside). rect: dp, React root origin (JS
    * layout; screen dp for an edge-to-edge root).
-   * focused false = a system dialog (permission prompt, Samsung Pass) is over the app; keyboard = IME rect or null.
+   * focused false = a system dialog (permission prompt, Samsung Pass), or on iOS an alert of the app's own, is over
+   * the app; keyboard = IME rect or null.
    */
   async snapshot() {
     const { commitId, nodes } = await this.js.call("Tree.snapshot");
@@ -345,6 +347,35 @@ class App {
     });
     const { focused = null, keyboard = null, screen = null } = vis;
     return { commitId, nodes: out, focused, keyboard, screen };
+  }
+
+  /**
+   * The back button, as on Android: { ok, via, reason }. Android: the native agent's Input.back (a back key to the window
+   * with focus). iOS has none, so the steps of Android's in its order: no back when the app is not active or an alert of
+   * its own is on top (focused false; the caller does it another way); the keyboard closes (a first back closes the IME);
+   * else the JS agent's Input.back (the topmost Modal's onRequestClose, then the BackHandler listeners, last first); else
+   * a native navigation controller pops (a native stack no BackHandler listener knows). ok: false = nothing took it
+   * (Android would leave the app). Settles after a back that was taken, as tap and fill do.
+   */
+  async back() {
+    let r;
+    if (this.platform !== "ios") r = await this.native.call("Input.back");
+    else {
+      const { focused, keyboard, appState } = await this.native.call("Layout.visibility", { tags: [], hit: true });
+      if (!focused)
+        return { ok: false, reason: appState ? "app not active (a system alert or another app in front)" : "an alert of the app" };
+      if (keyboard)
+        r = (await this.native.call("Input.hideKeyboard")).ok ? { ok: true, via: "keyboard" } : { ok: false, reason: "keyboard on screen" };
+      else {
+        r = await this.js.call("Input.back");
+        if (!r.ok) {
+          const nav = await this.native.call("Input.back");
+          r = nav.ok ? nav : { ok: false, reason: `${r.reason}; ${nav.reason}` };
+        }
+      }
+    }
+    if (r.ok) await this.settle();
+    return r;
   }
 
   getByRole(role, { name } = {}) {

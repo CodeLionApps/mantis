@@ -56,6 +56,20 @@ static __weak UIResponder *mantisFR;
 @implementation UIResponder (MantisFirstResponder)
 - (void)mantis_captureFirstResponder:(id)sender { mantisFR = self; }
 @end
+// The deepest shown navigation controller with more than one screen (tab → selected, navigation → top, containers →
+// their shown children, last first), or nil: what a back button would pop.
+static UINavigationController *backStack(UIViewController *vc) {
+  NSArray<UIViewController *> *next = [vc isKindOfClass:UITabBarController.class] ? @[((UITabBarController *)vc).selectedViewController ?: vc]
+    : [vc isKindOfClass:UINavigationController.class] ? @[((UINavigationController *)vc).topViewController ?: vc]
+    : vc.childViewControllers.reverseObjectEnumerator.allObjects;
+  for (UIViewController *c in next) {
+    if (c == vc || !c.isViewLoaded || !c.view.window || c.view.isHidden) continue;
+    UINavigationController *deeper = backStack(c);
+    if (deeper) return deeper;
+  }
+  return [vc isKindOfClass:UINavigationController.class] && ((UINavigationController *)vc).viewControllers.count > 1 ? (UINavigationController *)vc : nil;
+}
+
 static UIResponder *MantisFirstResponder(void) {
   mantisFR = nil;
   [UIApplication.sharedApplication sendAction:@selector(mantis_captureFirstResponder:) to:nil from:nil forEvent:nil];
@@ -72,6 +86,7 @@ static NSException *MantisError(NSString *reason) {
 
 @implementation MantisAgent {
   NSURLSessionWebSocketTask *_ws;
+  CGRect _keyboard; // last keyboard end frame (UIKeyboardWillChangeFrame), screen points; off screen = none
 }
 
 static MantisAgent *shared;
@@ -81,6 +96,12 @@ static MantisAgent *shared;
   if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) return;
   dispatch_async(dispatch_get_main_queue(), ^{
     shared = [MantisAgent new];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIKeyboardWillChangeFrameNotification object:nil queue:nil
+                                                usingBlock:^(NSNotification *n) {
+      shared->_keyboard = [n.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    }];
+    [NSNotificationCenter.defaultCenter addObserverForName:UIKeyboardWillHideNotification object:nil queue:nil
+                                                usingBlock:^(NSNotification *n) { shared->_keyboard = CGRectNull; }];
     [shared connect];
   });
 }
@@ -94,7 +115,7 @@ static MantisAgent *shared;
   _ws = [NSURLSession.sharedSession webSocketTaskWithURL:[NSURL URLWithString:url]];
   [_ws resume];
   // v: src/runner PROTOCOL; token: proves to the runner that it launched this app (simulators share localhost)
-  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @1, @"token": token}}];
+  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @2, @"token": token}}];
   [self receive];
 }
 
@@ -265,6 +286,22 @@ static NSArray *tagChain(UIView *v) {
   return out;
 }
 
+// Android reaches(): a touch at the centre of v's visible part lands in v, in a view inside v, or in an ancestor of v (a
+// text in a pressable), or in a view of the same window that doesn't cover all of v (a sibling over a corner).
+- (BOOL)reaches:(UIView *)v {
+  if (!v) return NO;
+  CGRect vis = CGRectIntersection(presentedRect(v), UIScreen.mainScreen.bounds);
+  for (UIView *a = v.superview; a && !CGRectIsNull(vis); a = a.superview)
+    if (a.clipsToBounds || [a isKindOfClass:UIScrollView.class]) vis = CGRectIntersection(vis, presentedRect(a));
+  if (CGRectIsNull(vis)) return NO;
+  UIView *hit = [self hitView:CGPointMake(CGRectGetMidX(vis), CGRectGetMidY(vis))];
+  NSArray *chain = tagChain(hit);
+  if ([chain containsObject:@(v.tag)]) return YES;
+  if (chain.count && [tagChain(v) containsObject:chain.firstObject]) return YES;
+  UIView *over = chain.count ? [self viewForTag:[chain.firstObject integerValue]] : nil;
+  return over && over.window == v.window && !CGRectContainsRect(presentedRect(over), vis);
+}
+
 // iOS counterpart of Android's "window has focus": UIKit drops touches while a view controller is being
 // presented / dismissed (RN Modal), and the presented view may still move.
 static NSString *transitionReason(UIWindow *w) {
@@ -330,7 +367,28 @@ static NSString *transitionReason(UIWindow *w) {
       [ratios addObject:@(visibleRatio(v))];
       [shownOut addObject:@(v && shown(v))];
     }
-    done(@{@"ratios": ratios, @"shown": shownOut});
+    if (![p[@"hit"] boolValue]) return done(@{@"ratios": ratios, @"shown": shownOut});
+    // hit: true (App.snapshot), as on Android: per tag whether a touch at the centre of its visible part reaches it, and
+    // once focused (app active, no UIAlertController on top: a system alert makes the app inactive), keyboard (frame
+    // from UIKeyboardWillChangeFrame, screen points, or null) and screen size. Points = dp, density = scale.
+    NSMutableArray *hits = [NSMutableArray array];
+    NSArray *tags = p[@"tags"];
+    for (NSUInteger i = 0; i < tags.count; i++) {
+      UIView *v = [tags[i] isKindOfClass:NSNumber.class] ? [self viewForTag:[tags[i] integerValue]] : nil;
+      [hits addObject:[ratios[i] doubleValue] > 0 && [self reaches:v] ? @YES : @NO];
+    }
+    UIViewController *top = self.windows.firstObject.rootViewController;
+    for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    BOOL focused = UIApplication.sharedApplication.applicationState == UIApplicationStateActive && ![top isKindOfClass:UIAlertController.class];
+    CGRect screen = UIScreen.mainScreen.bounds;
+    CGRect kb = CGRectIntersection(_keyboard, screen);
+    // appState (UIApplicationState: 0 active, 1 inactive = a system alert / Control Center / the lock screen over it, 2 background),
+    // why focused is false: an alert of the app's own or the system's, or a screen that is off.
+    done(@{@"ratios": ratios, @"shown": shownOut, @"hit": hits, @"focused": @(focused),
+           @"appState": @(UIApplication.sharedApplication.applicationState), @"top": NSStringFromClass(top.class) ?: NSNull.null,
+           @"keyboard": CGRectIsNull(kb) || kb.size.height < 1 ? NSNull.null : R(kb),
+           @"screen": @{@"width": @(screen.size.width), @"height": @(screen.size.height), @"density": @(UIScreen.mainScreen.scale)}});
   } else if ([method isEqualToString:@"Action.check"]) {
     // Actionability, native half: mounted, stable over 2 frames, in viewport (not clipped by a scroll view; delta
     // tells the runner where to scroll), no VC transition, hit-test reaches it.
@@ -457,6 +515,56 @@ static NSString *transitionReason(UIWindow *w) {
     // fill on a text input no tap can reach (see transparent): focus it the way a tap would
     UIView *t = textInputIn([self viewForTag:[p[@"tag"] integerValue]]);
     done(@{@"ok": @([t becomeFirstResponder])});
+  } else if ([method isEqualToString:@"Page.screenshot"]) {
+    // The app's own windows, bottom-up, as PNG base64: a screenshot without XCTest. No system UI: status bar, alerts,
+    // the Control Center are not the app's. scale: px per point (default 1).
+    // A window drawViewHierarchy cannot draw (it returns NO; seen as black frames on a physical iPhone) is drawn by
+    // layer.renderInContext instead: works off screen, but misdraws transformed text (tab bar labels) and has no
+    // blur/video/Metal content. render: renderInContext only. `fallbacks`: windows drawn that way.
+    CGRect screen = UIScreen.mainScreen.bounds;
+    UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat preferredFormat];
+    f.scale = [p[@"scale"] doubleValue] > 0 ? [p[@"scale"] doubleValue] : 1;
+    f.opaque = YES;
+    BOOL render = [p[@"render"] boolValue], after = [p[@"afterUpdates"] boolValue];
+    __block int fallbacks = 0;
+    NSMutableArray *drawn = [NSMutableArray array];
+    UIImage *img = [[[UIGraphicsImageRenderer alloc] initWithSize:screen.size format:f] imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+      [UIColor.blackColor setFill];
+      [ctx fillRect:screen];
+      for (UIWindow *w in self.windows.reverseObjectEnumerator) {
+        // The keyboard's windows (UIRemoteKeyboardWindow, UITextEffectsWindow) stay after the first text entry and draw
+        // as an opaque black screen: the keyboard is another process. ponytail: no keyboard on the picture.
+        NSString *cls = NSStringFromClass(w.class);
+        if ([cls containsString:@"Keyboard"] || [cls containsString:@"TextEffects"]) continue;
+        [drawn addObject:cls];
+        if (!render && [w drawViewHierarchyInRect:w.frame afterScreenUpdates:after]) continue;
+        if (!render) fallbacks++;
+        CGContextSaveGState(ctx.CGContext);
+        CGContextTranslateCTM(ctx.CGContext, w.frame.origin.x, w.frame.origin.y);
+        [w.layer renderInContext:ctx.CGContext];
+        CGContextRestoreGState(ctx.CGContext);
+      }
+    }];
+    done(@{@"ok": @YES, @"fallbacks": @(fallbacks), @"windows": drawn, @"png": [UIImagePNGRepresentation(img) base64EncodedStringWithOptions:0]});
+  } else if ([method isEqualToString:@"Input.back"]) {
+    // The back button, in-process, as Input.back on Android: pops the topmost navigation controller that can go back (a
+    // native stack: the pop its back button or edge swipe does). iOS has no system back: a JS stack (@react-navigation/stack)
+    // or a presented RN Modal has no such controller (ok: false). ok: false also when the app is not active (a system
+    // alert over it) or the keyboard is up; the caller does it another way then.
+    if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive)
+      return done(@{@"ok": @NO, @"reason": @"app not active (a system alert or another app in front)"});
+    CGRect kb = CGRectIntersection(_keyboard, UIScreen.mainScreen.bounds);
+    if (!CGRectIsNull(kb) && kb.size.height >= 1) return done(@{@"ok": @NO, @"reason": @"keyboard on screen"});
+    UIViewController *top = self.windows.firstObject.rootViewController;
+    for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
+    while (top.presentedViewController) top = top.presentedViewController;
+    if ([top isKindOfClass:UIAlertController.class]) return done(@{@"ok": @NO, @"reason": @"an alert of the app"});
+    UINavigationController *nav = backStack(top);
+    if (!nav) return done(@{@"ok": @NO, @"reason": @"no native navigation stack to pop"});
+    // a pop during a push or pop leaves the stack and its bar out of step; ok: false, back again once it is over
+    if (nav.transitionCoordinator) return done(@{@"ok": @NO, @"reason": @"a navigation transition is in progress"});
+    [nav popViewControllerAnimated:YES];
+    done(@{@"ok": @YES, @"via": @"navigation", @"controller": NSStringFromClass(nav.class)});
   } else if ([method isEqualToString:@"Input.hideKeyboard"]) {
     // what a user does when the keyboard covers the next target (Detox's replaceText never opens it)
     done(@{@"ok": @([UIApplication.sharedApplication sendAction:@selector(resignFirstResponder) to:nil from:nil forEvent:nil])});

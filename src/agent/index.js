@@ -199,6 +199,8 @@ function query(sel) {
 // ancestor. rect = getBoundingClientRect: dp from the React root's origin (= screen dp for an edge-to-edge root).
 // Empty boxes and boxes fully outside the screen are dropped; what's covered or on screens below is the native
 // half's job (App.snapshot joins both). ponytail: a <Text> is one node, links nested in it aren't listed.
+// <Modal>'s host: "ModalHostView" (its codegen name, Fabric), "RCTModalHostView" before RN dropped the Paper name
+const isModal = (f) => f.type === "ModalHostView" || f.type === "RCTModalHostView";
 const PRESS_PROPS = ["onPress", "onClick", "onLongPress", "onStartShouldSetResponder", "onResponderRelease"];
 function snapshot() {
   const screen = require("react-native").Dimensions.get("screen");
@@ -227,7 +229,7 @@ function snapshot() {
       const scroll = f.type === "RCTScrollView";
       let i = -1;
       // a Modal's host sits where <Modal> is in the tree, not where its window is: only its content counts
-      if (f.type !== "RCTModalHostView" && (own || p.testID != null || label != null || role != null || input || pressable || scroll)) {
+      if (!isModal(f) && (own || p.testID != null || label != null || role != null || input || pressable || scroll)) {
         const rect = rectOf(f);
         const onScreen =
           rect.width > 0 && rect.height > 0 && rect.x < screen.width && rect.y < screen.height &&
@@ -328,10 +330,60 @@ try {
   };
 } catch (e) {}
 
+// ---------- back (iOS) ----------
+// iOS has no back button, and RN's BackHandler there drops every listener (BackHandler.ios.js is a no-op). Keep them
+// as BackHandler.android.js does, so Input.back can run them: react-navigation's container registers one on iOS too
+// (useBackButton.native: goBack when canGoBack), and so do apps and other libraries. Nothing calls them but Input.back.
+const backListeners = [];
+let HardwareBackPressEvent = null;
+try {
+  const platform = require("react-native/Libraries/Utilities/Platform");
+  if ((platform.default || platform).OS === "ios") {
+    const m = require("react-native/Libraries/Utilities/BackHandler");
+    const bh = m.default || m;
+    const remove = (handler) => {
+      const i = backListeners.indexOf(handler);
+      if (i !== -1) backListeners.splice(i, 1);
+    };
+    bh.addEventListener = (_eventName, handler) => {
+      if (!backListeners.includes(handler)) backListeners.push(handler);
+      return { remove: () => remove(handler) };
+    };
+    // RN 0.76 still has a no-op removeEventListener (removed later): a listener taken off that way must not stay here
+    if (bh.removeEventListener) bh.removeEventListener = (_eventName, handler) => remove(handler);
+    try {
+      HardwareBackPressEvent = require("react-native/Libraries/Utilities/HardwareBackPressEvent").HardwareBackPressEvent;
+    } catch (e) {} // older RN: listeners get no argument
+  }
+} catch (e) {}
+
+// What Android's back does once it reaches the app's JS, in its order. A shown <Modal> first: on Android it is a Dialog,
+// the window with focus, and takes the back whether or not it has an onRequestClose (without one nothing happens).
+// ponytail: the topmost Modal = the last shown one in tree order (a nested Modal comes after its parent). Sibling
+// visible Modals: the last in tree order, not necessarily the one presented last; track presentation order if it matters.
+// Then the hardwareBackPress listeners, last registered first, until one returns true. None: Android leaves the app.
+function back() {
+  let modal = null;
+  for (const root of roots)
+    for (const [f] of hostFibers(root.current.child, []))
+      if (isModal(f) && (f.memoizedProps || {}).visible !== false) modal = f;
+  if (modal) {
+    const close = modal.memoizedProps.onRequestClose;
+    if (typeof close === "function") close({ nativeEvent: {} });
+    return { ok: true, via: "modal", handler: typeof close === "function" };
+  }
+  const event = HardwareBackPressEvent ? new HardwareBackPressEvent() : undefined;
+  // ponytail: a listener doing BackHandler.exitApp(); return true reports ok, though iOS's exitApp is a no-op
+  for (let i = backListeners.length - 1; i >= 0; i--)
+    if (backListeners[i]?.(event)) return { ok: true, via: "backHandler" };
+  return { ok: false, reason: `no BackHandler listener took it (${backListeners.length} registered; Android would leave the app)` };
+}
+
 // ---------- RPC ----------
 const handlers = {
   "Tree.query": (p) => query(p.selector),
   "Tree.snapshot": snapshot,
+  "Input.back": back,
   // queued behind any touch events already on the JS thread: the reply means their handlers have run
   // idleMs: since the last commit; net: requests in flight (age in ms, URL without query)
   "Agent.ping": () => {
@@ -361,7 +413,7 @@ function getLaunchArgs() {
   return launchArgs;
 }
 
-const PROTOCOL = 1; // src/runner PROTOCOL
+const PROTOCOL = 2; // src/runner PROTOCOL
 let ws = null;
 let retries = 0;
 const CTX = Math.random().toString(36).slice(2); // JS context identity

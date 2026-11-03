@@ -96,7 +96,7 @@ object MantisAgent {
       override fun onOpen(webSocket: WebSocket, response: Response) {
         // v: src/runner PROTOCOL
         webSocket.send(JSONObject().put("method", "Agent.hello")
-          .put("params", JSONObject().put("role", "native").put("platform", "android").put("v", 1)).toString())
+          .put("params", JSONObject().put("role", "native").put("platform", "android").put("v", 2)).toString())
       }
       // OkHttp's reader thread: an exception here would restart the socket and fail every RPC in flight, so validate
       // the frame first; a frame without a numeric id has nothing to answer
