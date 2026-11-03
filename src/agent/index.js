@@ -5,7 +5,7 @@
 
 const roots = new Set();
 let commitId = 0;
-let commitAt = 0; // Date.now() of the last commit, for Agent.ping's idleMs
+let commitAt = Date.now(); // of the last commit (agent start before the first), for Agent.ping's idleMs
 
 const prev = global.__REACT_DEVTOOLS_GLOBAL_HOOK__;
 if (prev) {

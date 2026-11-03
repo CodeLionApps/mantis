@@ -521,10 +521,13 @@ object MantisAgent {
 
       // Draw clock for the runner's idle wait: ms since any window of the app last drew (idleMs) and how many draws
       // so far. A draw = a frame that changed something on screen: a mount, a native-driver / Reanimated animation,
-      // a fling, a fragment transition (none of which commits in React). Windows are watched from their first poll on.
+      // a fling, a fragment transition (none of which commits in React). Windows are watched from their first poll on;
+      // a window seen for the first time counts as just drawn (a Modal that opened since the last poll).
       "Agent.ping" -> {
-        for (r in roots()) if (drawWatched.put(r, true) == null)
+        for (r in roots()) if (drawWatched.put(r, true) == null) {
           r.viewTreeObserver.addOnDrawListener { draws++; lastDraw = SystemClock.uptimeMillis() }
+          lastDraw = SystemClock.uptimeMillis()
+        }
         done(JSONObject().put("draws", draws).put("idleMs", SystemClock.uptimeMillis() - lastDraw))
       }
 
@@ -534,7 +537,7 @@ object MantisAgent {
 
   private val drawWatched = java.util.WeakHashMap<View, Boolean>()
   private var draws = 0
-  private var lastDraw = 0L
+  private var lastDraw = SystemClock.uptimeMillis()
 
   private fun editTextIn(v: View): EditText? {
     if (v is EditText) return v
