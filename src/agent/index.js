@@ -59,10 +59,25 @@ function hostChildrenText(fiber) {
   return out;
 }
 
-function accessibleName(fiber) {
-  const p = fiber.memoizedProps || {};
-  return p["aria-label"] ?? p.accessibilityLabel ?? hostChildrenText(fiber);
+// aria-label / accessibilityLabel, else the text of the views aria-labelledby / accessibilityLabelledBy point to (their
+// nativeID; RN takes a string or an array, aria-labelledby comma-separated). ponytail: a whole-tree walk per labelledBy node.
+function labelOf(p) {
+  const own = p["aria-label"] ?? p.accessibilityLabel;
+  const by = p["aria-labelledby"] ?? p.accessibilityLabelledBy;
+  if (own != null || by == null) return own ?? null;
+  const ids = Array.isArray(by) ? by : String(by).split(/\s*,\s*/);
+  const texts = [];
+  for (const root of roots)
+    for (const [f] of hostFibers(root.current.child, []))
+      if (ids.includes((f.memoizedProps || {}).nativeID)) texts.push(hostChildrenText(f));
+  return texts.length ? texts.join(" ") : null;
 }
+
+function accessibleName(fiber) {
+  return labelOf(fiber.memoizedProps || {}) ?? hostChildrenText(fiber);
+}
+
+const isInput = (f) => f.type.includes("TextInput");
 
 function roleOf(p) {
   return p.role ?? p.accessibilityRole;
@@ -91,12 +106,14 @@ function matchesSelf(fiber, sel) {
   if (sel.testId != null) return p.testID === sel.testId;
   if (sel.role != null)
     return roleOf(p) === sel.role && matchText(accessibleName(fiber), sel.name);
-  if (sel.label != null)
-    return matchText(p["aria-label"] ?? p.accessibilityLabel, sel.label);
-  if (sel.text != null)
-    return (
-      fiber.type === "RCTText" && matchText(hostChildrenText(fiber), sel.text)
-    );
+  if (sel.label != null) return matchText(labelOf(p), sel.label);
+  if (sel.placeholder != null) return isInput(fiber) && matchText(p.placeholder, sel.placeholder);
+  if (sel.text != null) {
+    if (fiber.type === "RCTText") return matchText(hostChildrenText(fiber), sel.text);
+    // a view with a label and no text of its own (icon button, labelled image or SVG): its label is its text
+    const label = p["aria-label"] ?? p.accessibilityLabel;
+    return label != null && !isInput(fiber) && !hostChildrenText(fiber) && matchText(label, sel.text);
+  }
   return false;
 }
 
@@ -211,11 +228,25 @@ function query(sel) {
 // <Modal>'s host: "ModalHostView" (its codegen name, Fabric), "RCTModalHostView" before RN dropped the Paper name
 const isModal = (f) => f.type === "ModalHostView" || f.type === "RCTModalHostView";
 const PRESS_PROPS = ["onPress", "onClick", "onLongPress", "onStartShouldSetResponder", "onResponderRelease"];
+const PRESS_ROLES = ["button", "link", "tab", "switch", "checkbox", "menuitem"];
+// react-native-gesture-handler's GestureDetector attaches its recognizers natively, by view tag: the view it wraps has
+// no handler props. Its gesture prop says what it recognizes: v2 API (Gesture.Tap(), Gesture.Race(...)) toGestureArray()
+// with handlerName, v3 hooks (useTapGesture) type, composed ones (useCompetingGestures...) gestures. Pans don't count.
+const TAP_GESTURES = ["TapGestureHandler", "LongPressGestureHandler"];
+const gestureNames = (g) =>
+  typeof g?.toGestureArray === "function" ? g.toGestureArray().map((x) => x.handlerName)
+  : Array.isArray(g?.gestures) ? g.gestures.flatMap(gestureNames)
+  : [g?.type];
+const tapDetector = (p) =>
+  p.gesture != null && typeof p.gesture === "object" && gestureNames(p.gesture).some((n) => TAP_GESTURES.includes(n));
+// v3's detector is a host view of its own (box-none) around the wrapped one
+const DETECTOR = "RNGestureHandlerDetector";
 function snapshot() {
   const screen = require("react-native").Dimensions.get("screen");
   const nodes = [];
-  // returns the subtree's host text, so accessibleName's fallback costs nothing extra
-  const walk = (fiber, parent) => {
+  // returns the subtree's host text, so accessibleName's fallback costs nothing extra.
+  // tap: inside a tap GestureDetector, the next host view below is its target
+  const walk = (fiber, parent, tap) => {
     let text = "";
     for (let f = fiber; f; f = f.sibling) {
       if (f.tag === HostText) {
@@ -223,18 +254,20 @@ function snapshot() {
         continue;
       }
       if (f.tag !== HostComponent) {
-        text += walk(f.child, parent);
+        text += walk(f.child, parent, tap || tapDetector(f.memoizedProps || {}));
         continue;
       }
       const p = f.memoizedProps || {};
       const isText = f.type === "RCTText";
       const own = isText ? hostChildrenText(f) : null;
-      const input = f.type.includes("TextInput");
-      const label = p["aria-label"] ?? p.accessibilityLabel;
+      const input = isInput(f);
+      const label = labelOf(p);
       const role = roleOf(p);
-      // gesture-handler buttons keep their handlers in RNGH, not in the host's props
+      const detector = f.type === DETECTOR;
+      // gesture-handler buttons keep their handlers in RNGH, not in the host's props; so do GestureDetector's views
       const pressable =
-        f.type === "RNGestureHandlerButton" || PRESS_PROPS.some((k) => typeof p[k] === "function");
+        f.type === "RNGestureHandlerButton" || (tap && !detector) || PRESS_PROPS.some((k) => typeof p[k] === "function") ||
+        PRESS_ROLES.includes(role) || (p.accessible === true && typeof p.onAccessibilityTap === "function");
       const scroll = isScroller(f);
       let i = -1;
       // a Modal's host sits where <Modal> is in the tree, not where its window is: only its content counts
@@ -254,7 +287,9 @@ function snapshot() {
             name: null, // below, once the subtree's text is known
             text: own,
             role: role ?? null,
-            value: input ? (p.text ?? p.value ?? null) : null,
+            // RN passes value ?? defaultValue as text; an uncontrolled input's typed text lives natively only.
+            // Never a password: a mask when there is one.
+            value: !input ? null : p.secureTextEntry && (p.text ?? p.value) ? "••••••••" : (p.text ?? p.value ?? null),
             placeholder: input ? (p.placeholder ?? null) : null,
             editable: input && p.editable !== false,
             pressable,
@@ -266,7 +301,7 @@ function snapshot() {
           }) - 1;
         }
       }
-      const sub = isText ? own : walk(f.child, i < 0 ? parent : i);
+      const sub = isText ? own : walk(f.child, i < 0 ? parent : i, tap && detector);
       if (i >= 0) nodes[i].name = label ?? sub;
       text += sub;
     }

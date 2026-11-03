@@ -400,10 +400,16 @@ class App {
   getByTestId(testId) {
     return new Locator(this, { testId });
   }
+  /** A text input by its placeholder, as Playwright: a case-insensitive substring unless exact (getByText is exact). */
+  getByPlaceholder(text, { exact = false } = {}) {
+    return new Locator(this, { placeholder: exact ? norm(text) : loose(text) });
+  }
 }
 
 const norm = (v) =>
   v instanceof RegExp ? { regex: v.source, flags: v.flags } : v;
+const loose = (v) =>
+  typeof v === "string" ? { regex: v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), flags: "i" } : norm(v);
 
 class Locator {
   // visible: only matches with some part on screen natively; shown: only matches in a window and not hidden
