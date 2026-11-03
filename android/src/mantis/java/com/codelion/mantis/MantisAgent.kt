@@ -295,13 +295,14 @@ object MantisAgent {
    * Covered: by the keyboard, another window (Modal, dialog), or a view over all of it (sheet backdrop, a sheet whose
    * QR code took the touch). ponytail: a pointerEvents box-none wrapper on that path still counts as covering.
    */
-  private fun reaches(v: View): Boolean {
+  private fun reaches(v: View, at: JSONArray): Boolean {
     val r = Rect()
     if (!v.getGlobalVisibleRect(r)) return false
     val o = IntArray(2).also { v.rootView.getLocationOnScreen(it) }
     r.offset(o[0], o[1])
     val chain = hitTest(r.exactCenterX() / density, r.exactCenterY() / density).optJSONArray("chain") ?: return false
     val hit = (0 until chain.length()).map { chain.getInt(it) }
+    hit.firstOrNull()?.let { at.put(at.length() - 1, it) }
     if (v.id in hit) return true
     val up = ancestorTags(v)
     if ((0 until up.length()).any { up.getInt(it) == hit.firstOrNull() }) return true
@@ -333,12 +334,16 @@ object MantisAgent {
         val out = JSONArray()
         val shown = JSONArray() // in a window and not hidden: what Detox/Espresso can match (screens below are not)
         val hits = JSONArray()
+        val at = JSONArray() // tag the touch at the centre landed on (null = none): the runner maps it to the React tree
         for (i in 0 until tags.length()) {
           val v = if (tags.isNull(i)) null else findView(tags.getInt(i))
           val ratio = visibleRatio(v)
           out.put(ratio)
           shown.put(v?.isShown == true)
-          if (withHit) hits.put(if (ratio == 0.0) false else if (decorOrNull == null) JSONObject.NULL else reaches(v!!))
+          if (withHit) {
+            at.put(JSONObject.NULL)
+            hits.put(if (ratio == 0.0) false else if (decorOrNull == null) JSONObject.NULL else reaches(v!!, at))
+          }
         }
         val res = JSONObject().put("ratios", out).put("shown", shown)
         if (withHit) {
@@ -349,7 +354,7 @@ object MantisAgent {
             JSONObject().put("x", it.left / density).put("y", (it.bottom - ime) / density)
               .put("width", it.width() / density).put("height", ime / density)
           } else JSONObject.NULL
-          res.put("hit", hits).put("focused", roots().any { it.hasWindowFocus() }).put("keyboard", keyboard)
+          res.put("hit", hits).put("at", at).put("focused", roots().any { it.hasWindowFocus() }).put("keyboard", keyboard)
             .put("screen", JSONObject().put("width", (win?.width ?: 0) / density).put("height", (win?.height ?: 0) / density)
               .put("density", density))
         }

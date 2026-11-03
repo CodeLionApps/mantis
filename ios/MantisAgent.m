@@ -290,7 +290,8 @@ static NSArray *tagChain(UIView *v) {
 // text in a pressable), or in a view of the same window that, with every superview below the common ancestor, doesn't
 // cover all of v (a sibling over a corner; not a QR code in a sheet over v, nor a text in a Modal: the sheet or the
 // Modal's root takes the rest). ponytail: a pointerEvents box-none wrapper on that path still counts as covering.
-- (BOOL)reaches:(UIView *)v {
+- (BOOL)reaches:(UIView *)v at:(id *)at {
+  *at = NSNull.null;
   if (!v) return NO;
   CGRect vis = CGRectIntersection(presentedRect(v), UIScreen.mainScreen.bounds);
   for (UIView *a = v.superview; a && !CGRectIsNull(vis); a = a.superview)
@@ -298,6 +299,7 @@ static NSArray *tagChain(UIView *v) {
   if (CGRectIsNull(vis)) return NO;
   UIView *hit = [self hitView:CGPointMake(CGRectGetMidX(vis), CGRectGetMidY(vis))];
   NSArray *chain = tagChain(hit);
+  if (chain.count) *at = chain.firstObject;
   if ([chain containsObject:@(v.tag)]) return YES;
   if (chain.count && [tagChain(v) containsObject:chain.firstObject]) return YES;
   if (!hit || hit.window != v.window) return NO;
@@ -375,11 +377,13 @@ static NSString *transitionReason(UIWindow *w) {
     // hit: true (App.snapshot), as on Android: per tag whether a touch at the centre of its visible part reaches it, and
     // once focused (app active, no UIAlertController on top: a system alert makes the app inactive), keyboard (frame
     // from UIKeyboardWillChangeFrame, screen points, or null) and screen size. Points = dp, density = scale.
-    NSMutableArray *hits = [NSMutableArray array];
+    NSMutableArray *hits = [NSMutableArray array], *ats = [NSMutableArray array]; // at: tag the centre touch landed on
     NSArray *tags = p[@"tags"];
     for (NSUInteger i = 0; i < tags.count; i++) {
       UIView *v = [tags[i] isKindOfClass:NSNumber.class] ? [self viewForTag:[tags[i] integerValue]] : nil;
-      [hits addObject:[ratios[i] doubleValue] > 0 && [self reaches:v] ? @YES : @NO];
+      id at = NSNull.null;
+      [hits addObject:[ratios[i] doubleValue] > 0 && [self reaches:v at:&at] ? @YES : @NO];
+      [ats addObject:at];
     }
     UIViewController *top = self.windows.firstObject.rootViewController;
     for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
@@ -389,7 +393,7 @@ static NSString *transitionReason(UIWindow *w) {
     CGRect kb = CGRectIntersection(_keyboard, screen);
     // appState (UIApplicationState: 0 active, 1 inactive = a system alert / Control Center / the lock screen over it, 2 background),
     // why focused is false: an alert of the app's own or the system's, or a screen that is off.
-    done(@{@"ratios": ratios, @"shown": shownOut, @"hit": hits, @"focused": @(focused),
+    done(@{@"ratios": ratios, @"shown": shownOut, @"hit": hits, @"at": ats, @"focused": @(focused),
            @"appState": @(UIApplication.sharedApplication.applicationState), @"top": NSStringFromClass(top.class) ?: NSNull.null,
            @"keyboard": CGRectIsNull(kb) || kb.size.height < 1 ? NSNull.null : R(kb),
            @"screen": @{@"width": @(screen.size.width), @"height": @(screen.size.height), @"density": @(UIScreen.mainScreen.scale)}});

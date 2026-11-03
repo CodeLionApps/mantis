@@ -329,7 +329,17 @@ class App {
   async snapshot() {
     const { commitId, nodes } = await this.js.call("Tree.snapshot");
     const vis = await this.native.call("Layout.visibility", { tags: nodes.map((n) => n.tag), hit: true });
-    const seen = nodes.map((_, i) => vis.ratios[i] > 0 && vis.hit?.[i] !== false);
+    // Fabric mounts the children of a View that only forms a view (a testID, no stacking context) on the nearest
+    // ancestor that forms one: natively its own Text is a sibling drawn over it and takes the touch. A touch that lands
+    // on a node's React descendant reaches it (events bubble the React tree). ponytail: the landing tag must be a listed
+    // node; an unlisted wrapper with a background, say, still reads as covering.
+    const index = new Map(nodes.map((n, i) => [n.tag, i]));
+    const inside = (j, i) => {
+      while (j != null && j > i) j = nodes[j].parent;
+      return j === i;
+    };
+    const hits = nodes.map((_, i) => (vis.hit?.[i] === false && inside(index.get(vis.at?.[i]), i) ? true : vis.hit?.[i]));
+    const seen = nodes.map((_, i) => vis.ratios[i] > 0 && hits[i] !== false);
     // a container is hit-tested at its centre only (e.g. a scroll view whose centre is under the keyboard): it stays
     // when anything in it is seen (its hit stays false). Nodes come in tree order, so parents before children.
     for (let i = nodes.length - 1; i >= 0; i--)
@@ -338,7 +348,7 @@ class App {
     const kept = new Map(); // index in nodes -> index in out
     const out = [];
     nodes.forEach((n, i) => {
-      const hit = vis.hit?.[i] ?? null;
+      const hit = hits[i] ?? null;
       if (!seen[i]) return;
       let p = n.parent;
       while (p >= 0 && !kept.has(p)) p = nodes[p].parent;
