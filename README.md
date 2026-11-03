@@ -153,7 +153,7 @@ Known differences from Detox:
 
 - Detox's `expect` checks once after the app is idle. Mantis has no idle signal, so it polls for a short grace.
   Helpers like `isVisible()` (try/catch around `expect`) cost that grace when the answer is "no".
-- Scroll is vertical only; `scroll()` ignores Detox's start point.
+- `scroll()` ignores Detox's start point (Mantis drags through the scroll view's visible centre).
 - `toExist` sees views React keeps mounted but RN flattened away natively; Detox doesn't.
 - iOS visibility doesn't render the window to find occlusion like Detox does; only clipping by ancestors and the
   screen counts.
@@ -169,6 +169,12 @@ await app.getByTestId("email").fill("ala@example.com");
 await app.getByRole("button", { name: "Zaloguj" }).tap();
 await expect(app.getByText(/Cześć/)).toBeVisible();
 ```
+
+Auto-scroll: tap and fill drag the target's scroll views (`ScrollView`, `FlatList`, `SectionList`, FlashList; vertical
+or horizontal) until it is in view; nested ones outermost first (a horizontal list in a vertical page). An item a
+virtualized list hasn't rendered yet isn't in the tree at all: the locator waits, then fails with "not found". Scroll
+the list there first: Detox's `waitFor(...).whileElement(list).scroll(...)`, or a drag of `dy` (or `dx`) dp with
+`app.native.call("Input.scroll", { tag: (await list.resolve()).tag, dy })`.
 
 `await app.snapshot()` returns the whole screen for an LLM driver: `{ commitId, nodes, focused, keyboard, screen }`.
 Nodes are host views with text, testID, label, role, a text input, a touch handler or a scroll view, in tree (paint)

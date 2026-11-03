@@ -414,8 +414,9 @@ static NSString *transitionReason(UIWindow *w) {
         UIScrollView *sv = nearestScroller(v);
         CGRect svVisible = sv ? CGRectIntersection(viewport(sv), presentedRect(sv)) : CGRectNull;
         // the scroller itself off screen (nested in another one): no delta to give (CGRectNull's mid is inf)
-        CGFloat delta = CGRectIsNull(svVisible) ? 0 : c.y - CGRectGetMidY(svVisible);
-        return done(@{@"ok": @NO, @"reason": @"not in viewport", @"rect": R(r2), @"delta": @(delta)});
+        BOOL none = CGRectIsNull(svVisible);
+        return done(@{@"ok": @NO, @"reason": @"not in viewport", @"rect": R(r2), @"delta": @(none ? 0 : c.y - CGRectGetMidY(svVisible)),
+                      @"dx": @(none ? 0 : c.x - CGRectGetMidX(svVisible))});
       }
       NSString *busy = transitionReason(v.window);
       if (busy) return done(@{@"ok": @NO, @"reason": busy});
@@ -442,7 +443,8 @@ static NSString *transitionReason(UIWindow *w) {
   } else if ([method isEqualToString:@"Input.scroll"]) {
     // Scroll = a real drag on the scroll view, same recipe as Android: down, eased moves (one per frame), finger held
     // still (moves at the end point) for > 100 ms so the release velocity is 0 (no deceleration), up.
-    // dy (pt) = how far content should move up (positive = reveal content below).
+    // dy (pt) = how far content should move up (positive = reveal content below); dx instead: left (positive = reveal
+    // content on the right), for a horizontal scroll view.
     UIView *host = [self viewForTag:[p[@"tag"] integerValue]];
     UIScrollView *sv = scrollViewIn(host);
     // JS commit can be ~1 frame ahead of the native mount: not ready yet, the runner retries next frame
@@ -450,13 +452,16 @@ static NSString *transitionReason(UIWindow *w) {
     CGRect vp = CGRectIntersection(viewport(sv), presentedRect(sv));
     if (CGRectIsEmpty(vp)) return done(@{@"ok": @NO, @"reason": @"scroll view not on screen"});
     const CGFloat slop = 10; // UIPanGestureRecognizer hysteresis
-    double want = [p[@"dy"] doubleValue];
-    // dy 0 would put down and up on one point: a tap on whatever is under it
-    if (want == 0) return done(@{@"ok": @NO, @"reason": @"dy is 0, nothing to scroll"});
+    BOOL horizontal = p[@"dx"] != nil;
+    double want = [p[horizontal ? @"dx" : @"dy"] doubleValue];
+    // 0 would put down and up on one point: a tap on whatever is under it
+    if (want == 0) return done(@{@"ok": @NO, @"reason": @"dx/dy is 0, nothing to scroll"});
     CGPoint startOffset = sv.contentOffset;
-    double amount = MIN(fabs(want) + slop, vp.size.height * 0.8) * (want < 0 ? -1 : 1);
-    CGPoint a = CGPointMake(CGRectGetMidX(vp), CGRectGetMidY(vp) + amount / 2);
-    CGPoint b = CGPointMake(a.x, CGRectGetMidY(vp) - amount / 2);
+    double amount = MIN(fabs(want) + slop, (horizontal ? vp.size.width : vp.size.height) * 0.8) * (want < 0 ? -1 : 1);
+    // the drag: a -> b through the visible centre, along the axis
+    CGVector half = horizontal ? CGVectorMake(amount / 2, 0) : CGVectorMake(0, amount / 2);
+    CGPoint a = CGPointMake(CGRectGetMidX(vp) + half.dx, CGRectGetMidY(vp) + half.dy);
+    CGPoint b = CGPointMake(CGRectGetMidX(vp) - half.dx, CGRectGetMidY(vp) - half.dy);
     if (![tagChain([self hitView:a]) containsObject:@(host.tag)])
       return done(@{@"ok": @NO, @"reason": @"scroll view covered at start point"});
     void (^end)(id) = [self fingerDown:a done:done];
@@ -476,7 +481,7 @@ static NSString *transitionReason(UIWindow *w) {
         CFTimeInterval now = CACurrentMediaTime();
         if (frame <= moves) {
           double k = 1 - (1 - (double)frame / moves) * (1 - (double)frame / moves); // ease-out
-          [self synth:UITouchPhaseMoved at:CGPointMake(a.x, a.y + (b.y - a.y) * k)];
+          [self synth:UITouchPhaseMoved at:CGPointMake(a.x + (b.x - a.x) * k, a.y + (b.y - a.y) * k)];
           lastMove = now;
         } else if (now - lastMove < 0.11) {
           [self synth:UITouchPhaseMoved at:b];
