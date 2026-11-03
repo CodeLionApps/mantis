@@ -523,7 +523,8 @@ class Locator {
   // ponytail: an item a virtualized list hasn't rendered yet isn't in the tree at all: "not found", no scrolling.
   async scrollToward(n, c) {
     const inViewport = c.reason === "not in viewport";
-    if (!n.scrolls.length || (!inViewport && c.reason !== "not mounted natively")) return false;
+    n.scrolls ??= n.scroll ? [n.scroll] : []; // an app built with an older Mantis: only the nearest, vertical
+    if (!n.scrolls.length ||(!inViewport && c.reason !== "not mounted natively")) return false;
     const mid = (r, h) => (h ? r.x + r.width / 2 : r.y + r.height / 2);
     // how far the target's centre is outside sc's box along sc's axis (0 = inside)
     const outside = (sc) => {
