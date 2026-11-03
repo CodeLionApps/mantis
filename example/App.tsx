@@ -4,6 +4,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Animated,
   BackHandler,
   FlatList,
@@ -241,6 +242,30 @@ function Gestures({ onBack }: { onBack: () => void }) {
   );
 }
 
+// Alert lab for app.back(): back runs the cancel-style button, an alert without one stays
+function Alerts({ onBack }: { onBack: () => void }) {
+  const [log, setLog] = useState<string[]>([]);
+  const add = (s: string) => () => setLog(l => [...l, s]);
+  return (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Alerty</Text>
+      <Button
+        title="Usuń"
+        onPress={() =>
+          Alert.alert('Usunąć?', undefined, [
+            { text: 'Anuluj', style: 'cancel', onPress: add('anulowano') },
+            { text: 'Usuń', style: 'destructive', onPress: add('usunięto') },
+          ])
+        }
+      />
+      <Button title="Info" onPress={() => Alert.alert('Gotowe', undefined, [{ text: 'OK', onPress: add('ok') }])} />
+      <Button title="Bez przycisków" onPress={() => Alert.alert('Uwaga')} />
+      <Text style={styles.body}>Log: {log.join(', ') || 'pusty'}</Text>
+      <Button title="Wstecz" onPress={onBack} />
+    </View>
+  );
+}
+
 // idle() lab: a loading overlay with a spinner that is hidden but stays mounted, faded to opacity 0 (native driver) or
 // moved off screen. Its spinner keeps looping natively; idle() must not wait for it.
 function Overlay({ onBack }: { onBack: () => void }) {
@@ -284,6 +309,7 @@ const SCREENS = {
   Gesty: Gestures,
   Nakładka: Overlay,
   Przewijanie: Scrolling,
+  Alerty: Alerts,
 };
 
 export default function App() {

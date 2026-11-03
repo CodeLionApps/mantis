@@ -657,8 +657,9 @@ static NSString *transitionReason(UIWindow *w) {
   } else if ([method isEqualToString:@"Input.back"]) {
     // The back button, in-process, as Input.back on Android: pops the topmost navigation controller that can go back (a
     // native stack: the pop its back button or edge swipe does). iOS has no system back: a JS stack (@react-navigation/stack)
-    // or a presented RN Modal has no such controller (ok: false). ok: false also when the app is not active (a system
-    // alert over it) or the keyboard is up; the caller does it another way then.
+    // or a presented RN Modal has no such controller (ok: false). An alert of the app's own on top: its cancel action.
+    // ok: false also when the app is not active (a system alert over it) or the keyboard is up; the caller does it
+    // another way then. alert: true = the alert only (ok: false "no alert" when there is none; no pop).
     if (UIApplication.sharedApplication.applicationState != UIApplicationStateActive)
       return done(@{@"ok": @NO, @"reason": @"app not active (a system alert or another app in front)"});
     CGRect kb = CGRectIntersection(_keyboard, UIScreen.mainScreen.bounds);
@@ -666,7 +667,36 @@ static NSString *transitionReason(UIWindow *w) {
     UIViewController *top = self.windows.firstObject.rootViewController;
     for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
     while (top.presentedViewController) top = top.presentedViewController;
-    if ([top isKindOfClass:UIAlertController.class]) return done(@{@"ok": @NO, @"reason": @"an alert of the app"});
+    if ([p[@"alert"] boolValue] && ![top isKindOfClass:UIAlertController.class]) return done(@{@"ok": @NO, @"reason": @"no alert"});
+    if ([top isKindOfClass:UIAlertController.class]) {
+      // An alert of the app's own (RN's Alert: a UIAlertController presented in a window of its own, made key; a system
+      // alert makes the app inactive, above). Back runs its cancel-style action, as back cancels a cancelable AlertDialog
+      // on Android; without one it does nothing, as on a dialog that is not cancelable. As a tap on it would: dismissed,
+      // then the action's handler (private, KVC; RN's sends the button to JS and hides the window). Answers after the
+      // handler ran, so the runner's settle sees what it sent to JS.
+      UIAlertController *alert = (UIAlertController *)top;
+      UIAlertAction *cancel = nil;
+      for (UIAlertAction *a in alert.actions) if (a.style == UIAlertActionStyleCancel) cancel = a;
+      if (!cancel) return done(@{@"ok": @NO, @"reason": @"an alert of the app without a cancel button"});
+      if (alert.isBeingDismissed) return done(@{@"ok": @NO, @"reason": @"the alert is being dismissed"});
+      if (![cancel respondsToSelector:NSSelectorFromString(@"handler")])
+        return done(@{@"ok": @NO, @"reason": @"UIAlertAction has no handler (UIKit changed)"});
+      void (^handler)(UIAlertAction *) = [cancel valueForKey:@"handler"];
+      void (^back)(void) = ^{
+        // a second back queued during the same presentation: its dismiss would be dropped and never answer
+        if (alert.isBeingDismissed || !alert.presentingViewController)
+          return done(@{@"ok": @NO, @"reason": @"the alert is being dismissed"});
+        [alert dismissViewControllerAnimated:YES completion:^{
+          if (handler) handler(cancel);
+          done(@{@"ok": @YES, @"via": @"alert", @"action": cancel.title ?: NSNull.null});
+        }];
+      };
+      // still coming in (focused turns false as it starts): once it is in, a dismiss during the presentation is dropped.
+      // Not queued (NO: the completion may never run): now.
+      id<UIViewControllerTransitionCoordinator> tc = alert.transitionCoordinator;
+      if (!tc || ![tc animateAlongsideTransition:nil completion:^(id c) { back(); }]) back();
+      return;
+    }
     UINavigationController *nav = backStack(top);
     if (!nav) return done(@{@"ok": @NO, @"reason": @"no native navigation stack to pop"});
     // a pop during a push or pop leaves the stack and its bar out of step; ok: false, back again once it is over

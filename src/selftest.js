@@ -32,6 +32,7 @@ Module._load = function (request, ...rest) {
 
 const backHandler = { addEventListener() {}, removeEventListener() {} }; // RN 0.76: removeEventListener a no-op too
 let keyboard = null; // the fake native agent's keyboard rect
+let alert = null; // the fake native agent's alert of the app (focused false, app active): its Input.back result
 let nativeBack = { ok: false, reason: "no native navigation stack to pop" };
 let screen = () => ({ draws: 0, idleMs: 1000, busy: null }); // the fake native agent's draw clock; null: no Agent.ping
 const { App, DETOX_VISIBLE, PROTOCOL, expect } = require("./runner");
@@ -175,7 +176,8 @@ function checkContract() {
           at: params.tags.map((t) =>
             t === row.stateNode.canonical.nativeTag ? row.child.stateNode.canonical.nativeTag
             : t === cta.stateNode.canonical.nativeTag ? topBack.stateNode.canonical.nativeTag : t),
-          focused: true,
+          focused: !alert,
+          appState: 0,
           keyboard,
         }),
       }),
@@ -183,7 +185,7 @@ function checkContract() {
       "Input.scroll": () => (scrolled.push(params), onScroll(params), { ok: true }),
       "Input.typeText": () => ({ ok: true }),
       "Input.hideKeyboard": () => ({ ok: true }),
-      "Input.back": () => nativeBack,
+      "Input.back": () => (params.alert ? alert ?? { ok: false, reason: "no alert" } : nativeBack),
       "Input.tap": () => {
         taps.push(params.x);
         if (!silent)
@@ -346,6 +348,19 @@ function checkContract() {
   keyboard = { x: 0, y: 500, width: 400, height: 300 };
   assert.deepEqual(await app.back(), { ok: true, via: "keyboard" });
   keyboard = null;
+  // an alert of the app's own: the native agent's Input.back (its cancel action), not the JS agent's
+  alert = { ok: true, via: "alert", action: "Cancel" };
+  assert.deepEqual(await app.back(), alert);
+  assert.equal(closes, 1);
+  alert = { ok: false, reason: "an alert of the app without a cancel button" };
+  settled = 0;
+  assert.deepEqual(await app.back(), alert);
+  assert.equal(settled, 0);
+  // the alert closed between Layout.visibility and Input.back: the usual steps (the Modal), not a native pop
+  alert = { ok: false, reason: "no alert" };
+  assert.deepEqual(await app.back(), { ok: true, via: "modal", handler: true });
+  assert.equal(closes, 2);
+  alert = null;
   app.platform = "android";
 
   // auto-scroll, nested: a horizontal list (Android's host) below the fold of a vertical page. The page first (JS

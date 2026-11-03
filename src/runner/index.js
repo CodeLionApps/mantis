@@ -361,10 +361,11 @@ class App {
 
   /**
    * The back button, as on Android: { ok, via, reason }. Android: the native agent's Input.back (a back key to the window
-   * with focus). iOS has none, so the steps of Android's in its order: no back when the app is not active or an alert of
-   * its own is on top (focused false; the caller does it another way); the keyboard closes (a first back closes the IME);
-   * else the JS agent's Input.back (the topmost Modal's onRequestClose, then the BackHandler listeners, last first); else
-   * a native navigation controller pops (a native stack no BackHandler listener knows). ok: false = nothing took it
+   * with focus). iOS has none, so the steps of Android's in its order: no back when the app is not active (the caller
+   * does it another way); the keyboard closes (a first back closes the IME); else an alert of the app's own on top
+   * (focused false) runs its cancel-style action, as back cancels a cancelable AlertDialog; else the JS agent's
+   * Input.back (the topmost Modal's onRequestClose, then the BackHandler listeners, last first); else a native
+   * navigation controller pops (a native stack no BackHandler listener knows). ok: false = nothing took it
    * (Android would leave the app). Settles after a back that was taken, as tap and fill do.
    */
   async back() {
@@ -372,15 +373,19 @@ class App {
     if (this.platform !== "ios") r = await this.native.call("Input.back");
     else {
       const { focused, keyboard, appState } = await this.native.call("Layout.visibility", { tags: [], hit: true });
-      if (!focused)
-        return { ok: false, reason: appState ? "app not active (a system alert or another app in front)" : "an alert of the app" };
+      if (!focused && appState) return { ok: false, reason: "app not active (a system alert or another app in front)" };
       if (keyboard)
         r = (await this.native.call("Input.hideKeyboard")).ok ? { ok: true, via: "keyboard" } : { ok: false, reason: "keyboard on screen" };
       else {
-        r = await this.js.call("Input.back");
-        if (!r.ok) {
-          const nav = await this.native.call("Input.back");
-          r = nav.ok ? nav : { ok: false, reason: `${r.reason}; ${nav.reason}` };
+        // an alert of the app's own: the native agent runs its cancel-style action (Android's back on a cancelable
+        // dialog); "no alert" = it closed since Layout.visibility: the usual steps, no pop in its place
+        if (!focused) r = await this.native.call("Input.back", { alert: true });
+        if (!r || r.reason === "no alert") {
+          r = await this.js.call("Input.back");
+          if (!r.ok) {
+            const nav = await this.native.call("Input.back");
+            r = nav.ok ? nav : { ok: false, reason: `${r.reason}; ${nav.reason}` };
+          }
         }
       }
     }
