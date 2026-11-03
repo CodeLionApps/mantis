@@ -45,6 +45,22 @@ const tests = {
     await element(by.text('Zamknij')).tap();
     await expect(element(by.text('Zapisano: Ala, powiadomienia: tak'))).not.toBeVisible();
   },
+  // off-screen items, the Detox way: scroll the list until the item shows (auto-scroll on tap: autoscroll.mantis.js)
+  scroll: async () => {
+    await element(by.text('Przewijanie')).tap();
+    await waitFor(element(by.id('tile-25'))).toBeVisible().whileElement(by.id('tiles')).scroll(200, 'right');
+    await element(by.id('tile-25')).tap();
+    await expect(element(by.text('Wybrano: Kafel 25'))).toBeVisible();
+    // nested: the shelf (row 40) onto the screen, then along it
+    await waitFor(element(by.id('shelf'))).toBeVisible().whileElement(by.id('rows')).scroll(300, 'down');
+    await waitFor(element(by.id('shelf-15'))).toBeVisible().whileElement(by.id('shelf')).scroll(200, 'right');
+    await element(by.id('shelf-15')).tap();
+    await expect(element(by.text('Wybrano: Półka 15'))).toBeVisible();
+    // far down the virtualized list: not rendered at all until the list gets near it
+    await waitFor(element(by.id('row-190'))).toBeVisible().whileElement(by.id('rows')).scroll(400, 'down');
+    await element(by.id('row-190')).tap();
+    await expect(element(by.text('Wybrano: Wiersz 190'))).toBeVisible();
+  },
 };
 
 beforeEach(async () => {
