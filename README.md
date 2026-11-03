@@ -173,8 +173,21 @@ await expect(app.getByText(/Cześć/)).toBeVisible();
 `await app.snapshot()` returns the whole screen for an LLM driver: `{ commitId, nodes, focused, keyboard, screen }`.
 Nodes are host views with text, testID, label, role, a text input, a touch handler or a scroll view, in tree (paint)
 order with `parent` indices, kept only when shown natively and not covered (another window, sheet backdrop, keyboard).
-Rects are dp. `focused: false` = a system window (permission dialog, notification shade) is over the app. Android
-reports `hit`, `focused`, `keyboard` and `screen`; iOS only the visible ratio so far.
+Rects are dp. `focused: false` = a system window (permission dialog, notification shade) is over the app, or on iOS
+an alert of the app's own. Both platforms report `hit`, `focused`, `keyboard` and `screen` (iOS: points, `density` =
+screen scale). On iOS, `app.native.call("Page.screenshot")` returns `{ png }` (base64) of the app's own windows,
+without XCTest: no status bar, keyboard or system alerts.
+
+`await app.back()` is the back button: `{ ok, via, reason }`, ~ms, in-process.
+
+- Android: a back key to the window with focus (`via: "key"`, or `"dispatcher"` under predictive back). `ok: false`
+  when a system dialog has focus, the keyboard is up, or nothing took it: press back the system's way then.
+- iOS has no back button, so Android's steps in Android's order: the keyboard closes (`via: "keyboard"`); the topmost
+  visible `<Modal>` gets `onRequestClose` (`via: "modal"`; without one the back is swallowed, as on Android); the
+  `BackHandler` `hardwareBackPress` listeners run last first until one returns `true` (`via: "backHandler"`;
+  react-navigation registers one); a native `UINavigationController` pops (`via: "navigation"`). `ok: false` when an
+  alert is over the app or nothing took it (Android would leave the app). RN's `BackHandler` is a no-op on iOS; the
+  JS agent keeps the listeners, but only for `app.back()`.
 
 ## Channel
 
