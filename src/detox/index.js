@@ -76,10 +76,18 @@ class Element {
     return this.locator.fill("");
   }
 
-  // ponytail: start point ignored (Mantis drags through the scroll view's centre)
-  async scroll(offset, direction = "down") {
+  // waits for the scroll view like any action (Detox waits for idle): a screen just navigated to is committed in JS
+  // before it is shown natively
+  async scrollView() {
+    await mantisExpect(this.locator).toBeAttached();
     const n = await this.locator.resolve();
     if (!n) throw new Error(`${this.locator}: not found`);
+    return n;
+  }
+
+  // ponytail: start point ignored (Mantis drags through the scroll view's centre)
+  async scroll(offset, direction = "down") {
+    const n = await this.scrollView();
     const d = direction === "up" || direction === "left" ? -offset : offset;
     const r = await app.native.call("Input.scroll", {
       tag: n.tag,
@@ -90,8 +98,7 @@ class Element {
   }
 
   async scrollTo(edge) {
-    const n = await this.locator.resolve();
-    if (!n) throw new Error(`${this.locator}: not found`);
+    const n = await this.scrollView();
     const r = await app.native.call("Input.scrollToEdge", { tag: n.tag, edge });
     if (!r.ok) throw new Error(`${this.locator}: scrollTo failed: ${r.reason}`);
     await app.settle();
