@@ -22,7 +22,25 @@ const DETOX_VISIBLE = Object.freeze({ ratio: 0.75 });
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-class TimeoutError extends Error {}
+/**
+ * Mantis's own errors carry a stable code; messages may change. TIMEOUT: a wait ran out (idle, expect, an RPC).
+ * NOT_ACTIONABLE: a tap / fill target never became actionable (reason: the last check's). NOT_FOCUSED: no text field took
+ * the text. DELIVERED: the touch or text reached the app, so retrying would do it twice. STRICT: a locator matched
+ * several elements. STALE: a getByTag node left the React tree. COVERED: a point tap would land under a system window
+ * or the keyboard. NOT_CONNECTED: an agent didn't connect in time. DISCONNECTED: it went away during a call.
+ */
+class MantisError extends Error {
+  constructor(code, message, props) {
+    super(message);
+    this.code = code;
+    Object.assign(this, props);
+  }
+}
+class TimeoutError extends MantisError {
+  constructor(message, code = "TIMEOUT", props) {
+    super(code, message, props);
+  }
+}
 
 // MANTIS_TIMING=<file>: one JSON line per step. total = step wall time, last = its final, successful iteration
 // (query + checks + action) = Mantis's own cost; total - last = waiting for the app.
@@ -131,7 +149,7 @@ class Peer {
   }
 
   failPending(reason) {
-    for (const p of this.pending.values()) p.reject(new Error(reason));
+    for (const p of this.pending.values()) p.reject(new MantisError("DISCONNECTED", reason));
     this.pending.clear();
   }
 
@@ -146,7 +164,8 @@ class Peer {
       const timer = setTimeout(() => {
         this.waiters = this.waiters.filter((w) => w !== done);
         reject(
-          new Error(
+          new MantisError(
+            "NOT_CONNECTED",
             `${this.role} agent not connected after ${timeout}ms` +
               (this.rejected ? ` (${this.rejected})` : ""),
           ),
@@ -159,7 +178,7 @@ class Peer {
   async call(method, params = {}) {
     if (!this.connected)
       await this.ready().catch((e) => {
-        throw new Error(`${e.message}: ${method}`);
+        throw new MantisError("NOT_CONNECTED", `${e.message}: ${method}`);
       });
     const id = ++this.seq;
     const t0 = performance.now();
@@ -178,7 +197,7 @@ class Peer {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`rpc timeout: ${method}`));
+        reject(new TimeoutError(`rpc timeout: ${method}`));
       }, 15000);
       const done = (f) => (v) => {
         clearTimeout(timer);
@@ -205,6 +224,10 @@ class App {
         this.commitWaiters.splice(0).forEach((w) => w());
       if (msg.method === "Input.touchStart") this.touch = msg.params;
     };
+    /** Playwright's page.touchscreen: a tap at a point in screen dp. */
+    this.touchscreen = { tap: (x, y, opts) => this.tapAt(x, y, opts) };
+    /** Playwright's page.keyboard: types into the text field that has focus. */
+    this.keyboard = { type: (text) => this.type(text) };
   }
 
   /** iOS launch args the agents need: simulators share the Mac's localhost, so this runner's port and token. */
@@ -258,7 +281,8 @@ class App {
     try {
       await Promise.all([this.js.ready(timeout), this.native.ready(timeout)]);
     } catch (e) {
-      throw new Error(
+      throw new MantisError(
+        "NOT_CONNECTED",
         `Mantis agents not connected ${timeout}ms after launch (js: ${this.js.connected}, native: ${this.native.connected}): ` +
           `${e.message}. Is this a Mantis build (MANTIS_E2E=1, withMantis() in metro.config.js) and is port ${this.port} ` +
           "reachable from the device (Android: adb reverse)?",
@@ -293,12 +317,73 @@ class App {
       const t = this.touch;
       if (t.seq === seq + 1) return t;
       if (t.seq !== seq)
-        throw new Error(
+        throw new MantisError(
+          "DELIVERED",
           `touch count went from ${seq} to ${t.seq} during one tap (JS reloaded, or a late touch of an earlier tap)`,
         );
       if (performance.now() > end) return null;
       await this.nextCommitOrFrame();
     }
+  }
+
+  // One Input.tap, settled; then the touch JS saw for it (touchAfter).
+  async tapOnce(params, timeout) {
+    const seq = this.touch.seq;
+    await this.native.call("Input.tap", params);
+    await this.settle();
+    return this.touchAfter(seq, timeout);
+  }
+
+  /**
+   * app.touchscreen.tap(x, y): a tap at a point in screen dp (snapshot rects), settled like Locator.tap. A touch that
+   * landed on a view React had already replaced is tapped again, as Locator.tap does. { seen: false } = JS saw no touch
+   * within timeout: a native view RN doesn't handle took it (WebView, map), or JS is stalled.
+   * COVERED, before tapping: the app's window has no focus (a system window or another app in front; an alert of the
+   * app's own on iOS is fine, the touch is in-process) or the point is on the keyboard. The native agent injects into
+   * the app's own windows, so such a tap would land in the app beneath, which no user can do.
+   */
+  async tapAt(x, y, { timeout = 1000 } = {}) {
+    const t0 = performance.now();
+    const { focused, keyboard: kb, appState } = await this.native.call("Layout.visibility", { tags: [], hit: true });
+    const at = `tap at (${x}, ${y})`;
+    if (!focused && !(this.platform === "ios" && appState === 0))
+      throw new MantisError("COVERED", `${at}: app window not focused (a system window or another app in front)`);
+    if (kb && x >= kb.x && x < kb.x + kb.width && y >= kb.y && y < kb.y + kb.height)
+      throw new MantisError("COVERED", `${at}: on the keyboard`);
+    for (let attempt = 1; ; attempt++) {
+      const touch = await this.tapOnce({ x, y }, timeout);
+      if (!touch || touch.mounted) {
+        timing(at, t0, t0);
+        return { seen: !!touch };
+      }
+      if (attempt === 3) throw new MantisError("DELIVERED", `${at}: tap dropped ${attempt} times (target re-mounted under the finger each time)`);
+    }
+  }
+
+  /**
+   * app.keyboard.type(text): one character at a time into the text field that has focus, through the IME like a key
+   * press (inserted at the cursor), each settled, so per-key handlers (onKeyPress, onChangeText moving focus to the next
+   * code box) see every character apart. Errors: NOT_FOCUSED = nothing typed; DELIVERED = err.typed characters went in
+   * first (typing again would double them).
+   */
+  async type(text) {
+    const t0 = performance.now();
+    const chars = [...text];
+    for (const [i, ch] of chars.entries()) {
+      let r;
+      try {
+        r = await this.native.call("Input.typeText", { text: ch });
+      } catch (e) {
+        if (!i) throw e;
+        r = { reason: e.message };
+      }
+      if (!r.ok) {
+        if (!i) throw new MantisError("NOT_FOCUSED", `keyboard.type: nothing typed: ${r.reason}`, { typed: 0 });
+        throw new MantisError("DELIVERED", `keyboard.type: ${i} of ${chars.length} characters typed, then ${r.reason}`, { typed: i });
+      }
+      await this.settle();
+    }
+    timing("keyboard.type", t0, t0);
   }
 
   // retry pacing: next React commit or one frame, whichever first (not blind sleeps)
@@ -325,6 +410,7 @@ class App {
    * layout; screen dp for an edge-to-edge root).
    * focused false = a system dialog (permission prompt, Samsung Pass), or on iOS an alert of the app's own, is over
    * the app; keyboard = IME rect or null.
+   * complete false = the nodes don't show all a user sees; reasons say why (incompleteness).
    */
   async snapshot() {
     const { commitId, nodes } = await this.js.call("Tree.snapshot");
@@ -356,7 +442,32 @@ class App {
       out.push({ ...n, parent: p < 0 ? -1 : kept.get(p), ratio: vis.ratios[i], hit });
     });
     const { focused = null, keyboard = null, screen = null } = vis;
-    return { commitId, nodes: out, focused, keyboard, screen };
+    const reasons = incompleteness(out, focused);
+    return { commitId, nodes: out, focused, keyboard, screen, complete: !reasons.length, reasons };
+  }
+
+  /**
+   * Scrolls the screen's main scroll view, as a swipe would: the largest one of the axis on screen (by its on-screen
+   * area), none when another is at least 80% as large (lists side by side). down / right = reveal what is below / to the
+   * right; the content moves by half the scroll view's size. { ok, tag, moved } (moved false: already at the end), or
+   * { ok: false, reason } when the app's window has no focus, the keyboard is up, or no scroll view qualifies.
+   */
+  async scroll(direction) {
+    const [key, sign] = { up: ["dy", -1], down: ["dy", 1], left: ["dx", -1], right: ["dx", 1] }[direction] ?? [];
+    if (!key) throw new Error(`scroll: direction must be up, down, left or right, got ${direction}`);
+    const snap = await this.snapshot();
+    if (snap.focused !== true) return { ok: false, reason: "app window not focused (a system window, another app or an alert in front)" };
+    if (snap.keyboard) return { ok: false, reason: "keyboard on screen" };
+    const horizontal = key === "dx";
+    const sv = mainScrollView(snap, horizontal);
+    if (!sv) return { ok: false, reason: `no single largest ${horizontal ? "horizontal" : "vertical"} scroll view on screen` };
+    const r = await this.native.call("Input.scroll", {
+      tag: sv.tag,
+      [key]: (sign * (horizontal ? sv.rect.width : sv.rect.height)) / 2,
+    });
+    if (!r.ok) return { ok: false, reason: r.reason, tag: sv.tag };
+    await this.settle();
+    return { ok: true, tag: sv.tag, moved: r.moved !== false };
   }
 
   /**
@@ -393,14 +504,23 @@ class App {
     return r;
   }
 
+  /** Both agents' clocks now, for idle({ since }): take it before an action. */
+  async mark() {
+    const [js, ui] = await Promise.all([this.js.call("Agent.ping"), nativePing(this.native.call("Agent.ping"))]);
+    return { commitId: js.commitId, draws: ui.draws };
+  }
+
   /**
    * Waits until the app stands still: no React commit and nothing changed on screen for quietMs, no request in flight.
    * Screen: Android, a window of the app drew; iOS, a layer changed or an animation runs (transitions, native-driver
    * and Reanimated frames, scrolling). Throws on timeout, naming what is still busy (a spinner never stops).
+   * since (app.mark() taken before an action): idle counts only once the app reacted to it (a commit or a draw since),
+   * or reactMs passed without one; for actions the app handles a while later (back, a tap whose handler awaits).
+   * netMaxMs: a request in flight longer than this no longer holds the wait (polling, a hung request).
    * ponytail: Android's clock can't tell which view drew, so a focused text field's caret (a draw every 500 ms) keeps
    * quietMs >= 500 from ever passing; blur the field first.
    */
-  async idle({ quietMs = 100, timeout = DEFAULT_TIMEOUT } = {}) {
+  async idle({ quietMs = 100, timeout = DEFAULT_TIMEOUT, since, reactMs = 1000, netMaxMs = Infinity } = {}) {
     const t0 = performance.now();
     // a ping waits for what's left of timeout (at least 100 ms, so one sent at the end can still answer): a stalled
     // thread throws this TimeoutError, not the RPC's after 15 s
@@ -417,24 +537,20 @@ class App {
         }),
       ]);
     };
+    let reacted = !since;
     for (;;) {
       const iter = performance.now();
-      const [js, ui] = await Promise.all([
-        ping(this.js, "JS"),
-        // an iOS agent older than the draw clock: the JS clock alone
-        ping(this.native, "main").catch((e) => {
-          if (/unknown method/.test(e.message)) return {};
-          throw e;
-        }),
-      ]);
-      const busy = (js.net ?? []).map((r) => `request in flight for ${r.ms}ms: ${r.url}`);
+      const [js, ui] = await Promise.all([ping(this.js, "JS"), nativePing(ping(this.native, "main"))]);
+      reacted ||= js.commitId !== since.commitId || (ui.draws != null && ui.draws !== since.draws) || iter - t0 >= reactMs;
+      const busy = (js.net ?? []).filter((r) => r.ms < netMaxMs).map((r) => `request in flight for ${r.ms}ms: ${r.url}`);
       if (js.idleMs < quietMs) busy.push(`React committed ${js.idleMs}ms ago`);
       if (ui.idleMs < quietMs) busy.push(`screen changed ${Math.round(ui.idleMs)}ms ago${ui.busy ? ` (${ui.busy})` : ""}`);
+      if (!reacted) busy.push("no commit or draw since the mark yet");
       if (!busy.length) return timing("idle", t0, iter);
       if (performance.now() - t0 > timeout)
         throw new TimeoutError(`app not idle after ${timeout}ms: ${busy.join("; ")}`);
-      // until both clocks can be quiet
-      await sleep(Math.max(16, quietMs - Math.min(js.idleMs ?? quietMs, ui.idleMs ?? quietMs)));
+      // until both clocks can be quiet; a frame at a time while waiting for the app to react
+      await sleep(reacted ? Math.max(16, quietMs - Math.min(js.idleMs ?? quietMs, ui.idleMs ?? quietMs)) : 16);
     }
   }
 
@@ -451,10 +567,52 @@ class App {
   getByTestId(testId) {
     return new Locator(this, { testId });
   }
+  /**
+   * The node of app.snapshot() with this tag (node.tag), auto-waiting like any locator. Tags live as long as the native
+   * view: a node React re-mounted (a new key, a screen rebuilt) or unmounted fails at once with STALE; snapshot again.
+   */
+  getByTag(tag) {
+    return new Locator(this, { tag });
+  }
   /** A text input by its placeholder, as Playwright: a case-insensitive substring unless exact (getByText is exact). */
   getByPlaceholder(text, { exact = false } = {}) {
     return new Locator(this, { placeholder: exact ? norm(text) : loose(text) });
   }
+}
+
+// an iOS agent older than the draw clock: the JS clock alone
+const nativePing = (p) =>
+  p.catch((e) => {
+    if (/unknown method/.test(e.message)) return {};
+    throw e;
+  });
+
+// Why a snapshot's nodes don't show all a user sees (App.snapshot complete / reasons).
+// ponytail: WebViews by host name (react-native-webview's RNCWebView); other native content (maps, video) isn't flagged.
+function incompleteness(nodes, focused) {
+  const reasons = [];
+  if (focused !== true) reasons.push("app window not focused: a system window, another app or (iOS) an alert in front");
+  if (!nodes.length) reasons.push("no nodes: nothing of React's on screen (a splash screen)");
+  const web = nodes.find((n) => /webview/i.test(n.type));
+  if (web) reasons.push(`a WebView on screen (${web.type}): its page is not in the tree`);
+  const field = nodes.find((n) => /TextInput/.test(n.type) && n.value == null);
+  if (field) reasons.push(`an uncontrolled text field (tag ${field.tag}): its text lives natively, value is null`);
+  return reasons;
+}
+
+// The scroll view a swipe on the screen means (App.scroll): the largest one of the axis by on-screen area, none when
+// another is at least 80% as large. An agent without the horizontal flag: Android's horizontal host by name.
+function mainScrollView({ nodes, screen }, horizontal) {
+  const w = screen?.width ?? Infinity;
+  const h = screen?.height ?? Infinity;
+  const area = ({ x, y, width, height }) =>
+    Math.max(0, Math.min(x + width, w) - Math.max(x, 0)) * Math.max(0, Math.min(y + height, h) - Math.max(y, 0));
+  const [a, b] = nodes
+    .filter((n) => n.scroll && (n.horizontal ?? n.type === "AndroidHorizontalScrollView") === horizontal)
+    .map((n) => ({ n, a: area(n.rect) }))
+    .filter((v) => v.a > 0)
+    .sort((p, q) => q.a - p.a);
+  return a && !(b && b.a >= 0.8 * a.a) ? a.n : undefined;
 }
 
 const norm = (v) =>
@@ -540,7 +698,8 @@ class Locator {
     const nodes = await this.all();
     if (this.index != null) return nodes.at(this.index);
     if (nodes.length > 1)
-      throw new Error(
+      throw new MantisError(
+        "STRICT",
         `strict mode violation: ${this} matched ${nodes.length} elements`,
       );
     return nodes[0];
@@ -559,6 +718,9 @@ class Locator {
     while (performance.now() < deadline) {
       const iter = performance.now();
       const n = await this.resolve();
+      // a tag never comes back once its view is gone
+      if (!n && this.selector.tag != null)
+        throw new MantisError("STALE", `${this}: no longer in the React tree (re-mounted or unmounted): take a new snapshot`);
       if (!n) reason = "not found";
       else if (!n.visible) reason = "not visible";
       else if (!n.enabled && !force) reason = "disabled";
@@ -580,6 +742,8 @@ class Locator {
     }
     throw new TimeoutError(
       `${this}: not actionable after ${timeout}ms, last: ${reason}`,
+      "NOT_ACTIONABLE",
+      { reason },
     );
   }
 
@@ -618,17 +782,16 @@ class Locator {
     const timeout = opts.timeout ?? DEFAULT_TIMEOUT;
     for (let attempt = 1; ; attempt++) {
       const { node, point, iter } = await this.waitActionable(opts);
-      const seq = this.app.touch.seq;
-      await this.app.native.call("Input.tap", { ...point, tag: node.tag });
-      await this.app.settle();
-      const touch = await this.app.touchAfter(seq, timeout);
+      const touch = await this.app.tapOnce({ ...point, tag: node.tag }, timeout);
       if (!touch)
-        throw new TimeoutError(
+        throw new MantisError(
+          "DELIVERED",
           `${this}: tapped, but the app's JS saw no touch within ${timeout}ms`,
         );
       if (touch.mounted) return timing(`tap ${this}`, t0, iter);
       if (attempt === 3)
-        throw new Error(
+        throw new MantisError(
+          "DELIVERED",
           `${this}: tap dropped ${attempt} times (target re-mounted under the finger each time)`,
         );
       trace({ event: "tap dropped, tapping again", locator: String(this) });
@@ -656,7 +819,7 @@ class Locator {
         return timing(`fill ${this}`, t0, iter);
       }
       if (performance.now() > deadline)
-        throw new TimeoutError(`${this}: never focused (${r.reason})`);
+        throw new TimeoutError(`${this}: never focused (${r.reason})`, "NOT_FOCUSED");
       await this.app.nextCommitOrFrame();
     }
   }
@@ -763,8 +926,10 @@ module.exports = {
   App,
   DETOX_VISIBLE,
   Locator,
+  MantisError,
   PORT,
   PROTOCOL,
+  TimeoutError,
   expect,
   setupMantis,
 };
