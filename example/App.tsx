@@ -199,6 +199,8 @@ function Form({ onBack }: { onBack: () => void }) {
     <View style={styles.screen}>
       <Text style={styles.title}>Formularz</Text>
       <TextInput testID="name-input" accessibilityLabel="Imię" style={styles.input} value={name} onChangeText={setName} />
+      {/* uncontrolled: what is typed lives natively, a snapshot can't show it */}
+      <TextInput testID="note-input" placeholder="Notatka" style={styles.input} />
       <View style={styles.switchRow}>
         <Text style={styles.body}>Powiadomienia</Text>
         <Switch testID="notify-switch" accessibilityLabel="Powiadomienia" value={notify} onValueChange={setNotify} />
