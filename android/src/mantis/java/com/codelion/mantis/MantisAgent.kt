@@ -4,6 +4,7 @@ import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.graphics.Rect
+import android.graphics.RectF
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -40,6 +41,7 @@ import org.json.JSONObject
 import java.net.InetAddress
 import java.net.Socket
 import java.util.concurrent.TimeUnit
+import kotlin.math.roundToInt
 import javax.net.SocketFactory
 
 /**
@@ -194,9 +196,20 @@ object MantisAgent {
 
   private fun findView(tag: Int): View? = roots().firstNotNullOfOrNull { it.findViewById<View>(tag) }
 
+  // The view's bounds through its own and its ancestors' transforms, as drawn. getLocationOnScreen maps the origin
+  // only: a mirrored view (an inverted FlatList, scale -1) came out shifted by its own size, off screen.
   private fun screenRect(v: View): Rect {
-    val l = IntArray(2).also { v.getLocationOnScreen(it) }
-    return Rect(l[0], l[1], l[0] + v.width, l[1] + v.height)
+    val r = RectF(0f, 0f, v.width.toFloat(), v.height.toFloat())
+    var cur = v
+    while (true) {
+      val p = cur.parent as? View ?: break
+      cur.matrix.mapRect(r)
+      r.offset((cur.left - p.scrollX).toFloat(), (cur.top - p.scrollY).toFloat())
+      cur = p
+    }
+    val l = IntArray(2).also { cur.getLocationOnScreen(it) }
+    r.offset(l[0].toFloat(), l[1].toFloat())
+    return Rect(r.left.roundToInt(), r.top.roundToInt(), r.right.roundToInt(), r.bottom.roundToInt())
   }
 
   /** Topmost window containing the point (px, screen); where a real touch would land. */
@@ -205,7 +218,7 @@ object MantisAgent {
   private fun rectOf(v: View): JSONObject {
     val r = screenRect(v)
     return JSONObject().put("x", r.left / density).put("y", r.top / density)
-      .put("width", v.width / density).put("height", v.height / density)
+      .put("width", r.width() / density).put("height", r.height() / density)
   }
 
   private fun isScroller(v: View) = v is ScrollView || v is HorizontalScrollView
