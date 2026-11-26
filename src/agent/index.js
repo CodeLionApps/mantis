@@ -324,7 +324,8 @@ function snapshot() {
       const pressable =
         f.type === "RNGestureHandlerButton" || (tap && !detector) || PRESS_PROPS.some((k) => typeof p[k] === "function") ||
         PRESS_ROLES.includes(role) || (p.accessible === true && typeof p.onAccessibilityTap === "function");
-      const scroll = isScroller(f);
+      // scrollEnabled false: no finger scrolls it
+      const scroll = isScroller(f) && p.scrollEnabled !== false;
       const web = /webview/i.test(f.type);
       let i = -1;
       // a Modal's host sits where <Modal> is in the tree, not where its window is: only its content counts
@@ -346,7 +347,9 @@ function snapshot() {
             role: role ?? null,
             // a controlled input's value (TextInput passes its props on); an uncontrolled one's text lives natively:
             // null, not its defaultValue. Never a password or code: a mask when there is one.
+            // the runner takes the native text instead when the native agent reports it (uncontrolled ones too)
             value: !input || typeof p.value !== "string" ? null : isSecret(f) && p.value ? "••••••••" : p.value,
+            secret: isSecret(f),
             placeholder: input ? (p.placeholder ?? null) : null,
             editable: input && p.editable !== false,
             pressable,
@@ -540,6 +543,8 @@ function connect() {
         error: checkInternals(),
         ctx: CTX,
         commitId,
+        // the runner's getByTag / scroll need this agent: tag selector, snapshot horizontal / WebView / secret
+        features: ["driver"],
       },
     });
   };

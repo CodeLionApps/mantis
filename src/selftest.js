@@ -94,6 +94,9 @@ let touchStart; // the agent's touch listener; the fake native tap feeds it, lik
 let drop = 0; // next n touches land on a view React already replaced
 let silent = false; // touches never reach JS
 let typeable = Infinity; // Input.typeText calls that find a focused field
+let nativeRects = new Map(); // tag -> the fake native agent's screen rect (else none: the JS layout)
+const nativeTexts = new Map(); // tag -> an input's native text
+let secretAsked = []; // the secret tags of the last Layout.visibility
 const typed = []; // their text
 let twice = false; // JS sees two touches for one tap (e.g. a late one of an earlier tap)
 const URL = "ws://127.0.0.1:9199";
@@ -178,10 +181,17 @@ function checkContract() {
           at: params.tags.map((t) =>
             t === row.stateNode.canonical.nativeTag ? row.child.stateNode.canonical.nativeTag
             : t === cta.stateNode.canonical.nativeTag ? topBack.stateNode.canonical.nativeTag : t),
+          rects: params.tags.map((t) => nativeRects.get(t) ?? null),
           focused: !alert,
           appState: 0,
           keyboard,
         }),
+        // the native agent masks the secret ones
+        ...(params.inputs && {
+          texts: params.inputs.map((t) =>
+            !nativeTexts.has(t) ? null : params.secret.includes(t) ? (nativeTexts.get(t) ? "••••••••" : "") : nativeTexts.get(t)),
+        }),
+        ...(params.secret && (secretAsked = params.secret) && {}),
       }),
       "Action.check": () => checks.get(params.tag)?.() ?? { ok: true, point: { x: params.tag, y: 0 } },
       "Input.scroll": () => (scrolled.push(params), onScroll(params), { ok: true }),
@@ -269,37 +279,62 @@ function checkContract() {
   // a point in screen dp: settled, the touch JS saw attributed like a locator's tap; never under a system window or keyboard
   taps.length = 0;
   assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true });
-  drop = 1; // landed on a view React had replaced: tapped again
-  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true });
-  assert.equal(taps.length, 3);
-  silent = true; // a native view took it (or JS is stalled)
+  drop = 1; // landed on a view React had replaced: nothing pressed, and something else may be there now: no second tap
+  await assert.rejects(app.touchscreen.tap(tagOf(minus), 5), { code: "STALE", name: "MantisError" });
+  assert.equal(taps.length, 2);
+  silent = true; // unknown: a native view took it, or JS is busy
   assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5, { timeout: 100 }), { seen: false });
   silent = false;
   keyboard = { x: 0, y: 500, width: 400, height: 300 };
   await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /on the keyboard/ });
   keyboard = null;
   alert = { ok: false }; // focused false: a system window over the app on Android, an alert of its own on iOS
+  const covered = performance.now();
   await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /not focused/ });
+  assert(performance.now() - covered >= 300); // waited for focus first (a window that just opened)
+  setTimeout(() => (alert = null), 100); // focus arrives (Android: a Modal's Dialog, ~130 ms after it shows)
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true });
+  alert = { ok: false };
   app.platform = "ios";
   assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true });
   app.platform = "android";
   alert = null;
   assert.equal(taps.length, 5);
+  assert.equal(app.tapAt, undefined); // one API: touchscreen / keyboard
 
   // keyboard.type: one character per Input.typeText into the focused field; partial failure is DELIVERED
   typed.length = 0;
   await app.keyboard.type("12ą");
   assert.deepEqual(typed, ["1", "2", "ą"]);
   typeable = 0;
-  await assert.rejects(app.keyboard.type("34"), { code: "NOT_FOCUSED", typed: 0 });
+  await assert.rejects(app.keyboard.type("34", { timeout: 50 }), { code: "NOT_FOCUSED", typed: 0 });
+  setTimeout(() => (typeable = Infinity), 50); // the tap that focuses the field is still landing
+  await app.keyboard.type("34");
+  assert.deepEqual(typed.slice(-2), ["3", "4"]);
   typeable = 2;
-  await assert.rejects(app.keyboard.type("5678"), { code: "DELIVERED", typed: 2, message: /2 of 4 characters typed, then focused: null/ });
+  await assert.rejects(app.keyboard.type("5678"), (e) =>
+    e.code === "DELIVERED" && e.typed === 2 && /2 of 4 characters typed, then keyboard.type: focused: null/.test(e.message) &&
+    e.cause.code === "NOT_FOCUSED");
   typeable = Infinity;
 
   // getByTag: the exact node of a snapshot
   taps.length = 0;
   await app.getByTag(tagOf(minus)).tap({ force: true });
   assert.deepEqual(taps, [tagOf(minus)]);
+  // in the tree, only filtered out (not shown): waits like any locator, no STALE
+  await assert.rejects(app.getByTag(tagOf(lowerBack)).filter({ visible: true }).tap(quick), { code: "NOT_ACTIONABLE", reason: "not found" });
+  // the app's JS reloaded since the locator was made: tags start over, the same number may be another view
+  const minusByTag = app.getByTag(tagOf(minus));
+  const ctx = app.js.hello.ctx;
+  app.js.hello.ctx = "reloaded";
+  await assert.rejects(minusByTag.tap({ force: true }), { code: "STALE", message: /reloaded/ });
+  await assert.rejects(expect(minusByTag).toBeAttached(), { code: "STALE" });
+  app.js.hello.ctx = ctx;
+  // an app built with an older Mantis: its JS agent can't match tags
+  app.js.hello.features = undefined;
+  await assert.rejects(app.getByTag(tagOf(minus)).tap(), { code: "UNSUPPORTED", message: /rebuild the app/ });
+  await assert.rejects(app.scroll("down"), { code: "UNSUPPORTED" });
+  app.js.hello.features = ["driver"];
 
   // snapshot: JS lists the screens below and covered nodes too; App.snapshot keeps what's seen (and containers of it)
   const raw = await app.js.call("Tree.snapshot");
@@ -317,6 +352,10 @@ function checkContract() {
   assert.equal(snap.nodes[by("testID", "minus")].enabled, false);
   assert.equal(snap.focused, true);
   assert.deepEqual([snap.complete, snap.reasons], [true, []]);
+  // rects as drawn natively (screen dp), not the JS layout (React root origin: a Modal under the status bar, transforms)
+  nativeRects = new Map([[tagOf(minus), { x: 0, y: 24, width: 100, height: 20 }]]);
+  assert.deepEqual((await app.snapshot()).nodes.find((n) => n.testID === "minus").rect, { x: 0, y: 24, width: 100, height: 20 });
+  nativeRects = new Map();
   alert = { ok: false };
   assert.deepEqual((await app.snapshot()).reasons, ["app window not focused: a system window, another app or (iOS) an alert in front"]);
   alert = null;
@@ -451,7 +490,7 @@ function checkContract() {
   keyboard = { x: 0, y: 500, width: 400, height: 300 };
   assert.deepEqual(await app.scroll("up"), { ok: false, reason: "keyboard on screen" });
   keyboard = null;
-  await assert.rejects(app.scroll("sideways"), /direction must be/);
+  await assert.rejects(app.scroll("sideways"), { code: "INVALID_ARGUMENT" });
   const scrollers = (await app.js.call("Tree.snapshot")).nodes.filter((n) => n.scroll).map((n) => n.type);
   assert.deepEqual(scrollers, ["RCTScrollView", "AndroidHorizontalScrollView"]);
   // iOS: one host for both axes, the axis is the horizontal prop
@@ -463,6 +502,13 @@ function checkContract() {
   surface.current = { child: host("RCTView", {}, [page, host("RCTScrollView", {}, [], { x: 0, y: 0, width: 380, height: 800 })]) };
   global.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(1, surface);
   assert.deepEqual(await app.scroll("down"), { ok: false, reason: "no single largest vertical scroll view on screen" });
+  // nested in one of about its size: the inner one, a swipe moves it first; not scrollable (scrollEnabled false): none
+  const inner = host("RCTScrollView", {}, [], { x: 0, y: 0, width: 400, height: 780 });
+  surface.current = { child: host("RCTScrollView", {}, [inner], { x: 0, y: 0, width: 400, height: 800 }) };
+  global.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(1, surface);
+  assert.equal((await app.scroll("down")).tag, tagOf(inner));
+  inner.memoizedProps = { scrollEnabled: false };
+  assert.equal((await app.scroll("down")).tag, tagOf(surface.current.child));
 
   // text inputs without testIDs: by placeholder (Playwright: case-insensitive substring unless exact), by label, also
   // through accessibilityLabelledBy (a Text's nativeID); the snapshot shows placeholder and value, never a password
@@ -498,7 +544,7 @@ function checkContract() {
         // wraps an input's children in is never listed
         host("RCTSinglelineTextInputView", { testID: "shown-password", textContentType: "password", value: "visible-secret", text: "visible-secret" }, [text("child-secret")]),
         host("RCTSinglelineTextInputView", { testID: "otp", autoComplete: "sms-otp", value: "123456", text: "123456" }),
-        // uncontrolled (defaultValue): what was typed since lives natively, so no value; a WebView's page isn't React
+        // uncontrolled (defaultValue): what was typed since lives natively; a WebView's page isn't React
         host("RCTSinglelineTextInputView", { testID: "uncontrolled", defaultValue: "Jan", text: "Jan" }),
         host("RNCWebView", {}),
         // one nativeID on two screens (pushed twice): the label from the input's own screen
@@ -531,9 +577,15 @@ function checkContract() {
   assert.doesNotMatch(JSON.stringify(form), /hunter2|visible-secret|child-secret|123456/);
   assert.deepEqual(["shown-password", "otp"].map((t) => node("testID", t).value), ["••••••••", "••••••••"]);
   assert.equal(node("testID", "uncontrolled").value, null);
-  const { complete, reasons } = await app.snapshot();
+  // App.snapshot: the native text (an uncontrolled input's too), masked natively for the secret ones
+  const uncontrolled = node("testID", "uncontrolled").tag;
+  nativeTexts.set(uncontrolled, "Jan Kowalski").set(tagOf(password), "hunter2");
+  const { complete, reasons, nodes: shown } = await app.snapshot();
+  assert.equal(shown.find((n) => n.tag === uncontrolled).value, "Jan Kowalski");
+  assert.equal(shown.find((n) => n.tag === tagOf(password)).value, "••••••••");
+  assert.deepEqual(secretAsked.sort(), [tagOf(password), node("testID", "shown-password").tag, node("testID", "otp").tag].sort());
   assert.equal(complete, false);
-  assert.deepEqual(reasons.map((r) => r.split(" (")[0]), ["a WebView on screen", "an uncontrolled text field"]);
+  assert.deepEqual(reasons.map((r) => r.split(" (")[0]), ["a WebView on screen"]);
   assert(node("testID", "throws") && node("testID", "proxy"));
   assert.equal(node("label", "Zamknij").name, "Zamknij");
   assert.deepEqual(

@@ -184,20 +184,22 @@ virtualized list hasn't rendered yet isn't in the tree at all: the locator waits
 the list there first: Detox's `waitFor(...).whileElement(list).scroll(...)`, or a drag of `dy` (or `dx`) dp with
 `app.native.call("Input.scroll", { tag: (await list.resolve()).tag, dy })`.
 
-`await app.snapshot()` returns the whole screen for an LLM driver: `{ commitId, nodes, focused, keyboard, screen }`.
+`await app.snapshot()` returns the whole screen for an LLM driver:
+`{ commitId, nodes, focused, keyboard, screen, complete, reasons }`.
 Nodes are host views with text, testID, label, role, a text input, a touch handler, a scroll view (`scroll`,
-`horizontal`) or a WebView, in tree (paint) order with `parent` indices, kept only when shown natively and not covered
+`horizontal`; not one with `scrollEnabled={false}`) or a WebView, in tree (paint) order with `parent` indices, kept only when shown natively and not covered
 (another window, sheet backdrop, keyboard).
-Text inputs carry `placeholder` and `value`: a mask for a password or one-time code (`secureTextEntry`, or a
-`textContentType` / `autoComplete` for one, so also with a "show password" toggle on); `null` for an uncontrolled input
-(no `value` prop: what was typed lives natively). `pressable`: a press handler prop, a role of button, link, tab, switch, checkbox or menuitem,
+Text inputs carry `placeholder`, `secret` and `value`: the text as it is natively (an uncontrolled input's too), a mask
+for a password or one-time code (`secret`: `secureTextEntry`, or a `textContentType` / `autoComplete` for one, so also
+with a "show password" toggle on; the native agent masks it, the text never leaves the device). `pressable`: a press handler prop, a role of button, link, tab, switch, checkbox or menuitem,
 `onAccessibilityTap`, a gesture-handler button, or a view a gesture-handler `GestureDetector` with a tap or long press
 wraps.
 `complete: false` when the nodes don't show all a user sees, with `reasons`: the app's window has no focus (a system
 window, another app, or on iOS an alert of the app's own), no nodes (a splash screen), a WebView on screen (its page is
-not React), an uncontrolled text field. A driver that needs the whole screen takes a screenshot or an accessibility
+not React). A driver that needs the whole screen takes a screenshot or an accessibility
 dump then. `screen.density` is the app's own; comparing it with the device's (`adb shell wm density`) is up to you.
-Rects are dp. `focused: false` = a system window (permission dialog, notification shade) is over the app, or on iOS
+Rects are screen dp as drawn natively (iOS: points), transforms in flight included: what `touchscreen.tap` takes, also
+for a Modal whose React root doesn't start at the top of the screen. `focused: false` = a system window (permission dialog, notification shade) is over the app, or on iOS
 an alert of the app's own. Both platforms report `hit`, `focused`, `keyboard` and `screen` (iOS: points, `density` =
 screen scale). On iOS, `app.native.call("Page.screenshot")` returns `{ png }` (base64) of the app's own windows,
 without XCTest: no status bar, keyboard or system alerts.
@@ -242,37 +244,52 @@ await app.idle({ since: mark, netMaxMs: 3000 });
 For a driver that decides from `app.snapshot()` (an LLM) rather than from selectors:
 
 - `app.getByTag(node.tag)`: a locator for exactly that node, with the usual auto-wait (`tap`, `fill`, `expect`). Tags
-  live as long as the native view. A node React re-mounted (a new `key`, a screen rebuilt) or unmounted fails at once
-  with `STALE`: take a new snapshot.
+  live as long as the native view. `tap` / `fill` on a node React re-mounted (a new `key`, a screen rebuilt) or
+  unmounted fail at once with `STALE` (a node only hidden or filtered out waits as usual); `expect` treats it as absent,
+  so `expect(app.getByTag(t)).not.toBeAttached()` works. After a JS reload tags start over, so every use of a locator
+  made before it throws `STALE`. An app built with an older Mantis: `UNSUPPORTED` (rebuild it).
 - `await app.touchscreen.tap(x, y, { timeout = 1000 })`: a tap at a point in screen dp (snapshot rects), settled like
-  `Locator.tap`, retried when it landed on a view React had already replaced. `{ seen: false }` = the app's JS saw no
-  touch within `timeout` (a native view RN doesn't handle took it, or JS is stalled). Throws `COVERED` instead of
-  tapping when the app's window has no focus or the point is on the keyboard: the touch would land in the app beneath.
-- `await app.keyboard.type(text)`: into the text field that has focus, one character at a time through the IME (as a
-  key press, at the cursor), each settled, so per-key handlers (`onKeyPress`, a code input moving focus to the next box)
-  see every character. `fill` replaces the whole value in one go instead. `NOT_FOCUSED`: nothing typed; `DELIVERED`
-  with `err.typed`: that many characters went in first.
-- `await app.scroll("up" | "down" | "left" | "right")`: a drag on the screen's main scroll view of that axis, the
-  largest on screen; none when another is at least 80% as large (lists side by side). `down` / `right` reveal what is
-  below / to the right, by half the scroll view's size. `{ ok: true, tag, moved }` (`moved: false`: at the end), or
-  `{ ok: false, reason }`: no focus, the keyboard is up, no such scroll view.
+  `Locator.tap`. `{ seen: true }`: the app's JS saw the touch. `{ seen: false }` is unknown: a native view RN doesn't
+  handle took it (WebView, map), or JS is busy and may still handle it, so tapping again may tap twice. `STALE`: the
+  touch reached a view React had already replaced, nothing was pressed; it is not tapped again (something else may be
+  under the point now): snapshot again. `COVERED` instead of tapping when the app's window has no focus (after waiting
+  300 ms for it: a window that just opened gets focus a little later) or the point is on the keyboard: the touch would
+  land in the app beneath.
+- `await app.keyboard.type(text, { timeout = 1000 })`: into the text field that has focus, one character (code point)
+  at a time through the IME, at the cursor, each settled, so a per-character `onChangeText` (a code input moving focus
+  to the next box) sees every character apart; `onKeyPress` fires per character on both platforms. `"\n"` is typed as a
+  character, not as the return key (an iOS multiline field may still take it as one). Waits up to `timeout` for a field to take the first character (the tap that focuses it may
+  still be landing). `fill` replaces the whole value in one go instead. `NOT_FOCUSED`: nothing typed; `DELIVERED` with
+  `err.typed`: that many characters went in first, `err.cause` is what stopped it. `type("")` does nothing, focused or
+  not.
+- `await app.scroll("up" | "down" | "left" | "right")`: a drag on the screen's main scroll view of that axis: the
+  largest scrollable one on screen whose centre isn't covered (a list under a sheet); none when another is at least 80%
+  as large side by side; of nested ones about as large, the inner one (a swipe moves it first). `down` / `right` reveal
+  what is below / to the right, by half the scroll view's size. `{ ok: true, tag, moved }` (`moved: false`: at the end),
+  or `{ ok: false, reason }`: no focus (after waiting 300 ms for it), no such scroll view, or the keyboard is up (unlike
+  a locator's auto-scroll, which hides it).
+- `idle({ since })` counts any commit or draw after the mark as the app reacting, a press ripple or a caret blink too:
+  a heuristic for actions the app handles a while later (back), not proof that the action's result is on screen.
 
 ### Errors
 
-Mantis's errors are `MantisError`s with a stable `code` (messages may change); waits that run out are `TimeoutError`s
-(a subclass), both exported. An exception inside an agent (the app) comes back as a plain `Error` without a code.
+Mantis's errors are `MantisError`s with a stable `code` and `name` (messages may change); waits that run out are
+`TimeoutError`s (a subclass), both exported. An exception inside an agent (the app) comes back as a plain `Error` without
+a code.
 
-| `code`           | Meaning                                                                                       |
-| ---------------- | --------------------------------------------------------------------------------------------- |
-| `TIMEOUT`        | a wait ran out: `idle`, `expect`, an RPC                                                      |
-| `NOT_ACTIONABLE` | a tap / fill target never became actionable; `err.reason`: the last check (`not found`, `disabled`, `covered by ...`) |
-| `NOT_FOCUSED`    | no text field took the text (`fill`, `keyboard.type`)                                        |
-| `DELIVERED`      | the touch or text reached the app: retrying would do it twice                                 |
-| `STRICT`         | a locator matched several elements                                                            |
-| `STALE`          | a `getByTag` node is no longer in the React tree                                              |
-| `COVERED`        | `touchscreen.tap` at a point under a system window or the keyboard                            |
-| `NOT_CONNECTED`  | an agent didn't connect in time                                                               |
-| `DISCONNECTED`   | an agent went away during a call (relaunch, crash)                                            |
+| `code`             | Meaning                                                                                       |
+| ------------------ | --------------------------------------------------------------------------------------------- |
+| `TIMEOUT`          | a wait ran out: `idle`, `expect`, a read-only RPC                                             |
+| `NOT_ACTIONABLE`   | a tap / fill target never became actionable; `err.reason`: the last check (`not found`, `disabled`, `covered by ...`) |
+| `NOT_FOCUSED`      | no text field took the text (`fill`, `keyboard.type`)                                        |
+| `DELIVERED`        | the touch or text reached the app, or may have (an `Input.*` RPC that never answered): retrying could do it twice |
+| `STRICT`           | a locator matched several elements                                                            |
+| `STALE`            | what a snapshot showed is gone (a `getByTag` node, the view under a point tap, a JS reload): snapshot again |
+| `COVERED`          | `touchscreen.tap` at a point under a system window or the keyboard                            |
+| `UNSUPPORTED`      | the app's agent is older than this runner: rebuild the app                                    |
+| `INVALID_ARGUMENT` | e.g. `scroll("sideways")`                                                                    |
+| `NOT_CONNECTED`    | an agent didn't connect in time                                                               |
+| `DISCONNECTED`     | an agent went away during a call (relaunch, crash); the call may or may not have run          |
 
 ## Channel
 

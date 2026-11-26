@@ -327,7 +327,9 @@ object MantisAgent {
       // Visible share per tag (Detox semantics, see visibleRatio), for toBeInViewport and filter({ visible }).
       // hit: true (App.snapshot) adds per tag whether a touch at the centre of its visible part reaches it (null = no
       // resumed activity, can't tell), and once: focused (a window of the app has focus; false under a system
-      // dialog), keyboard (IME rect or null) and screen size, all in screen dp.
+      // dialog), keyboard (IME rect or null) and screen size, all in screen dp, and rects: each tag's screen rect (null =
+      // not shown). inputs (tags): texts, each one's text as it is natively (an uncontrolled input's too), masked for the
+      // tags in secret (passwords never leave the device); null = no text field there.
       "Layout.visibility" -> {
         val tags = p.getJSONArray("tags")
         val withHit = p.optBoolean("hit")
@@ -335,6 +337,7 @@ object MantisAgent {
         val shown = JSONArray() // in a window and not hidden: what Detox/Espresso can match (screens below are not)
         val hits = JSONArray()
         val at = JSONArray() // tag the touch at the centre landed on (null = none): the runner maps it to the React tree
+        val rects = JSONArray()
         for (i in 0 until tags.length()) {
           val v = if (tags.isNull(i)) null else findView(tags.getInt(i))
           val ratio = visibleRatio(v)
@@ -343,9 +346,19 @@ object MantisAgent {
           if (withHit) {
             at.put(JSONObject.NULL)
             hits.put(if (ratio == 0.0) false else if (decorOrNull == null) JSONObject.NULL else reaches(v!!, at))
+            rects.put(if (ratio == 0.0) JSONObject.NULL else rectOf(v!!))
           }
         }
         val res = JSONObject().put("ratios", out).put("shown", shown)
+        p.optJSONArray("inputs")?.let { inputs ->
+          val secret = p.optJSONArray("secret")?.let { a -> (0 until a.length()).map { a.optInt(it) }.toSet() } ?: emptySet()
+          val texts = JSONArray()
+          for (i in 0 until inputs.length()) {
+            val et = findView(inputs.optInt(i))?.let { editTextIn(it) }
+            texts.put(if (et == null) JSONObject.NULL else if (inputs.optInt(i) in secret) (if (et.text.isEmpty()) "" else "••••••••") else et.text.toString())
+          }
+          res.put("texts", texts)
+        }
         if (withHit) {
           val decor = decorOrNull
           val win = decor ?: roots().lastOrNull() // the activity window is the bottom one
@@ -354,7 +367,7 @@ object MantisAgent {
             JSONObject().put("x", it.left / density).put("y", (it.bottom - ime) / density)
               .put("width", it.width() / density).put("height", ime / density)
           } else JSONObject.NULL
-          res.put("hit", hits).put("at", at).put("focused", roots().any { it.hasWindowFocus() }).put("keyboard", keyboard)
+          res.put("hit", hits).put("at", at).put("rects", rects).put("focused", roots().any { it.hasWindowFocus() }).put("keyboard", keyboard)
             .put("screen", JSONObject().put("width", (win?.width ?: 0) / density).put("height", (win?.height ?: 0) / density)
               .put("density", density))
         }
@@ -491,6 +504,9 @@ object MantisAgent {
         val want = p.optJSONArray("tags")?.let { t -> (0 until t.length()).map { t.optInt(it) } }
         if (want != null && focused.id !in want) { done(JSONObject().put("ok", false).put("reason", "focus still on tag ${focused.id}")); return }
         val ic = focused.onCreateInputConnection(EditorInfo()) ?: error("no InputConnection")
+        // commitText replaces the composing region when there is one, and the IME (Gboard) marks the word before the
+        // cursor as composing a moment after text changes: typed one character at a time, "@" replaced "ala"
+        ic.finishComposingText()
         if (p.optBoolean("replace")) ic.setSelection(0, focused.text.length)
         ic.commitText(p.getString("text"), 1)
         done(JSONObject().put("ok", true).put("focusedTag", focused.id))
