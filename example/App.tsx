@@ -195,18 +195,22 @@ function Form({ onBack }: { onBack: () => void }) {
   const [name, setName] = useState('Jan');
   const [notify, setNotify] = useState(false);
   const [saved, setSaved] = useState(false);
+  const [keys, setKeys] = useState(0);
+  const [sheet, setSheet] = useState(false);
   return (
     <View style={styles.screen}>
       <Text style={styles.title}>Formularz</Text>
       <TextInput testID="name-input" accessibilityLabel="Imię" style={styles.input} value={name} onChangeText={setName} />
-      {/* uncontrolled: what is typed lives natively, a snapshot can't show it */}
-      <TextInput testID="note-input" placeholder="Notatka" style={styles.input} />
+      {/* uncontrolled: what is typed lives natively; onKeyPress counts the keys app.keyboard.type sends */}
+      <TextInput testID="note-input" placeholder="Notatka" style={styles.input} onKeyPress={() => setKeys(k => k + 1)} />
+      <Text style={styles.body}>Klawisze: {keys}</Text>
       <View style={styles.switchRow}>
         <Text style={styles.body}>Powiadomienia</Text>
         <Switch testID="notify-switch" accessibilityLabel="Powiadomienia" value={notify} onValueChange={setNotify} />
       </View>
       <Button title="Zapisz" onPress={() => setSaved(true)} />
       <Button title="Wstecz" onPress={onBack} />
+      <Button title="Arkusz" onPress={() => setSheet(true)} />
       <Modal visible={saved} transparent animationType="fade" onRequestClose={() => setSaved(false)}>
         <View style={styles.modalBackdrop}>
           <View style={styles.modal}>
@@ -215,6 +219,12 @@ function Form({ onBack }: { onBack: () => void }) {
             </Text>
             <Button title="Zamknij" onPress={() => setSaved(false)} />
           </View>
+        </View>
+      </Modal>
+      {/* iOS page sheet: its React root starts below the top of the screen (Android: full screen) */}
+      <Modal visible={sheet} presentationStyle="pageSheet" animationType="slide" onRequestClose={() => setSheet(false)}>
+        <View style={styles.screen}>
+          <Button title="Zamknij arkusz" onPress={() => setSheet(false)} />
         </View>
       </Modal>
     </View>

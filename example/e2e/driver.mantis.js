@@ -39,8 +39,18 @@ test('snapshot nodes: getByTag, a point tap, a stale tag', async () => {
   await assert.rejects(app.getByTag(button.tag).tap(), { code: 'STALE' });
 });
 
-test('keyboard.type into the focused field; nothing focused: NOT_FOCUSED', async () => {
-  await assert.rejects(app.keyboard.type('x'), { code: 'NOT_FOCUSED' });
+test('keyboard.type into the focused field, a key event per character; nothing focused: NOT_FOCUSED', async () => {
+  await assert.rejects(app.keyboard.type('x', { timeout: 100 }), { code: 'NOT_FOCUSED' });
+  await app.getByText('Formularz').tap();
+  await app.getByPlaceholder('Notatka').tap();
+  await app.keyboard.type('abc');
+  await expect(app.getByText('Klawisze: 3')).toBeVisible();
+  const form = await app.snapshot();
+  assert.equal(form.nodes.find(n => n.testID === 'note-input').value, 'abc'); // uncontrolled: its native text
+  assert.equal(form.complete, true, form.reasons.join());
+});
+
+test('keyboard.type into a controlled field; the keyboard is not tappable', async () => {
   await app.getByText('Logowanie').tap();
   await app.getByPlaceholder('ala@').tap();
   await app.keyboard.type('ala@example.com');
@@ -72,11 +82,26 @@ test('idle({ since }): after back, idle only once the app reacted', async () => 
   await expect(app.getByText('Menu')).toBeVisible({ timeout: 0 });
 });
 
-test('snapshot.complete: an uncontrolled text field', async () => {
+test('snapshot rects are screen dp: an iOS page sheet', async () => {
   await app.getByText('Formularz').tap();
-  await expect(app.getByPlaceholder('Notatka')).toBeVisible();
-  const { complete, reasons, nodes } = await app.snapshot();
-  assert.equal(complete, false);
-  assert.match(reasons.join(), /uncontrolled text field/);
-  assert.equal(nodes.find(n => n.testID === 'name-input').value, 'Jan'); // controlled: its value
+  await app.getByText('Arkusz').tap();
+  await expect(app.getByText('Zamknij arkusz')).toBeVisible();
+  await app.idle(); // the sheet slides in
+  const { node } = await nodeWithText('Zamknij arkusz');
+  const js = (await app.js.call('Tree.snapshot')).nodes.find(n => n.tag === node.tag).rect;
+  // iOS: the sheet's React root starts below the top of the screen, so its JS layout is off by that much
+  if (target.platform === 'ios') assert.ok(node.rect.y - js.y > 20, `native ${node.rect.y}, JS ${js.y}`);
+  assert.deepEqual(await app.touchscreen.tap(...centre(node)), { seen: true });
+  await expect(app.getByText('Zamknij arkusz')).not.toBeAttached();
+});
+
+test('scroll at the end: moved false', async () => {
+  await app.getByText('Lista').tap();
+  await expect(app.getByText('Element 1')).toBeVisible();
+  let r;
+  for (let i = 0; i < 60 && (r = await app.scroll('down')).moved; i++);
+  assert.equal(r.ok, true, r.reason);
+  assert.equal(r.moved, false);
+  await expect(app.getByText('Element 100')).toBeInViewport();
+  assert.equal((await app.scroll('down')).moved, false);
 });
