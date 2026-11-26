@@ -269,9 +269,14 @@ function checkContract() {
   // waits that a frame won don't pile up until the next commit
   assert.equal(app.commitWaiters.length, 0);
 
-  // a call while the agent reconnects (relaunch, reload) waits for it instead of failing
+  // a call while the agent reconnects (relaunch, reload) waits for it instead of failing...
   native.close();
   await closed(native);
+  // ...but idle and mark fail at once: their caller picks another wait
+  let gone = performance.now();
+  await assert.rejects(app.idle(), { code: "DISCONNECTED", message: /native agent is not connected/ });
+  await assert.rejects(app.mark(), { code: "DISCONNECTED" });
+  assert(performance.now() - gone < 100);
   setTimeout(() => (native = connectNative()), 100);
   await id("minus").tap({ force: true });
   assert.equal(taps.length, 10);
@@ -394,8 +399,11 @@ function checkContract() {
   await assert.rejects(app.idle({ timeout: 200 }), (e) =>
     e.constructor.name === "TimeoutError" && /not idle after 200ms: the main thread didn't answer$/.test(e.message));
   assert(performance.now() - stalled < 500);
+  await assert.rejects(app.mark({ timeout: 100 }), { code: "TIMEOUT", message: /^mark: the main thread didn't answer in 100ms$/ });
   screen = null; // an iOS agent from before the draw clock: the JS clock alone
   await app.idle();
+  // an exception inside an agent comes back with a code too
+  await assert.rejects(app.native.call("Agent.ping"), { code: "AGENT_ERROR", name: "MantisError", message: /unknown method/ });
   screen = () => ({ draws: 2, idleMs: 1000, busy: null });
   // idle({ since }): idle counts only once the app reacted to the action (a commit or a draw since the mark)...
   let mark = await app.mark();

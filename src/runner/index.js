@@ -29,7 +29,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * don't retry it blindly. STRICT: a locator matched several elements. STALE: what the snapshot showed is gone (a
  * getByTag node, a view under a point tap): snapshot again. COVERED: a point tap would land under a system window or the
  * keyboard. UNSUPPORTED: the app's agent is older than this runner. INVALID_ARGUMENT. NOT_CONNECTED: an agent didn't
- * connect in time. DISCONNECTED: it went away during a call (which may or may not have run).
+ * connect in time. DISCONNECTED: it went away during a call (which may or may not have run), or is gone when idle / mark
+ * ping it. AGENT_ERROR: the call threw inside the app's agent.
  */
 class MantisError extends Error {
   constructor(code, message, props) {
@@ -108,7 +109,7 @@ class Peer {
         const p = this.pending.get(msg.id);
         if (!p) return;
         this.pending.delete(msg.id);
-        if (msg.error) p.reject(new Error(String(msg.error.message ?? JSON.stringify(msg.error))));
+        if (msg.error) p.reject(new MantisError("AGENT_ERROR", String(msg.error.message ?? JSON.stringify(msg.error))));
         else p.resolve(msg.result);
       } else if (typeof msg.method === "string") {
         trace({ event: msg.method, params: msg.params });
@@ -544,9 +545,26 @@ class App {
   }
 
   /** Both agents' clocks now, for idle({ since }): take it before an action. */
-  async mark() {
-    const [js, ui] = await Promise.all([this.js.call("Agent.ping"), nativePing(this.native.call("Agent.ping"))]);
+  async mark({ timeout = DEFAULT_TIMEOUT } = {}) {
+    const msg = (thread) => `mark: the ${thread} thread didn't answer in ${timeout}ms`;
+    const [js, ui] = await Promise.all([
+      this.#ping(this.js, timeout, msg("JS")),
+      nativePing(this.#ping(this.native, timeout, msg("main"))),
+    ]);
     return { commitId: js.commitId, draws: ui.draws };
+  }
+
+  // Agent.ping within ms: a stalled thread is a TimeoutError(message), not the RPC's after 15 s. An agent that's gone
+  // is DISCONNECTED at once: a plain call would wait up to 15 s for it to come back (a waiter picks its own fallback).
+  #ping(peer, ms, message) {
+    if (!peer.connected) return Promise.reject(new MantisError("DISCONNECTED", `the ${peer.role} agent is not connected`));
+    let timer;
+    return Promise.race([
+      peer.call("Agent.ping").finally(() => clearTimeout(timer)),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new TimeoutError("TIMEOUT", message)), ms);
+      }),
+    ]);
   }
 
   /**
@@ -558,24 +576,13 @@ class App {
    * netMaxMs: a request in flight longer than this no longer holds the wait (polling, a hung request).
    * ponytail: Android's clock can't tell which view drew, so a focused text field's caret (a draw every 500 ms) keeps
    * quietMs >= 500 from ever passing; blur the field first.
+   * An agent that's gone (or goes) fails it at once with DISCONNECTED, not at timeout.
    */
   async idle({ quietMs = 100, timeout = DEFAULT_TIMEOUT, since, reactMs = 1000, netMaxMs = Infinity } = {}) {
     const t0 = performance.now();
-    // a ping waits for what's left of timeout (at least 100 ms, so one sent at the end can still answer): a stalled
-    // thread throws this TimeoutError, not the RPC's after 15 s
-    const ping = (peer, thread) => {
-      const ms = Math.max(100, t0 + timeout - performance.now());
-      let timer;
-      return Promise.race([
-        peer.call("Agent.ping").finally(() => clearTimeout(timer)),
-        new Promise((_, reject) => {
-          timer = setTimeout(
-            () => reject(new TimeoutError("TIMEOUT", `app not idle after ${timeout}ms: the ${thread} thread didn't answer`)),
-            ms,
-          );
-        }),
-      ]);
-    };
+    // a ping waits for what's left of timeout (at least 100 ms, so one sent at the end can still answer)
+    const ping = (peer, thread) =>
+      this.#ping(peer, Math.max(100, t0 + timeout - performance.now()), `app not idle after ${timeout}ms: the ${thread} thread didn't answer`);
     let reacted = !since;
     for (;;) {
       const iter = performance.now();

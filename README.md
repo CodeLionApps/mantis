@@ -228,10 +228,12 @@ transition. On timeout it throws, naming what is still busy: a spinner or a loop
 are not tracked. On Android a focused text field's caret draws every 500 ms, so `quietMs` of 500 or more never passes
 while a field is focused.
 
-- `since`: `await app.mark()` taken before an action. The app may handle it a while later (a back on the JS thread, a
+- `since`: `await app.mark({ timeout })` taken before an action. The app may handle it a while later (a back on the JS thread, a
   handler that awaits first) and look idle until then; with `since`, idle counts only once a commit or a draw happened
   after the mark, or `reactMs` passed without one (the action changed nothing).
 - `netMaxMs`: a request in flight longer than this no longer holds the wait (polling, a request that hangs).
+- An agent that's gone (relaunch, crash, JS reload) fails `idle` and `mark` at once with `DISCONNECTED`, not at
+  `timeout`.
 
 ```js
 const mark = await app.mark();
@@ -260,8 +262,8 @@ For a driver that decides from `app.snapshot()` (an LLM) rather than from select
   to the next box) sees every character apart; `onKeyPress` fires per character on both platforms. `"\n"` is typed as a
   character, not as the return key (an iOS multiline field may still take it as one). Waits up to `timeout` for a field to take the first character (the tap that focuses it may
   still be landing). `fill` replaces the whole value in one go instead. `NOT_FOCUSED`: nothing typed; `DELIVERED` with
-  `err.typed`: that many characters went in first, `err.cause` is what stopped it. `type("")` does nothing, focused or
-  not.
+  `err.typed`: that many characters went in first, `err.cause` is what stopped it. An error on the first character is
+  thrown as is (`AGENT_ERROR`; `DISCONNECTED`: it may have gone in). `type("")` does nothing, focused or not.
 - `await app.scroll("up" | "down" | "left" | "right")`: a drag on the screen's main scroll view of that axis: the
   largest scrollable one on screen whose centre isn't covered (a list under a sheet); none when another is at least 80%
   as large side by side; of nested ones about as large, the inner one (a swipe moves it first). `down` / `right` reveal
@@ -274,8 +276,7 @@ For a driver that decides from `app.snapshot()` (an LLM) rather than from select
 ### Errors
 
 Mantis's errors are `MantisError`s with a stable `code` and `name` (messages may change); waits that run out are
-`TimeoutError`s (a subclass), both exported. An exception inside an agent (the app) comes back as a plain `Error` without
-a code.
+`TimeoutError`s (a subclass), both exported. An exception inside an agent (the app) comes back as `AGENT_ERROR`.
 
 | `code`             | Meaning                                                                                       |
 | ------------------ | --------------------------------------------------------------------------------------------- |
@@ -289,7 +290,8 @@ a code.
 | `UNSUPPORTED`      | the app's agent is older than this runner: rebuild the app                                    |
 | `INVALID_ARGUMENT` | e.g. `scroll("sideways")`                                                                    |
 | `NOT_CONNECTED`    | an agent didn't connect in time                                                               |
-| `DISCONNECTED`     | an agent went away during a call (relaunch, crash); the call may or may not have run          |
+| `DISCONNECTED`     | an agent went away during a call (relaunch, crash); the call may or may not have run. `idle` and `mark` throw it at once when an agent is gone (other calls wait for it to reconnect) |
+| `AGENT_ERROR`      | the call threw inside the app's agent                                                         |
 
 ## Channel
 
