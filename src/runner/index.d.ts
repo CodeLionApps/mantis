@@ -1,0 +1,189 @@
+// Types of the runner's public API (README: Playwright-style API, Driving from a snapshot, Errors).
+export type Platform = "android" | "ios";
+
+/** Screen dp (iOS: points), as drawn natively. */
+export interface Rect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export type ErrorCode =
+  | "TIMEOUT"
+  | "NOT_ACTIONABLE"
+  | "NOT_FOCUSED"
+  | "DELIVERED"
+  | "STRICT"
+  | "STALE"
+  | "COVERED"
+  | "UNSUPPORTED"
+  | "INVALID_ARGUMENT"
+  | "NOT_CONNECTED"
+  | "DISCONNECTED"
+  | "AGENT_ERROR";
+
+/** Mantis's errors: a stable code; messages may change. Some codes carry facts as properties. */
+export class MantisError extends Error {
+  constructor(code: ErrorCode, message: string, props?: object);
+  code: ErrorCode;
+  /** NOT_ACTIONABLE: the last check that failed ("not found", "disabled", "covered by ..."). */
+  reason?: string;
+  /** keyboard.type: how many characters went in (NOT_FOCUSED: 0; DELIVERED: before cause). */
+  typed?: number;
+}
+/** A wait that ran out (code TIMEOUT, or NOT_ACTIONABLE / NOT_FOCUSED for an action's auto-wait). */
+export class TimeoutError extends MantisError {}
+
+/** A host view of app.snapshot(). */
+export interface SnapshotNode {
+  tag: number;
+  /** index of the nearest kept ancestor in nodes, -1 for none */
+  parent: number;
+  /** host component name, e.g. RCTView, RCTText */
+  type: string;
+  testID: string | null;
+  label: string | null;
+  /** accessible name: the label, else the text inside */
+  name: string;
+  /** a Text's own text, else null */
+  text: string | null;
+  role: string | null;
+  /** a text input's text as it is natively; a mask for a secret one */
+  value: string | null;
+  secret: boolean;
+  placeholder: string | null;
+  editable: boolean;
+  pressable: boolean;
+  enabled: boolean;
+  selected: boolean | null;
+  checked: boolean | "mixed" | null;
+  scroll: boolean;
+  horizontal: boolean;
+  rect: Rect;
+  /** visible share, 0..1 */
+  ratio: number;
+  /** a touch at its visible centre reaches it; null: can't tell */
+  hit: boolean | null;
+}
+
+export interface Snapshot {
+  commitId: number;
+  nodes: SnapshotNode[];
+  /** false: a system window, another app or (iOS) an alert of the app's own is in front */
+  focused: boolean | null;
+  keyboard: Rect | null;
+  screen: { width: number; height: number; density: number } | null;
+  complete: boolean;
+  reasons: string[];
+}
+
+/** What a locator matched (Tree.query). */
+export interface QueryNode {
+  tag: number;
+  type: string;
+  name: string;
+  text: string;
+  rect: Rect;
+  /** a non-empty box */
+  visible: boolean;
+  enabled: boolean;
+  state?: object;
+  /** its own tag and its descendants' */
+  tags: number[];
+  scrolls: { tag: number; rect: Rect; horizontal: boolean }[];
+  busy: string | null;
+}
+
+export type TextMatch = string | RegExp;
+
+export interface ActionOptions {
+  /** ms; default 10000 */
+  timeout?: number;
+  /** skip the enabled check (Detox taps disabled views too) */
+  force?: boolean;
+}
+
+export declare class Locator {
+  nth(index: number): Locator;
+  first(): Locator;
+  filter(opts: { visible?: boolean; shown?: boolean }): Locator;
+  getByText(text: TextMatch): Locator;
+  getByTestId(testId: string): Locator;
+  all(): Promise<QueryNode[]>;
+  /** The one match (STRICT if several), the nth with nth(); undefined when none. */
+  resolve(): Promise<QueryNode | undefined>;
+  tap(opts?: ActionOptions): Promise<void>;
+  fill(text: string, opts?: ActionOptions & { append?: boolean }): Promise<void>;
+}
+
+export interface Mark {
+  commitId: number;
+  /** the native draw count; absent from older iOS agents */
+  draws?: number;
+}
+
+export interface IdleOptions {
+  quietMs?: number;
+  timeout?: number;
+  since?: Mark;
+  reactMs?: number;
+  netMaxMs?: number;
+}
+
+export type BackResult =
+  | { ok: true; via: string; [fact: string]: unknown }
+  | { ok: false; reason: string };
+
+export type ScrollResult =
+  | { ok: true; tag: number; moved: boolean }
+  | { ok: false; reason: string; tag?: number };
+
+export interface TapResult {
+  /** the app's JS saw the touch */
+  seen: boolean;
+}
+
+export declare class App {
+  constructor(port?: number, platform?: Platform);
+  readonly port: number;
+  platform: Platform;
+  /** iOS launch args the agents need: this runner's port and token. */
+  readonly launchArgs: { mantisPort: number; mantisToken: string };
+  readonly touchscreen: { tap(x: number, y: number, opts?: { timeout?: number }): Promise<TapResult> };
+  readonly keyboard: { type(text: string, opts?: { timeout?: number }): Promise<void> };
+  start(): Promise<void>;
+  close(): Promise<void>;
+  relaunch(launch: () => unknown, opts?: { timeout?: number }): Promise<void>;
+  reloadJs(reload: () => unknown, opts?: { timeout?: number }): Promise<void>;
+  snapshot(): Promise<Snapshot>;
+  scroll(direction: "up" | "down" | "left" | "right"): Promise<ScrollResult>;
+  back(): Promise<BackResult>;
+  mark(opts?: { timeout?: number }): Promise<Mark>;
+  idle(opts?: IdleOptions): Promise<void>;
+  getByRole(role: string, opts?: { name?: TextMatch }): Locator;
+  getByText(text: TextMatch): Locator;
+  getByLabel(label: TextMatch): Locator;
+  getByTestId(testId: string): Locator;
+  getByTag(tag: number): Locator;
+  getByPlaceholder(text: TextMatch, opts?: { exact?: boolean }): Locator;
+  /** Raw RPC to the native agent, e.g. call("Page.screenshot") on iOS. */
+  readonly native: { call(method: string, params?: object): Promise<any> };
+}
+
+export interface Assertions {
+  readonly not: Assertions;
+  toBeAttached(opts?: { timeout?: number }): Promise<void>;
+  toBeVisible(opts?: { timeout?: number }): Promise<void>;
+  toBeHidden(opts?: { timeout?: number }): Promise<void>;
+  toBeInViewport(opts?: { ratio?: number; timeout?: number }): Promise<void>;
+  toHaveText(text: string, opts?: { timeout?: number }): Promise<void>;
+  toHaveCount(count: number, opts?: { timeout?: number }): Promise<void>;
+}
+
+export function expect(locator: Locator): Assertions;
+export function setupMantis(target?: { platform?: Platform; deviceId?: string }): App;
+export const PORT: number;
+export const PROTOCOL: number;
+/** Detox's toBeVisible threshold, for toBeInViewport. */
+export const DETOX_VISIBLE: { readonly ratio: 0.75 };

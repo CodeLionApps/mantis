@@ -127,6 +127,17 @@ function checkContract() {
   assert(ios.includes(`@"v": @${PROTOCOL}`), "iOS agent PROTOCOL");
   assert(android.includes(`put("v", ${PROTOCOL})`), "Android agent PROTOCOL");
   assert(src("src/agent/index.js").includes(`const PROTOCOL = ${PROTOCOL};`), "JS agent PROTOCOL");
+  // the shipped types declare every export (the ones no app needs aside)
+  for (const [mod, dtsPath, internal] of [
+    ["./runner", "src/runner/index.d.ts", []],
+    ["./device", "src/device/index.d.ts", ["detoxDevice", "requireDetox"]],
+    ["../metro", "metro.d.ts", []],
+  ]) {
+    const dts = src(dtsPath);
+    for (const name of Object.keys(require(mod)))
+      if (!internal.includes(name))
+        assert(new RegExp(`export (declare )?(class|function|const) ${name}\\b`).test(dts), `${dtsPath} lacks ${name}`);
+  }
 }
 
 (async () => {

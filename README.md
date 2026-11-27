@@ -237,9 +237,11 @@ without XCTest: no status bar, keyboard or system alerts.
   JS agent keeps the listeners, but only for `app.back()`.
 
 `await app.idle({ quietMs = 100, timeout, since, reactMs = 1000, netMaxMs = Infinity })` waits until the app stands still: no React commit and nothing changed on
-screen for `quietMs`, and no XHR / `fetch` in flight. On screen: Android, a window of the app drew; iOS, a layer changed
-or an animation runs (stack transitions, native-driver and Reanimated frames, scrolling, Modal fades; not the keyboard
-or a text cursor). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a
+screen for `quietMs`, and no XHR / `fetch` in flight. On screen: Android, a window of the app drew or a drawable animates
+on the render thread where no draw is seen (an `ActivityIndicator`); iOS, a layer changed or an animation runs (stack
+transitions, native-driver and Reanimated frames, scrolling, Modal fades; not the keyboard or a text cursor). A spinner
+that is mounted but hidden, transparent or off screen doesn't count, on either platform; one covered by another view
+still does (occlusion isn't checked). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a
 transition. On timeout it throws, naming what is still busy: a spinner or a looping animation never stops. JS timers
 are not tracked. On Android a focused text field's caret draws every 500 ms, so `quietMs` of 500 or more never passes
 while a field is focused.
@@ -292,7 +294,9 @@ For a driver that decides from `app.snapshot()` (an LLM) rather than from select
 ### Errors
 
 Mantis's errors are `MantisError`s with a stable `code` and `name` (messages may change); waits that run out are
-`TimeoutError`s (a subclass), both exported. An exception inside an agent (the app) comes back as `AGENT_ERROR`.
+`TimeoutError`s (a subclass), both exported. TypeScript types ship with the package (the runner, `/runner`, `/device`
+and `/metro`), the error codes and every result included; `/agent`, `/detox` and `/reset` are side-effect imports
+that export nothing. An exception inside an agent (the app) comes back as `AGENT_ERROR`.
 
 | `code`             | Meaning                                                                                       |
 | ------------------ | --------------------------------------------------------------------------------------------- |

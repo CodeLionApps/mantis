@@ -5,6 +5,8 @@ import android.app.Application
 import android.content.Context
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.drawable.Animatable
+import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -24,6 +26,8 @@ import android.view.inputmethod.InputMethodManager
 import android.view.inspector.WindowInspector
 import android.widget.EditText
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import androidx.activity.findViewTreeOnBackPressedDispatcherOwner
 import androidx.core.view.ViewCompat
@@ -572,17 +576,42 @@ object MantisAgent {
       // so far. A draw = a frame that changed something on screen: a mount, a native-driver / Reanimated animation,
       // a fling, a fragment transition (none of which commits in React). Windows are watched from their first poll on;
       // a window seen for the first time counts as just drawn (a Modal that opened since the last poll).
+      // A drawable animating on the RenderThread draws no UI frame (see animating): changing now, busy names it.
       "Agent.ping" -> {
-        for (r in roots()) if (drawWatched.put(r, true) == null) {
+        val roots = roots()
+        for (r in roots) if (drawWatched.put(r, true) == null) {
           r.viewTreeObserver.addOnDrawListener { draws++; lastDraw = SystemClock.uptimeMillis() }
           lastDraw = SystemClock.uptimeMillis()
         }
-        done(JSONObject().put("draws", draws).put("idleMs", SystemClock.uptimeMillis() - lastDraw))
+        val busy = roots.firstNotNullOfOrNull { animating(it) }
+        done(JSONObject().put("draws", draws).put("idleMs", if (busy != null) 0 else SystemClock.uptimeMillis() - lastDraw)
+          .put("busy", busy ?: JSONObject.NULL))
       }
 
       else -> error("unknown method $method")
     }
   }
+
+  /**
+   * The first view in [v] (a shown window root) with a running Animatable drawable, for the draw clock: an
+   * AnimatedVectorDrawable (an indeterminate ProgressBar, i.e. RN's ActivityIndicator) animates on the RenderThread,
+   * so no draw listener fires. As on iOS, not one that is visible = GONE / INVISIBLE, transparent itself or through an
+   * ancestor (a loading overlay faded out but mounted), or entirely off screen. ponytail: one covered by another view
+   * still counts (no occlusion check, iOS neither). Runs on every ping: no allocation until one is found.
+   */
+  private fun animating(v: View): String? {
+    if (v.visibility != View.VISIBLE || v.alpha < 0.01f) return null
+    val d = running((v as? ProgressBar)?.takeIf { it.isIndeterminate }?.indeterminateDrawable)
+      ?: running((v as? ImageView)?.drawable) ?: running(v.background) ?: running(v.foreground)
+    // the view's React tag: its own, else its nearest tagged ancestor's (RN's ProgressBar sits in a tagged container)
+    if (d != null && visibleRatio(v) > 0)
+      return "${v.javaClass.simpleName} tag ${ancestorTags(v).opt(0)} animating ${d.javaClass.simpleName}" +
+        if (v is ProgressBar) " in a loop" else ""
+    if (v is ViewGroup) for (i in 0 until v.childCount) animating(v.getChildAt(i))?.let { return it }
+    return null
+  }
+
+  private fun running(d: Drawable?) = d?.takeIf { it is Animatable && it.isRunning }
 
   private val drawWatched = java.util.WeakHashMap<View, Boolean>()
   private var draws = 0

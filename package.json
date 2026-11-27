@@ -10,19 +10,42 @@
     "url": "git+https://github.com/CodeLionApps/mantis.git"
   },
   "main": "src/runner/index.js",
+  "types": "src/runner/index.d.ts",
   "exports": {
-    ".": "./src/runner/index.js",
-    "./agent": "./src/agent/index.js",
-    "./detox": "./src/detox/index.js",
-    "./device": "./src/device/index.js",
-    "./metro": "./metro.js",
-    "./reset": "./src/reset.js",
-    "./runner": "./src/runner/index.js",
+    ".": {
+      "types": "./src/runner/index.d.ts",
+      "default": "./src/runner/index.js"
+    },
+    "./agent": {
+      "types": "./src/side-effect.d.ts",
+      "default": "./src/agent/index.js"
+    },
+    "./detox": {
+      "types": "./src/side-effect.d.ts",
+      "default": "./src/detox/index.js"
+    },
+    "./device": {
+      "types": "./src/device/index.d.ts",
+      "default": "./src/device/index.js"
+    },
+    "./metro": {
+      "types": "./metro.d.ts",
+      "default": "./metro.js"
+    },
+    "./reset": {
+      "types": "./src/side-effect.d.ts",
+      "default": "./src/reset.js"
+    },
+    "./runner": {
+      "types": "./src/runner/index.d.ts",
+      "default": "./src/runner/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [
     "src",
     "metro.js",
+    "metro.d.ts",
     "android/build.gradle",
     "android/src",
     "ios",
