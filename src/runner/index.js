@@ -16,6 +16,9 @@ const PORT =
   1;
 const DEFAULT_TIMEOUT = 10000;
 const CONNECT_TIMEOUT = 15000;
+// an iOS app frees its port ~0.6 s after another one launched (it went to the background), and an agent that found the
+// port taken retries every second
+const HELD_GRACE = 1500;
 // bumped on incompatible changes; agents send it in Agent.hello (an app built with another Mantis version)
 const PROTOCOL = 2;
 
@@ -31,8 +34,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * don't retry it blindly. STRICT: a locator matched several elements. STALE: what the snapshot showed is gone (a
  * getByTag node, a view under a point tap): snapshot again; err.tag says which (null: unknown). COVERED: a point tap would land under a system window or the
  * keyboard. UNSUPPORTED: the app's agent is older than this runner. INVALID_ARGUMENT. NOT_CONNECTED: an agent didn't
- * connect in time. DISCONNECTED: it went away during a call (which may or may not have run), or is gone when idle / mark
- * ping it. AGENT_ERROR: the call threw inside the app's agent.
+ * connect in time. PORT_IN_USE: a cabled iPhone's port is held by another app (another Mantis build, or a launch of
+ * another runner), so this launch's agent couldn't listen there. DISCONNECTED: it went away during a call (which may or
+ * may not have run), or is gone when idle / mark ping it. AGENT_ERROR: the call threw inside the app's agent.
  */
 class MantisError extends Error {
   constructor(code, message, props) {
@@ -83,7 +87,8 @@ class Peer {
     this.pending = new Map();
     this.hello = null;
     this.rejected = null; // why the last hello was refused, for the "not connected" error
-    this.waiters = [];
+    this.held = false; // rejected: another app holds the port (cabled iPhone)
+    this.waiters = []; // ready(): { since, done, fail }
   }
 
   get connected() {
@@ -143,6 +148,7 @@ class Peer {
                 : null;
     if (why) {
       this.rejected = `${this.role} agent rejected: ${why}`;
+      this.held = false;
       trace({ event: "hello rejected", role: this.role, why });
       return ws.close(1008, why.slice(0, 120));
     }
@@ -150,8 +156,18 @@ class Peer {
     this.ws = ws;
     this.hello = p;
     this.rejected = null;
+    this.held = false;
     this.onHello?.(p);
-    this.waiters.splice(0).forEach((w) => w());
+    this.waiters.splice(0).forEach((w) => w.done());
+  }
+
+  // Cabled iPhone: what answered on this agent's port is another app. Fails the waits that started HELD_GRACE before that
+  // dial did: an earlier one may have reached the app this launch just sent to the background, before it freed the port.
+  heldBy(dialed, why) {
+    this.rejected = why;
+    this.held = true;
+    trace({ event: "port held", role: this.role, why });
+    for (const w of this.waiters.filter((w) => w.since <= dialed)) w.fail();
   }
 
   failPending(reason) {
@@ -162,29 +178,38 @@ class Peer {
   /** Resolves once this agent is connected (e.g. reconnecting after a relaunch or a JS reload), else rejects. */
   ready(timeout = CONNECT_TIMEOUT) {
     if (this.connected) return Promise.resolve();
+    const since = performance.now() + HELD_GRACE;
     return new Promise((resolve, reject) => {
-      const done = () => {
+      const end = (f) => {
         clearTimeout(timer);
-        resolve();
+        this.waiters = this.waiters.filter((x) => x !== w);
+        f();
       };
-      const timer = setTimeout(() => {
-        this.waiters = this.waiters.filter((w) => w !== done);
-        reject(
-          new MantisError(
-            "NOT_CONNECTED",
-            `${this.role} agent not connected after ${timeout}ms` +
-              (this.rejected ? ` (${this.rejected})` : ""),
+      const w = {
+        since,
+        done: () => end(resolve),
+        fail: () => end(() => reject(new MantisError("PORT_IN_USE", this.rejected))),
+      };
+      const timer = setTimeout(
+        () =>
+          end(() =>
+            reject(
+              new MantisError(
+                this.held ? "PORT_IN_USE" : "NOT_CONNECTED",
+                `${this.role} agent not connected after ${timeout}ms` + (this.rejected ? ` (${this.rejected})` : ""),
+              ),
+            ),
           ),
-        );
-      }, timeout);
-      this.waiters.push(done);
+        timeout,
+      );
+      this.waiters.push(w);
     });
   }
 
   async call(method, params = {}) {
     if (!this.connected)
       await this.ready().catch((e) => {
-        throw new MantisError("NOT_CONNECTED", `${e.message}: ${method}`);
+        throw new MantisError(e.code, `${e.message}: ${method}`);
       });
     const id = ++this.seq;
     const t0 = performance.now();
@@ -291,6 +316,7 @@ class App extends EventEmitter {
       while (this.legs === legs) {
         let wait = 50; // ponytail: fixed 50 ms; a refused connect (the app isn't listening yet) costs ~1 ms on the Mac
         try {
+          const dialed = performance.now();
           const sock = await usbmux.connect(this.usb, this.port);
           if (this.legs !== legs) {
             sock.destroy();
@@ -298,12 +324,26 @@ class App extends EventEmitter {
           }
           const ws = new WebSocket(`ws://127.0.0.1:${this.port}/`, { createConnection: () => sock });
           legs.add(ws);
-          ws.once("open", () =>
-            ws.send(JSON.stringify({ method: "Runner.attach", params: { role: peer.role, token: this.token } })),
-          );
+          let opened = false;
+          let answered = false;
+          ws.once("open", () => {
+            opened = true;
+            ws.send(JSON.stringify({ method: "Runner.attach", params: { role: peer.role, token: this.token } }));
+          });
+          ws.once("message", () => (answered = true));
           peer.attach(ws);
           await new Promise((r) => ws.once("close", r));
           legs.delete(ws);
+          // The native agent answers Runner.attach with its hello at once, and only with this runner's token: a listener
+          // that closed it unanswered is another app holding the port, so this launch can't listen there. (One suspended
+          // in the background refuses connections, as if nothing listened: no signal then.)
+          if (this.legs === legs && peer.role === "native" && opened && !answered)
+            peer.heldBy(
+              dialed,
+              `port ${this.port} on the iPhone is held by another app: one this runner didn't launch answered there ` +
+                "(another Mantis build, or a launch of another runner) and this launch's agent never did. Stop that app and " +
+                "relaunch (an app built with Mantis 0.5.0 or older holds the port in the background and doesn't retry it)",
+            );
           // closed before an accepted hello: an app launched by someone else (another token), another platform's or
           // version's agent, or no JS agent within the hello timeout. Don't hammer it.
           if (peer.ws !== ws) {
@@ -356,11 +396,15 @@ class App extends EventEmitter {
     try {
       await Promise.all([this.js.ready(timeout), this.native.ready(timeout)]);
     } catch (e) {
+      // the JS agent's wait can run out first; a cabled iPhone's port taken by another app is the cause then too
+      if (this.native.held) throw new MantisError("PORT_IN_USE", `Mantis agents not connected after launch: ${this.native.rejected}`);
       throw new MantisError(
         "NOT_CONNECTED",
         `Mantis agents not connected ${timeout}ms after launch (js: ${this.js.connected}, native: ${this.native.connected}): ` +
           `${e.message}. Is this a Mantis build (MANTIS_E2E=1, withMantis() in metro.config.js) and is port ${this.port} ` +
-          "reachable from the device (Android: adb reverse; iPhone: cabled, launched with app.launchArgs)?",
+          "reachable from the device (Android: adb reverse; iPhone: cabled, launched with app.launchArgs, and no other " +
+          `Mantis app holding the port: one suspended in the background refuses connections like a free port, the app's log ` +
+          `then says "listener on port ${this.port} failed")?`,
       );
     }
     timing("launch:agents", t0, t0);

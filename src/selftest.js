@@ -175,6 +175,7 @@ async function checkUsbmux() {
     `<integer>${id}</integer><key>EscapedFullServiceName</key><data>AAEC</data>` +
     `<key>SerialNumber</key><string>${udid.replace("-", "")}</string></dict></dict>`;
   let listening = false; // the app on the "phone" runs and listens
+  let foreign = false; // ...but it's another app: it closes a Runner.attach with another token unanswered
   let connects = 0;
   const sockets = { native: [], js: [] };
   const phone = new WebSocketServer({ noServer: true });
@@ -182,6 +183,7 @@ async function checkUsbmux() {
     ws.on("message", (data) => {
       const msg = JSON.parse(data);
       if (msg.method === "Runner.attach") {
+        if (foreign) return ws.terminate();
         sockets[msg.params.role].push(ws);
         const hello = { role: msg.params.role, platform: "ios", v: PROTOCOL, token: msg.params.token, ctx: "c" };
         return ws.send(JSON.stringify({ method: "Agent.hello", params: hello }));
@@ -219,9 +221,16 @@ async function checkUsbmux() {
 
   await assert.rejects(new App(port, "ios", { usb: "ffffffff-ffffffffffffffff" }).start(), /no iPhone/);
   const app = new App(port, "ios", { usb: udid });
+  // another app holds the port: the launch fails fast with PORT_IN_USE, not NOT_CONNECTED after the timeout
+  foreign = true;
   await app.start();
-  await app.relaunch(async () => (listening = true));
-  assert(app.native.connected && app.js.connected);
+  const t0 = performance.now();
+  await assert.rejects(app.relaunch(async () => (listening = true), { timeout: 5000 }), { code: "PORT_IN_USE", message: /held by another app/ });
+  assert(performance.now() - t0 < 4000);
+  // it's gone, this launch's agent listens: connected, and nothing held any more
+  foreign = false;
+  await app.relaunch(async () => {});
+  assert(app.native.connected && app.js.connected && !app.native.held);
   // the native leg drops (app killed, cable out): the call in flight fails at once, the runner redials
   const hang = app.native.call("Hang");
   sockets.native[0].terminate();

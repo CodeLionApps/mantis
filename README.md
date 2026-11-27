@@ -334,6 +334,7 @@ that export nothing. An exception inside an agent (the app) comes back as `AGENT
 | `UNSUPPORTED`      | the app's agent is older than this runner: rebuild the app                                    |
 | `INVALID_ARGUMENT` | e.g. `scroll("sideways")`                                                                    |
 | `NOT_CONNECTED`    | an agent didn't connect in time                                                               |
+| `PORT_IN_USE`      | a cabled iPhone: another app answered on the agent's port (another Mantis build, or a launch of another runner) and this launch's agent never did (`relaunch`, a call waiting for the agents) |
 | `DISCONNECTED`     | an agent went away during a call (relaunch, crash); the call may or may not have run. `idle` and `mark` throw it at once when an agent is gone (other calls wait for it to reconnect) |
 | `AGENT_ERROR`      | the call threw inside the app's agent                                                         |
 
@@ -446,7 +447,11 @@ test("login", async () => {
   redials until `close()`, and later calls wait for the agents as after a relaunch (`NOT_CONNECTED` after 15 s).
 - Prepare the phone: Developer Mode on and paired with the Mac; AutoFill Passwords off (the "Save Password?" sheet is
   the system's: Mantis can't close it and a tap under it fails with `COVERED`); Auto-Lock off.
-- One Mantis app at a time per phone and port.
+- One Mantis app at a time per phone and port. An app sent to the background frees the port (and takes it back when
+  it's in the foreground again; the runner redials), and an app that finds the port taken retries. An app built with
+  Mantis 0.5.0 keeps the port in the background: stop it. When another app answers there, `relaunch` and calls fail
+  with `PORT_IN_USE`; a suspended one refuses connections like a free port, so that one shows only as `NOT_CONNECTED`
+  (the app's log says `listener on port N failed`).
 
 ## Supported
 
