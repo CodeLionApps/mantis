@@ -28,18 +28,20 @@ const display = async () => {
   return { width: w / screen.density, height: h / screen.density };
 };
 
-// 8-bit RGB / RGBA PNG -> { width, height, px(x, y) = [r, g, b] }; throws on anything it can't decode
+// 8- or 16-bit (iOS, wide colour) RGB / RGBA PNG -> { width, height, px(x, y) = [r, g, b] } (8-bit); throws on anything
+// it can't decode
 function decodePng(buf) {
   assert.equal(buf.subarray(0, 8).toString('hex'), '89504e470d0a1a0a', 'PNG signature');
-  let width, height, bpp;
+  let width, height, bpp, depth;
   const idat = [];
   for (let o = 8; o < buf.length; ) {
     const len = buf.readUInt32BE(o), type = buf.toString('ascii', o + 4, o + 8), data = buf.subarray(o + 8, o + 8 + len);
     if (type === 'IHDR') {
       width = data.readUInt32BE(0);
       height = data.readUInt32BE(4);
-      assert.equal(data[8], 8, 'bit depth');
-      bpp = { 2: 3, 6: 4 }[data[9]];
+      depth = data[8] / 8;
+      assert.ok(depth === 1 || depth === 2, `bit depth ${data[8]}`);
+      bpp = { 2: 3, 6: 4 }[data[9]] * depth; // bytes per pixel
       assert.ok(bpp, `color type ${data[9]}`);
     }
     if (type === 'IDAT') idat.push(data);
@@ -60,7 +62,8 @@ function decodePng(buf) {
       out[y * stride + i] = (x + pred) & 0xff;
     }
   }
-  return { width, height, px: (x, y) => [...out.subarray((y * width + x) * bpp, (y * width + x) * bpp + 3)] };
+  // a 16-bit sample's high byte is its 8-bit value
+  return { width, height, px: (x, y) => [0, 1, 2].map(c => out[(y * width + x) * bpp + c * depth]) };
 }
 
 const shoot = async () => {
