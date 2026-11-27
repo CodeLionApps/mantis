@@ -88,9 +88,11 @@ Android agent lets any process on the host drive the app through the port. Both 
 `MANTIS_E2E=1` is set **at build time**:
 
 - iOS: the podspec defines `MANTIS_E2E_$(MANTIS_E2E)`, and Xcode expands it from the build environment. Only
-  `MANTIS_E2E=1` gives `MANTIS_E2E_1`, the `#if` around `MantisAgent.m`, and only for the **simulator** SDK. A device
-  build (what the App Store gets) with `MANTIS_E2E=1` fails to compile, so a variable leaked into a release job
-  breaks the build instead of shipping the agent. The environment at `pod install` time doesn't matter.
+  `MANTIS_E2E=1` gives `MANTIS_E2E_1`, the `#if` around `MantisAgent.m`. A device build (what the App Store gets) with
+  `MANTIS_E2E=1` fails to compile unless its configuration allows device builds (`MANTIS_DEVICE=YES` on the mantis pod
+  target, see [Physical iPhone](#physical-iphone)), so a variable leaked into a release job breaks the build instead of
+  shipping the agent. `MANTIS_DEVICE` can't come from the environment: the podspec pins it to `NO`, and a pod target's
+  xcconfig outranks the environment. The environment at `pod install` time doesn't matter.
 - Android: `android/build.gradle` adds the agent sources and the manifest with its `ContentProvider` only with
   `MANTIS_E2E=1`. Without it, the library is an empty `MantisPackage` (autolinking needs one). With it, building an
   app bundle (`.aab`, what Play gets) fails. Any value other than `1`, `0`, empty or unset fails the build (iOS
@@ -102,7 +104,7 @@ Defence in depth (recommended):
 - iOS: limit the pod to your E2E configuration in `react-native.config.js`:
   `dependencies: { "@codelionapps/mantis": { platforms: { ios: { configurations: ["Release-E2E"] } } } }`.
 - CI: check the build you ship:
-  `bash node_modules/@codelionapps/mantis/scripts/check-release.sh <apk|aab|app>`. It reads every file of the build as
+  `bash node_modules/@codelionapps/mantis/scripts/check-release.sh <apk|aab|ipa|app>`. It reads every file of the build as
   raw bytes. Exit 0 = no agent, 1 = agent found, 2 = could not check (no native code or JS bundle found, unreadable
   archive): treat 2 as a failure too.
 
@@ -111,6 +113,7 @@ Defence in depth (recommended):
 | Env                     | Default        | Meaning                                                                                |
 | ----------------------- | -------------- | -------------------------------------------------------------------------------------- |
 | `MANTIS_E2E=1`           |                | build time: compile in / bundle the agents                                             |
+| `MANTIS_DEVICE=YES`      | `NO`           | iOS build setting of the mantis pod target, per configuration: allow device builds (Podfile, see [Physical iPhone](#physical-iphone)) |
 | `MANTIS_PORT`            | 9123           | first Jest worker's host port; worker N uses `MANTIS_PORT + N - 1` (iOS: launch arg `mantisPort`; Android: `adb reverse`) |
 | `MANTIS_APP_ID`          | from Detox     | package / bundle id; default: Detox app `bundleId`, else read from `binaryPath`        |
 | `MANTIS_EXPECT_TIMEOUT`  | 1000           | grace (ms) for Detox's one-shot `expect`, see below                                     |
@@ -323,7 +326,8 @@ What the channel does not protect against:
   reach the adb server too (`127.0.0.1:5037`, no authentication), which already controls the device.
 - Other apps on the device. The agents trust whatever listens on the device's `localhost` port, so an app that binds
   it could read the UI tree and drive the E2E build. Install `MANTIS_E2E=1` builds only on emulators, simulators and
-  test devices.
+  test devices. On a physical iPhone the native agent listens instead, and takes only connections that carry the
+  token of its launch.
 - `MANTIS_TRACE` records RPCs, but typed text only as its length.
 
 ## Without Detox
@@ -354,6 +358,71 @@ test("login", async () => {
 With `beforeAll` / `afterAll` (Jest, Vitest globals) or Mocha's `before` / `after`, `setupMantis(target)` does the
 `before` / `after` part. Not without Detox: `launchApp({ delete: true })` (install the app yourself).
 
+## Physical iPhone
+
+Over USB, without Detox (it has no physical iPhone support): the Playwright-style API, the app launched with
+`xcrun devicectl`. The phone's `localhost` is the phone's, and reaching the Mac would need the user's Local Network
+consent, so the native agent listens on the phone's loopback (`127.0.0.1:<mantisPort>`) and the runner dials it
+through usbmuxd (the Mac's USB multiplexer, as `iproxy` does), one connection per agent, each opened with the
+runner's token. The JS agent dials the native one, which relays it. No XCTest, no consent prompts. On an iPhone SE
+(iOS 18.3), p50: RPC round trip 1 ms to the native agent, 3 ms to the JS one (relayed); tap 125 ms with the auto-wait;
+launch to connected and active 0.8 s.
+
+**Build.** `MANTIS_E2E=1` turns the agent on as for simulators, and the configuration must allow device builds:
+`MANTIS_DEVICE=YES` on the mantis pod target. Set it in the Podfile for your E2E / staging configuration only (the
+podspec pins it to `NO`, so the environment can't set it):
+
+```ruby
+post_install do |installer|
+  # ... react_native_post_install(...)
+  installer.pods_project.targets.select { |t| t.name == "mantis" }.each do |t|
+    t.build_configurations.each { |c| c.build_settings["MANTIS_DEVICE"] = "YES" if c.name == "Staging" }
+  end
+end
+```
+
+```sh
+MANTIS_E2E=1 xcodebuild -workspace ios/App.xcworkspace -scheme App -configuration Staging -sdk iphoneos ...
+xcrun devicectl device install app --device <UDID> <path>/App.app
+```
+
+Building from Xcode, with nothing in the environment: set `MANTIS_E2E=1` for that configuration as a build setting
+too, on the app target (Metro's bundling step reads it) and on the mantis pod target next to `MANTIS_DEVICE`.
+
+What keeps the agent out of the App Store build:
+
+- a device build with `MANTIS_E2E=1` of any configuration without `MANTIS_DEVICE=YES` fails to compile;
+- on the phone the agent stays off unless the app was launched with the runner's `-mantisToken`, which only a Mac the
+  phone trusts can pass (`devicectl`, Xcode); it listens on loopback only and drops connections without the token;
+- what you archive from the allowed configuration (TestFlight, Ad Hoc) carries the agent, by design. Check the build
+  you upload: `check-release.sh App.ipa`.
+
+**Test.** Target the phone by its hardware UDID (`xcrun devicectl device info details --device <id>` shows it as
+`udid`; not devicectl's own identifier, which looks like a simulator's):
+
+```js
+const target = { platform: "ios", deviceId: "<hardware UDID>", appId: "com.example.app" };
+const app = new App(PORT, "ios", { usb: target.deviceId }); // setupMantis(target) picks USB by itself
+before(() => app.start()); // fails at once if that iPhone isn't on USB
+after(() => app.close());
+
+test("login", async () => {
+  await app.relaunch(() => launchApp({ ...target, launchArgs: app.launchArgs }));
+  // ...
+});
+```
+
+- `launchApp` runs `xcrun devicectl device process launch --terminate-existing <app> -- <launch args>`: the app's
+  arguments go after `--`, or devicectl takes `-mantisPort` as its own option. `clearAppData` and `permissions` throw:
+  reinstall instead (`devicectl device uninstall app` / `install app`). `app.relaunch` also waits up to 1 s for the
+  app to be active: on a phone the agents connect during its launch animation.
+- iOS parses a launch argument value that starts with `[` or `(` as a plist (an array), not a string (simulators too).
+- A connection that drops (relaunch, crash, cable out) fails the calls in flight with `DISCONNECTED`; the runner
+  redials until `close()`, and later calls wait for the agents as after a relaunch (`NOT_CONNECTED` after 15 s).
+- Prepare the phone: Developer Mode on and paired with the Mac; AutoFill Passwords off (the "Save Password?" sheet is
+  the system's: Mantis can't close it and a tap under it fails with `COVERED`); Auto-Lock off.
+- One Mantis app at a time per phone and port.
+
 ## Supported
 
 - React Native with the New Architecture (Fabric); the agents assume `view.tag` / `View.id` is the React tag.
@@ -364,8 +433,8 @@ With `beforeAll` / `afterAll` (Jest, Vitest globals) or Mocha's `before` / `afte
   cancelled, so the next one starts clean. The agents turn Objective-C / Java exceptions into errors of the call;
   a C++ exception (Fabric) still crashes the app.
 - Detox 20 for the Detox layer; any Node test framework without it. Node 22+.
-- Android emulator (API 29+ for Modals: `WindowInspector`), iOS simulator. Physical iPhone: not tested (the spike
-  measured XCTest as a fallback, ~254 ms per tap).
+- Android emulator (API 29+ for Modals: `WindowInspector`), iOS simulator, physical iPhone over USB (tested on
+  iOS 18.3, see [Physical iPhone](#physical-iphone)).
 
 ## License
 

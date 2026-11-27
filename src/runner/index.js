@@ -3,7 +3,8 @@
 // launch args); Mantis does the actions and assertions instead of element()/expect(). See README.md.
 const { randomUUID } = require("node:crypto");
 const { performance } = require("node:perf_hooks");
-const { WebSocketServer } = require("ws");
+const { WebSocket, WebSocketServer } = require("ws");
+const usbmux = require("./usbmux");
 
 // Host port. iOS agents dial it directly (launch arg mantisPort, which src/detox adds); Android agents always dial
 // 9123 on the device and adb reverse maps that to this port (see src/device). One port per Jest worker, so parallel
@@ -219,8 +220,10 @@ class Peer {
 }
 
 class App {
-  constructor(port = PORT, platform = "android") {
+  /** usb: hardware UDID of a cabled iPhone: its agents listen on the phone, the runner dials them through usbmuxd. */
+  constructor(port = PORT, platform = "android", { usb } = {}) {
     this.port = port;
+    this.usb = usb;
     this.platform = platform;
     this.token = randomUUID();
     this.js = new Peer("js", platform, this.token);
@@ -239,12 +242,16 @@ class App {
     this.keyboard = { type: (text, opts) => this.#type(text, opts) };
   }
 
-  /** iOS launch args the agents need: simulators share the Mac's localhost, so this runner's port and token. */
+  /**
+   * iOS launch args the agents need: simulators share the Mac's localhost, so this runner's port and token. An iPhone
+   * listens on that port (on the phone), and only with the token, which it accepts the runner's connections with.
+   */
   get launchArgs() {
     return { mantisPort: this.port, mantisToken: this.token };
   }
 
   start() {
+    if (this.usb) return this.#dial();
     // loopback only: nothing else on the network may drive the app (Android reaches it through adb reverse)
     this.wss = new WebSocketServer({ host: "127.0.0.1", port: this.port });
     this.wss.on("error", (e) => trace({ event: "server error", message: e.message }));
@@ -263,7 +270,50 @@ class App {
     });
   }
 
+  // Cabled iPhone: one usbmux connection per agent ("leg"), each opened with Runner.attach {role, token}; the native
+  // agent answers the native leg itself and relays the JS agent on the JS leg. Redialed whenever it drops (app
+  // relaunched or not started yet, cable out: calls in flight fail with DISCONNECTED), until close().
+  async #dial() {
+    this.legs = new Set();
+    // fail early on a wrong UDID or an iPhone that isn't cabled; later dials just retry
+    await usbmux.deviceId(this.usb);
+    const leg = async (peer) => {
+      let last;
+      while (this.legs) {
+        try {
+          const sock = await usbmux.connect(this.usb, this.port);
+          if (!this.legs) {
+            sock.destroy();
+            break;
+          }
+          const ws = new WebSocket(`ws://127.0.0.1:${this.port}/`, { createConnection: () => sock });
+          this.legs.add(ws);
+          ws.once("open", () =>
+            ws.send(JSON.stringify({ method: "Runner.attach", params: { role: peer.role, token: this.token } })),
+          );
+          peer.attach(ws);
+          await new Promise((r) => ws.once("close", r));
+          this.legs?.delete(ws);
+        } catch (e) {
+          // refused (result 3) while the app isn't listening is the normal wait; trace anything else once
+          if (e.result === undefined && e.message !== last)
+            trace({ event: "usbmux error", role: peer.role, message: e.message });
+          last = e.message;
+        }
+        // ponytail: fixed 50 ms; a refused connect costs ~1 ms on the Mac
+        await sleep(50);
+      }
+    };
+    leg(this.native);
+    leg(this.js);
+  }
+
   close() {
+    if (this.legs) {
+      for (const ws of this.legs) ws.terminate();
+      this.legs = null;
+      return Promise.resolve();
+    }
     if (!this.wss) return Promise.resolve();
     for (const c of this.wss.clients) c.terminate();
     return new Promise((r) => this.wss.close(r));
@@ -294,9 +344,14 @@ class App {
         "NOT_CONNECTED",
         `Mantis agents not connected ${timeout}ms after launch (js: ${this.js.connected}, native: ${this.native.connected}): ` +
           `${e.message}. Is this a Mantis build (MANTIS_E2E=1, withMantis() in metro.config.js) and is port ${this.port} ` +
-          "reachable from the device (Android: adb reverse)?",
+          "reachable from the device (Android: adb reverse; iPhone: cabled, launched with app.launchArgs)?",
       );
     }
+    // A cabled iPhone's agents connect ~0.4 s before the app is active (its launch animation; a simulator's app is
+    // active by then), and until then back / point taps / scroll report a system window in front. Wait for it, but not
+    // for an alert that keeps it inactive. ponytail: fixed 1 s ceiling
+    for (const end = performance.now() + 1000; this.usb && performance.now() < end; await sleep(20))
+      if ((await this.native.call("Layout.visibility", { tags: [], hit: true })).appState === 0) break;
     timing("launch:agents", t0, t0);
   }
 
@@ -975,8 +1030,9 @@ function expect(locator, negate = false) {
  * so tests start once the agents are connected; pass launchArgs: app.launchArgs (iOS: the runner's port and token).
  */
 function setupMantis(target = {}) {
-  const { platform, deviceId } = require("../device").target(target);
-  const app = new App(PORT, platform);
+  const device = require("../device");
+  const { platform, deviceId } = device.target(target);
+  const app = new App(PORT, platform, { usb: device.isIosDevice({ platform, deviceId }) ? deviceId : undefined });
   const before = global.beforeAll ?? global.before;
   const after = global.afterAll ?? global.after;
   if (!before || !after)

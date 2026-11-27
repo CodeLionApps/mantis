@@ -12,11 +12,16 @@ Pod::Spec.new do |s|
   s.platforms    = { :ios => "15.1" }
   s.source       = { :git => "#{package["homepage"]}.git", :tag => s.version.to_s }
   s.source_files = "ios/**/*.{h,m}"
-  s.frameworks   = "UIKit", "QuartzCore"
+  s.frameworks   = "UIKit", "QuartzCore", "Network"
   # the agent turns exceptions into RPC errors; without this ARC leaks the objects of every frame an exception unwinds
   s.compiler_flags = "-fobjc-arc-exceptions"
   # Build-time gate: Xcode expands $(MANTIS_E2E) from the build environment, so only `MANTIS_E2E=1 xcodebuild ...`
   # defines MANTIS_E2E_1 and compiles the agent (private UIKit/IOKit API, never for the App Store). Any other build,
   # whatever the environment at `pod install`, compiles MantisAgent.m to nothing.
-  s.pod_target_xcconfig = { "GCC_PREPROCESSOR_DEFINITIONS" => "$(inherited) MANTIS_E2E_$(MANTIS_E2E)=1" }
+  # Device builds need MANTIS_DEVICE=YES too. It's pinned to NO here: a pod target xcconfig outranks the environment,
+  # so only a build setting on this target (the Podfile, per configuration) or an xcodebuild argument can allow one.
+  s.pod_target_xcconfig = {
+    "MANTIS_DEVICE" => "NO",
+    "GCC_PREPROCESSOR_DEFINITIONS" => "$(inherited) MANTIS_E2E_$(MANTIS_E2E)=1 MANTIS_DEVICE_$(MANTIS_DEVICE)=1",
+  }
 end
