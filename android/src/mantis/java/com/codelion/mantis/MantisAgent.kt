@@ -604,7 +604,8 @@ object MantisAgent {
    * Each window read back by PixelCopy (what the GPU drew: hardware layers, TextureView; not a SurfaceView's own
    * surface), then scaled, composed and PNG-encoded on [shot]: the UI thread only starts the copies.
    * PixelCopy needs API 34 for any window (Dialog, popup), 26 for the activity's; a window it can't copy is drawn
-   * by View.draw on the UI thread (`fallbacks`). A dimming window (FLAG_DIM_BEHIND: an AlertDialog) dims what is under it.
+   * by View.draw on the UI thread (`fallbacks`; it throws on a hardware Bitmap in the window). Below API 29 roots()
+   * has the activity window only. A dimming window (FLAG_DIM_BEHIND: an AlertDialog) dims what is under it.
    */
   private fun screenshot(scale: Float, done: (Any?) -> Unit) {
     val k = scale / density
@@ -617,19 +618,24 @@ object MantisAgent {
     val layers = roots().filter { it.width > 0 && it.height > 0 }.reversed().map { Layer(it) }
     val compose = { fallbacks: Int ->
       val out = Bitmap.createBitmap((size.x * k).roundToInt(), (size.y * k).roundToInt(), Bitmap.Config.ARGB_8888)
-      val c = Canvas(out)
-      c.drawColor(Color.BLACK)
-      val paint = Paint(Paint.FILTER_BITMAP_FLAG)
-      for (l in layers) {
-        if (l.dim > 0) c.drawColor(Color.argb((l.dim * 255).roundToInt(), 0, 0, 0))
-        val b = l.bmp ?: continue
-        // a surface is larger than its window by its insets (an elevated dialog's shadow), the same on every side
-        c.drawBitmap(b, Matrix().apply {
-          setTranslate(l.at[0] - (b.width - l.win.width) / 2f, l.at[1] - (b.height - l.win.height) / 2f)
-          postScale(k, k)
-        }, paint)
+      val png = try {
+        val c = Canvas(out)
+        c.drawColor(Color.BLACK)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        for (l in layers) {
+          if (l.dim > 0) c.drawColor(Color.argb((l.dim * 255).roundToInt(), 0, 0, 0))
+          val b = l.bmp ?: continue
+          // a surface is larger than its window by its insets (an elevated dialog's shadow), the same on every side
+          c.drawBitmap(b, Matrix().apply {
+            setTranslate(l.at[0] - (b.width - l.win.width) / 2f, l.at[1] - (b.height - l.win.height) / 2f)
+            postScale(k, k)
+          }, paint)
+        }
+        java.io.ByteArrayOutputStream().also { out.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
+      } finally {
+        out.recycle() // ~10 MB a window at full resolution: don't leave it to the GC between screenshots
+        layers.forEach { it.bmp?.recycle() }
       }
-      val png = java.io.ByteArrayOutputStream().also { out.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
       done(JSONObject().put("ok", true).put("fallbacks", fallbacks)
         .put("windows", JSONArray(layers.map { it.win.javaClass.simpleName })).put("png", Base64.encodeToString(png, Base64.NO_WRAP)))
     }

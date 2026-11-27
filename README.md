@@ -224,8 +224,10 @@ windows composed as on screen, in-process (no XCTest, no `adb screencap`). Scree
 point; default 1). No status bar, navigation bar, keyboard or system dialogs: they are not the app's. `windows`: the
 windows drawn, bottom-up. Android: activity, Modals, dialogs and popups, read back by `PixelCopy` (hardware layers and
 `TextureView` included, a `SurfaceView` such as video or a map is not); a dialog that dims what is under it
-(`AlertDialog`) dims it in the picture too. PixelCopy reads any window on API 34+, only the activity's below; a window it
-can't read is drawn by `View.draw` (`fallbacks`: how many). iOS: `drawViewHierarchy`, `layer.renderInContext` for a
+(`AlertDialog`) dims it in the picture too. PixelCopy reads any window on API 34+, only the activity's on 26–33; a window
+it can't read is drawn by `View.draw` (`fallbacks`: how many), which fails on a hardware `Bitmap` (Coil, Glide,
+expo-image): on API 29–33 a Modal showing one makes the call fail. Below API 29: the activity window only (Modals,
+dialogs and popups are not in the picture), on 24–25 by `View.draw`. iOS: `drawViewHierarchy`, `layer.renderInContext` for a
 window that can't (`fallbacks`; `render: true` forces it).
 
 `await app.back()` is the back button: `{ ok, via, reason }`, ~ms, in-process, settled like `tap`.

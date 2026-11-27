@@ -1,9 +1,10 @@
-// Page.screenshot: the app's own windows as a PNG, a Modal (another window) included.
+// Page.screenshot: the app's own windows as a PNG, a Modal and an AlertDialog (other windows) included.
 // MANTIS_E2E=1 build installed; DEVICE=<adb serial or simulator UDID> [PLATFORM=ios MANTIS_APP_ID=<bundle id>]
 //   node --test e2e/screenshot.mantis.js
-const { test, before, after } = require('node:test');
+const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const zlib = require('node:zlib');
+const { execFileSync } = require('node:child_process');
 const { App, PORT, expect } = require('@codelionapps/mantis');
 const { launchApp, reversePort } = require('@codelionapps/mantis/device');
 
@@ -12,9 +13,20 @@ const app = new App(PORT, target.platform);
 before(async () => {
   await app.start();
   reversePort(app.port, target);
-  await app.relaunch(() => launchApp({ ...target, launchArgs: app.launchArgs }));
 });
 after(() => app.close());
+beforeEach(() => app.relaunch(() => launchApp({ ...target, launchArgs: app.launchArgs })));
+
+const android = target.platform === 'android';
+const adb = (...args) => execFileSync('adb', ['-s', target.deviceId, 'shell', ...args], { encoding: 'utf8' });
+// the picture is the display (Android: wm size, its override if any; iOS: the screen), in dp at scale 1
+const display = async () => {
+  const { screen } = await app.snapshot();
+  if (!android) return screen;
+  const sizes = [...adb('wm', 'size').matchAll(/(\d+)x(\d+)/g)];
+  const [, w, h] = sizes[sizes.length - 1];
+  return { width: w / screen.density, height: h / screen.density };
+};
 
 // 8-bit RGB / RGBA PNG -> { width, height, px(x, y) = [r, g, b] }; throws on anything it can't decode
 function decodePng(buf) {
@@ -60,17 +72,17 @@ const shoot = async () => {
   return { ...r, img };
 };
 
-test('the screen, then the same screen under a transparent Modal: screen-sized, decodable, the backdrop in it', async () => {
+test('the screen, then the same screen under a transparent Modal: display-sized, decodable, the backdrop in it', async () => {
   await app.getByText('Formularz').tap();
   await expect(app.getByText('Zapisz')).toBeVisible();
-  const { screen } = await app.snapshot();
-  const before = await shoot();
+  const size = await display();
+  const form = await shoot();
   // scale 1 = 1 px per dp (iOS: point)
-  assert.ok(Math.abs(before.img.width - screen.width) <= 1, `width ${before.img.width} vs screen ${screen.width} dp`);
-  assert.ok(Math.abs(before.img.height - screen.height) <= 1, `height ${before.img.height} vs screen ${screen.height} dp`);
+  assert.ok(Math.abs(form.img.width - size.width) <= 1, `width ${form.img.width} vs display ${size.width} dp`);
+  assert.ok(Math.abs(form.img.height - size.height) <= 1, `height ${form.img.height} vs display ${size.height} dp`);
   // left of the modal box (the backdrop's padding is 24 dp), mid-height: the form's white background...
-  const at = [12, Math.round(screen.height / 2)];
-  assert.deepEqual(before.img.px(...at), [255, 255, 255]);
+  const at = [12, Math.round(size.height / 2)];
+  assert.deepEqual(form.img.px(...at), [255, 255, 255]);
 
   await app.getByText('Zapisz').tap();
   await expect(app.getByText('Zamknij')).toBeVisible();
@@ -78,7 +90,26 @@ test('the screen, then the same screen under a transparent Modal: screen-sized, 
   const modal = await shoot();
   // ...darkened by the backdrop (#0006 over white = 153)
   for (const c of modal.img.px(...at)) assert.ok(Math.abs(c - 153) <= 3, `backdrop pixel ${modal.img.px(...at)}`);
+  // API 34+ reads every window by PixelCopy
+  if (android && Number(adb('getprop', 'ro.build.version.sdk')) >= 34) assert.equal(modal.fallbacks, 0);
 
-  const scaled = await app.native.call('Page.screenshot', { scale: 2 });
-  assert.ok(Math.abs(decodePng(Buffer.from(scaled.png, 'base64')).width - before.img.width * 2) <= 2);
+  const scaled = decodePng(Buffer.from((await app.native.call('Page.screenshot', { scale: 2 })).png, 'base64'));
+  assert.ok(Math.abs(scaled.width - form.img.width * 2) <= 2, `scale 2 width ${scaled.width}`);
+  assert.ok(Math.abs(scaled.height - form.img.height * 2) <= 2, `scale 2 height ${scaled.height}`);
+});
+
+test('an AlertDialog: its own window, the screen under it dimmed', { skip: !android && 'Android: a dialog window with FLAG_DIM_BEHIND' }, async () => {
+  await app.getByText('Alerty').tap();
+  await expect(app.getByText('Info')).toBeVisible();
+  const screen = await shoot();
+  const corner = [12, 12]; // the screen's white background, away from the dialog
+  assert.deepEqual(screen.img.px(...corner), [255, 255, 255]);
+  await app.getByText('Info').tap();
+  // the dialog's window, then its enter animation (native, outside idle())
+  const end = Date.now() + 5000;
+  while ((await app.native.call('Page.screenshot')).windows.length === screen.windows.length) assert.ok(Date.now() < end, 'no dialog window');
+  await new Promise(r => setTimeout(r, 500));
+  const alert = await shoot();
+  assert.equal(alert.windows.length, screen.windows.length + 1, `windows ${alert.windows}`);
+  for (const c of alert.img.px(...corner)) assert.ok(c < 160, `dimmed corner pixel ${alert.img.px(...corner)}`);
 });
