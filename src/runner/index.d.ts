@@ -22,6 +22,7 @@ export type ErrorCode =
   | "UNSUPPORTED"
   | "INVALID_ARGUMENT"
   | "NOT_CONNECTED"
+  | "PORT_IN_USE"
   | "DISCONNECTED"
   | "AGENT_ERROR";
 

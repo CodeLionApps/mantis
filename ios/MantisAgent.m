@@ -190,6 +190,7 @@ static NSException *MantisError(NSString *reason) {
 @implementation MantisAgent {
   NSURLSessionWebSocketTask *_ws; // simulator: the socket to the runner
   nw_listener_t _listener; // physical iPhone: the runner's legs and the JS agent connect here
+  BOOL _bindFailed; // the port is taken (another app): logged once, retried
   nw_connection_t _native, _runnerJs, _js; // the runner's native leg, its JS leg, the JS agent
   CGRect _keyboard; // last keyboard end frame (UIKeyboardWillChangeFrame), screen points; off screen = none
 }
@@ -222,6 +223,13 @@ static id mantisToken(void) {
     [shared connect];
 #else
     [shared listen];
+    // in the background the port is free for another Mantis app (iOS keeps a suspended app's socket bound, and its
+    // listener can't answer); the runner redials until the app is back
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil
+                                                     queue:nil usingBlock:^(NSNotification *n) { [shared unlisten]; }];
+    // not WillEnterForeground: the state is still background there
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil
+                                                     queue:nil usingBlock:^(NSNotification *n) { [shared listen]; }];
 #endif
   });
 }
@@ -269,15 +277,16 @@ static id mantisToken(void) {
 // (or by anything but a runner) never listens.
 - (void)listen {
   if (mantisToken() == NSNull.null) return NSLog(@"[Mantis] no -mantisToken launch argument: agent off");
+  if (_listener || UIApplication.sharedApplication.applicationState == UIApplicationStateBackground) return;
   nw_parameters_t params = nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL, NW_PARAMETERS_DEFAULT_CONFIGURATION);
   nw_protocol_stack_prepend_application_protocol(nw_parameters_copy_default_protocol_stack(params), nw_ws_create_options(nw_ws_version_13));
   NSString *port = [NSString stringWithFormat:@"%ld", (long)mantisPort()];
   nw_parameters_set_local_endpoint(params, nw_endpoint_create_host("127.0.0.1", port.UTF8String));
   nw_parameters_set_required_interface_type(params, nw_interface_type_loopback);
   nw_parameters_set_reuse_local_address(params, true); // a relaunch rebinds while the last process's sockets linger
-  _listener = nw_listener_create(params);
-  nw_listener_set_queue(_listener, dispatch_get_main_queue());
-  nw_listener_set_new_connection_handler(_listener, ^(nw_connection_t c) {
+  nw_listener_t l = _listener = nw_listener_create(params);
+  nw_listener_set_queue(l, dispatch_get_main_queue());
+  nw_listener_set_new_connection_handler(l, ^(nw_connection_t c) {
     nw_connection_set_queue(c, dispatch_get_main_queue());
     nw_connection_set_state_changed_handler(c, ^(nw_connection_state_t s, nw_error_t e) {
       if (s == nw_connection_state_failed || s == nw_connection_state_cancelled) [self dropped:c];
@@ -289,10 +298,25 @@ static id mantisToken(void) {
       if (c != self->_native && c != self->_runnerJs && c != self->_js) nw_connection_cancel(c);
     });
   });
-  nw_listener_set_state_changed_handler(_listener, ^(nw_listener_state_t s, nw_error_t e) {
-    if (s == nw_listener_state_failed) NSLog(@"[Mantis] listener on port %@ failed: %@", port, e);
+  nw_listener_set_state_changed_handler(l, ^(nw_listener_state_t s, nw_error_t e) {
+    if (s == nw_listener_state_ready) self->_bindFailed = NO;
+    if (s != nw_listener_state_failed) return;
+    if (!self->_bindFailed) NSLog(@"[Mantis] listener on port %@ failed: %@ (another Mantis app holding it? retrying)", port, e);
+    self->_bindFailed = YES;
+    nw_listener_cancel(l);
+    if (self->_listener != l) return;
+    // taken: e.g. by an app that is going to the background right now (it frees the port then)
+    self->_listener = nil;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC), dispatch_get_main_queue(), ^{ [self listen]; });
   });
-  nw_listener_start(_listener);
+  nw_listener_start(l);
+}
+
+- (void)unlisten {
+  if (_listener) nw_listener_cancel(_listener);
+  _listener = nil;
+  nw_connection_t all[] = {_native, _runnerJs, _js}; // each one's dropped: clears it
+  for (int i = 0; i < 3; i++) if (all[i]) nw_connection_cancel(all[i]);
 }
 
 - (void)read:(nw_connection_t)c {
