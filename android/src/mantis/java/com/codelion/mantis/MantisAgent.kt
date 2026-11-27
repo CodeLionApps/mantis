@@ -3,14 +3,26 @@ package com.codelion.mantis
 import android.app.Activity
 import android.app.Application
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Point
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.drawable.Animatable
+import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Base64
 import android.util.TypedValue
+import android.view.PixelCopy
+import android.view.WindowManager
 import android.view.Choreographer
 import android.view.InputDevice
 import android.view.KeyCharacterMap
@@ -24,6 +36,8 @@ import android.view.inputmethod.InputMethodManager
 import android.view.inspector.WindowInspector
 import android.widget.EditText
 import android.widget.HorizontalScrollView
+import android.widget.ImageView
+import android.widget.ProgressBar
 import android.widget.ScrollView
 import androidx.activity.findViewTreeOnBackPressedDispatcherOwner
 import androidx.core.view.ViewCompat
@@ -435,15 +449,17 @@ object MantisAgent {
         }
       }
 
+      // took: the innermost React view under the point (hit-test before the DOWN), null = none (another window's)
       "Input.tap" -> {
         val x = p.getDouble("x").toFloat() * density
         val y = p.getDouble("y").toFloat() * density
         val win = windowAt(x, y) ?: error("no window at (${x / density}, ${y / density})")
+        val took = hitTest(x / density, y / density).optJSONArray("chain")?.opt(0) ?: JSONObject.NULL
         val (f, end) = fingerDown(win, x, y, done)
         // hold = until next frame (~16 ms), enough for Pressable / gesture handlers to see DOWN
         onFrame(end) {
           move(f, MotionEvent.ACTION_UP, x, y)
-          end(JSONObject().put("ok", true))
+          end(JSONObject().put("ok", true).put("took", took))
         }
       }
 
@@ -498,7 +514,10 @@ object MantisAgent {
               // 2 frames: lets the scroll events of the UP (momentum begin) reach the JS queue before the runner
               // queries again, so the "scroll view animating" check cannot miss them
               // moved: false = the drag happened but the content didn't move (at its end), the runner stops scrolling
-              onFrame(end) { onFrame(end) { end(JSONObject().put("ok", true).put("px", amount).put("moved", (sv.scrollX to sv.scrollY) != start)) } }
+              // from / to: the drag's start and end point (dp), for the runner's touch event
+              onFrame(end) { onFrame(end) { end(JSONObject().put("ok", true).put("px", amount).put("moved", (sv.scrollX to sv.scrollY) != start)
+                .put("from", JSONObject().put("x", x0 / density).put("y", y0 / density))
+                .put("to", JSONObject().put("x", x1 / density).put("y", y1 / density))) } }
               return@guard
             }
             Choreographer.getInstance().postFrameCallback(this)
@@ -572,16 +591,110 @@ object MantisAgent {
       // so far. A draw = a frame that changed something on screen: a mount, a native-driver / Reanimated animation,
       // a fling, a fragment transition (none of which commits in React). Windows are watched from their first poll on;
       // a window seen for the first time counts as just drawn (a Modal that opened since the last poll).
+      // A drawable animating on the RenderThread draws no UI frame (see animating): changing now, busy names it.
       "Agent.ping" -> {
-        for (r in roots()) if (drawWatched.put(r, true) == null) {
+        val roots = roots()
+        for (r in roots) if (drawWatched.put(r, true) == null) {
           r.viewTreeObserver.addOnDrawListener { draws++; lastDraw = SystemClock.uptimeMillis() }
           lastDraw = SystemClock.uptimeMillis()
         }
-        done(JSONObject().put("draws", draws).put("idleMs", SystemClock.uptimeMillis() - lastDraw))
+        val busy = roots.firstNotNullOfOrNull { animating(it) }
+        done(JSONObject().put("draws", draws).put("idleMs", if (busy != null) 0 else SystemClock.uptimeMillis() - lastDraw)
+          .put("busy", busy ?: JSONObject.NULL))
       }
+
+      // The app's own windows, bottom-up, composed as on screen, as PNG base64 (iOS: same). No system UI: status bar
+      // icons, navigation bar, keyboard (another process), system dialogs. scale: px per dp (default 1).
+      "Page.screenshot" -> screenshot(p.optDouble("scale", 1.0).takeIf { it > 0 }?.toFloat() ?: 1f, done)
 
       else -> error("unknown method $method")
     }
+  }
+
+  /**
+   * The first view in [v] (a shown window root) with a running Animatable drawable, for the draw clock: an
+   * AnimatedVectorDrawable (an indeterminate ProgressBar, i.e. RN's ActivityIndicator) animates on the RenderThread,
+   * so no draw listener fires. As on iOS, not one that is visible = GONE / INVISIBLE, transparent itself or through an
+   * ancestor (a loading overlay faded out but mounted), or entirely off screen. ponytail: one covered by another view
+   * still counts (no occlusion check, iOS neither). Runs on every ping: no allocation until one is found.
+   */
+  private fun animating(v: View): String? {
+    if (v.visibility != View.VISIBLE || v.alpha < 0.01f) return null
+    val d = running((v as? ProgressBar)?.takeIf { it.isIndeterminate }?.indeterminateDrawable)
+      ?: running((v as? ImageView)?.drawable) ?: running(v.background) ?: running(v.foreground)
+    // the view's React tag: its own, else its nearest tagged ancestor's (RN's ProgressBar sits in a tagged container)
+    if (d != null && visibleRatio(v) > 0)
+      return "${v.javaClass.simpleName} tag ${ancestorTags(v).opt(0)} animating ${d.javaClass.simpleName}" +
+        if (v is ProgressBar) " in a loop" else ""
+    if (v is ViewGroup) for (i in 0 until v.childCount) animating(v.getChildAt(i))?.let { return it }
+    return null
+  }
+
+  private fun running(d: Drawable?) = d?.takeIf { it is Animatable && it.isRunning }
+
+  private val shot by lazy { Handler(HandlerThread("mantis-screenshot").apply { start() }.looper) }
+
+  /**
+   * Each window read back by PixelCopy (what the GPU drew: hardware layers, TextureView; not a SurfaceView's own
+   * surface), then scaled, composed and PNG-encoded on [shot]: the UI thread only starts the copies.
+   * PixelCopy needs API 34 for any window (Dialog, popup), 26 for the activity's; a window it can't copy is drawn
+   * by View.draw on the UI thread (`fallbacks`; it throws on a hardware Bitmap in the window). Below API 29 roots()
+   * has the activity window only. A dimming window (FLAG_DIM_BEHIND: an AlertDialog) dims what is under it.
+   */
+  private fun screenshot(scale: Float, done: (Any?) -> Unit) {
+    val k = scale / density
+    val size = Point().also { @Suppress("DEPRECATION") (app.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealSize(it) }
+    class Layer(val win: View) {
+      val at = IntArray(2).also { win.getLocationOnScreen(it) }
+      val dim = (win.layoutParams as? WindowManager.LayoutParams)?.takeIf { it.flags and WindowManager.LayoutParams.FLAG_DIM_BEHIND != 0 }?.dimAmount ?: 0f
+      var bmp: Bitmap? = null
+    }
+    val layers = roots().filter { it.width > 0 && it.height > 0 }.reversed().map { Layer(it) }
+    val compose = { fallbacks: Int ->
+      val out = Bitmap.createBitmap((size.x * k).roundToInt(), (size.y * k).roundToInt(), Bitmap.Config.ARGB_8888)
+      val png = try {
+        val c = Canvas(out)
+        c.drawColor(Color.BLACK)
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        for (l in layers) {
+          if (l.dim > 0) c.drawColor(Color.argb((l.dim * 255).roundToInt(), 0, 0, 0))
+          val b = l.bmp ?: continue
+          // a surface is larger than its window by its insets (an elevated dialog's shadow), the same on every side
+          c.drawBitmap(b, Matrix().apply {
+            setTranslate(l.at[0] - (b.width - l.win.width) / 2f, l.at[1] - (b.height - l.win.height) / 2f)
+            postScale(k, k)
+          }, paint)
+        }
+        java.io.ByteArrayOutputStream().also { out.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
+      } finally {
+        out.recycle() // ~10 MB a window at full resolution: don't leave it to the GC between screenshots
+        layers.forEach { it.bmp?.recycle() }
+      }
+      done(JSONObject().put("ok", true).put("fallbacks", fallbacks)
+        .put("windows", JSONArray(layers.map { it.win.javaClass.simpleName })).put("png", Base64.encodeToString(png, Base64.NO_WRAP)))
+    }
+    // after the last copy: the windows PixelCopy couldn't read drawn on the UI thread, then composed on [shot]
+    val finish = { main.post { guard(done) {
+      val missing = layers.filter { it.bmp == null }
+      for (l in missing) l.bmp = Bitmap.createBitmap(l.win.width, l.win.height, Bitmap.Config.ARGB_8888).also { l.win.draw(Canvas(it)) }
+      shot.post { guard(done) { compose(missing.size) } }
+    } } }
+    var pending = layers.size
+    val copied = { l: Layer, b: Bitmap? -> l.bmp = b; if (--pending == 0) finish() } // on [shot]
+    for (l in layers) if (!pixelCopy(l.win) { copied(l, it) }) shot.post { copied(l, null) }
+    if (layers.isEmpty()) finish()
+  }
+
+  /** Starts a PixelCopy of [win]'s window: [cb] on [shot], with its surface (insets included) or null. false = not on this API. */
+  private fun pixelCopy(win: View, cb: (Bitmap?) -> Unit): Boolean {
+    if (Build.VERSION.SDK_INT >= 34) return runCatching {
+      PixelCopy.request(PixelCopy.Request.Builder.ofWindow(win).build(), { shot.post(it) }) {
+        cb(if (it.status == PixelCopy.SUCCESS) it.bitmap else null)
+      }
+    }.isSuccess
+    val w = activity?.window?.takeIf { it.decorView === win && Build.VERSION.SDK_INT >= 26 } ?: return false
+    val b = Bitmap.createBitmap(win.width, win.height, Bitmap.Config.ARGB_8888)
+    return runCatching { PixelCopy.request(w, b, { cb(if (it == PixelCopy.SUCCESS) b else null) }, shot) }.isSuccess
   }
 
   private val drawWatched = java.util.WeakHashMap<View, Boolean>()

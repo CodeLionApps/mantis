@@ -2,6 +2,7 @@
 // Runs inside Detox's Jest environment: Detox still installs and launches the app (device.launchApp, permissions,
 // launch args); Mantis does the actions and assertions instead of element()/expect(). See README.md.
 const { randomUUID } = require("node:crypto");
+const { EventEmitter } = require("node:events");
 const { performance } = require("node:perf_hooks");
 const { WebSocket, WebSocketServer } = require("ws");
 const usbmux = require("./usbmux");
@@ -28,7 +29,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * a read-only RPC). NOT_ACTIONABLE: a tap / fill target never became actionable (reason: the last check's).
  * NOT_FOCUSED: no text field took the text. DELIVERED: the action reached the app or may have (an Input.* RPC timed out):
  * don't retry it blindly. STRICT: a locator matched several elements. STALE: what the snapshot showed is gone (a
- * getByTag node, a view under a point tap): snapshot again. COVERED: a point tap would land under a system window or the
+ * getByTag node, a view under a point tap): snapshot again; err.tag says which (null: unknown). COVERED: a point tap would land under a system window or the
  * keyboard. UNSUPPORTED: the app's agent is older than this runner. INVALID_ARGUMENT. NOT_CONNECTED: an agent didn't
  * connect in time. DISCONNECTED: it went away during a call (which may or may not have run), or is gone when idle / mark
  * ping it. AGENT_ERROR: the call threw inside the app's agent.
@@ -219,9 +220,17 @@ class Peer {
   }
 }
 
-class App {
+/**
+ * Events: "touch", once for every touch Mantis injected (tap, a scroll's drag, fill's focusing tap), once its RPC
+ * answered: { type: "tap" | "drag", x, y, dx, dy, start, end }. x, y: where the finger went down, dx, dy: how far it
+ * moved (0 for a tap), screen dp like snapshot rects (px: times snapshot().screen.density); start, end: the host's
+ * Date.now() before the RPC was sent and when it answered. None when the RPC failed or timed out (the touch may still
+ * have happened), or an agent too old to report a drag's points.
+ */
+class App extends EventEmitter {
   /** usb: hardware UDID of a cabled iPhone: its agents listen on the phone, the runner dials them through usbmuxd. */
   constructor(port = PORT, platform = "android", { usb } = {}) {
+    super();
     this.port = port;
     this.usb = usb;
     this.platform = platform;
@@ -396,25 +405,49 @@ class App {
           "DELIVERED",
           `touch count went from ${seq} to ${t.seq} during one tap (JS reloaded, or a late touch of an earlier tap)`,
         );
-      if (performance.now() > end) return null;
+      if (performance.now() >= end) return null;
       await this.nextCommitOrFrame();
     }
   }
 
-  // One Input.tap, settled; then the touch JS saw for it (touchAfter).
+  // One Input.tap, settled; then the touch JS saw for it (touchAfter) and the tag the native hit-test gave (took).
   async tapOnce(params, timeout) {
     const seq = this.touch.seq;
-    await this.native.call("Input.tap", params);
+    const { took = null } = await this.inject("Input.tap", params);
     await this.settle();
-    return this.touchAfter(seq, timeout);
+    return { touch: await this.touchAfter(seq, timeout), took };
+  }
+
+  // A native Input.tap / Input.scroll, then its "touch" event (class doc) when it put a finger down. Emitted in a
+  // microtask: a listener that throws can't fail the action (the touch happened); its error is uncaught, as Node's.
+  async inject(method, params) {
+    const start = Date.now();
+    const r = await this.native.call(method, params);
+    const from = method === "Input.tap" ? params : r?.from;
+    if (from && r?.ok !== false && this.listenerCount("touch")) {
+      const to = r.to ?? from;
+      const touch = {
+        type: method === "Input.tap" ? "tap" : "drag",
+        x: from.x,
+        y: from.y,
+        dx: to.x - from.x,
+        dy: to.y - from.y,
+        start,
+        end: Date.now(),
+      };
+      queueMicrotask(() => this.emit("touch", touch));
+    }
+    return r;
   }
 
   /**
    * app.touchscreen.tap(x, y): a tap at a point in screen dp (snapshot rects), settled like Locator.tap.
-   * { seen: true }: JS saw the touch. { seen: false }: unknown, JS saw none within timeout: a native view RN doesn't
-   * handle took it (WebView, map), or JS is busy and may still handle it, so tapping again may tap twice.
+   * { seen, took }. took: the tag of the innermost React view the native hit-test found under the point (null: none;
+   * an agent that doesn't report it). seen true: JS saw the touch. seen false: JS saw none within timeout (0: don't
+   * wait past settling): a native view RN doesn't handle took it (WebView, map), or JS is busy and may still handle it,
+   * so tapping again may tap twice.
    * STALE: the touch reached a view React had already replaced (nothing was pressed; something else may be under the
-   * point now): snapshot again. Not retried here, unlike Locator.tap, which finds its target again.
+   * point now): snapshot again; err.tag = took. Not retried here, unlike Locator.tap, which finds its target again.
    * COVERED, before tapping: the app's window has no focus (a system window or another app in front; an alert of the
    * app's own on iOS is fine, the touch is in-process) or the point is on the keyboard. The native agent injects into
    * the app's own windows, so such a tap would land in the app beneath, which no user can do.
@@ -432,11 +465,15 @@ class App {
     const kb = v.keyboard;
     if (kb && x >= kb.x && x < kb.x + kb.width && y >= kb.y && y < kb.y + kb.height)
       throw new MantisError("COVERED", `${at}: on the keyboard`);
-    const touch = await this.tapOnce({ x, y }, timeout);
+    const { touch, took } = await this.tapOnce({ x, y }, timeout);
     if (touch && !touch.mounted)
-      throw new MantisError("STALE", `${at}: the view under the point was replaced before the touch reached it, nothing was pressed: take a new snapshot`);
+      throw new MantisError(
+        "STALE",
+        `${at}: the view under the point${took == null ? "" : ` (tag ${took})`} was replaced before the touch reached it, nothing was pressed: take a new snapshot`,
+        { tag: took },
+      );
     timing(at, t0, t0);
-    return { seen: !!touch };
+    return { seen: !!touch, took };
   }
 
   /**
@@ -567,7 +604,7 @@ class App {
     const horizontal = key === "dx";
     const sv = mainScrollView(snap, horizontal);
     if (!sv) return { ok: false, reason: `no single largest ${horizontal ? "horizontal" : "vertical"} scroll view on screen` };
-    const r = await this.native.call("Input.scroll", {
+    const r = await this.inject("Input.scroll", {
       tag: sv.tag,
       [key]: (sign * (horizontal ? sv.rect.width : sv.rect.height)) / 2,
     });
@@ -683,6 +720,7 @@ class App {
    * The node of app.snapshot() with this tag (node.tag), auto-waiting like any locator. Tags live as long as the native
    * view: tap / fill on a node React re-mounted (a new key, a screen rebuilt) or unmounted fail at once with STALE
    * (expect sees it as absent); after a JS reload every use throws STALE (tags start over). Snapshot again then.
+   * STALE's err.tag: the tag (look it up in your snapshot).
    */
   getByTag(tag) {
     // ctx: the JS context the tag belongs to (tags start over after a reload)
@@ -767,6 +805,11 @@ class Locator {
     return { index: this.index, visible: this.visible, shown: this.shown };
   }
 
+  // STALE for a getByTag locator, with its tag
+  stale(why) {
+    return new MantisError("STALE", `${this}: ${why}: take a new snapshot`, { tag: this.selector.tag });
+  }
+
   toString() {
     return (
       JSON.stringify(this.selector, (k, v) => (k === "ctx" ? undefined : v)) +
@@ -809,7 +852,7 @@ class Locator {
     if (tag != null) {
       this.app.requireDriver(String(this));
       if (ctx != null && ctx !== this.app.js.hello?.ctx)
-        throw new MantisError("STALE", `${this}: the app's JS reloaded since (tags start over): take a new snapshot`);
+        throw this.stale("the app's JS reloaded since (tags start over)");
     }
     if ((!this.visible && !this.shown) || !nodes.length) return nodes;
     const { ratios, shown } = await this.visibility(nodes);
@@ -854,7 +897,7 @@ class Locator {
       const n = await this.resolve();
       // a tag never comes back once its view is gone (filters aside: a node merely hidden may come back)
       if (!n && this.selector.tag != null && !(await this.app.js.call("Tree.query", { selector: this.selector })).count)
-        throw new MantisError("STALE", `${this}: no longer in the React tree (re-mounted or unmounted): take a new snapshot`);
+        throw this.stale("no longer in the React tree (re-mounted or unmounted)");
       if (!n) reason = "not found";
       else if (!n.visible) reason = "not visible";
       else if (!n.enabled && !force) reason = "disabled";
@@ -901,7 +944,7 @@ class Locator {
     // clipped away (removeClippedSubviews) or an outer scroll view: only the JS layout knows where it is
     const d = sc === nearest && inViewport ? (sc.horizontal ? c.dx : c.delta) : outside(sc);
     if (!d) return false; // inside the viewport, just not mounted yet
-    const r = await this.app.native.call("Input.scroll", {
+    const r = await this.app.inject("Input.scroll", {
       tag: sc.tag,
       ...(sc.horizontal ? { dx: d } : { dy: d }),
     });
@@ -916,7 +959,7 @@ class Locator {
     const timeout = opts.timeout ?? DEFAULT_TIMEOUT;
     for (let attempt = 1; ; attempt++) {
       const { node, point, iter } = await this.waitActionable(opts);
-      const touch = await this.app.tapOnce({ ...point, tag: node.tag }, timeout);
+      const { touch } = await this.app.tapOnce({ ...point, tag: node.tag }, timeout);
       if (!touch)
         throw new MantisError(
           "DELIVERED",
@@ -939,7 +982,7 @@ class Locator {
       ...opts,
       focus: true,
     });
-    if (point) await this.app.native.call("Input.tap", point);
+    if (point) await this.app.inject("Input.tap", point);
     else await this.app.native.call("Input.focus", { tag: node.tag });
     const deadline = performance.now() + (opts.timeout ?? DEFAULT_TIMEOUT);
     for (;;) {

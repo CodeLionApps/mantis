@@ -99,6 +99,7 @@ const nativeTexts = new Map(); // tag -> an input's native text
 let secretAsked = []; // the secret tags of the last Layout.visibility
 const typed = []; // their text
 let twice = false; // JS sees two touches for one tap (e.g. a late one of an earlier tap)
+let oldAgent = false; // a native agent from before Input.tap reported took
 const URL = "ws://127.0.0.1:9199";
 const NodeWS = global.WebSocket; // the JS agent's gets replaced below
 const hello = (role, extra = {}) =>
@@ -114,7 +115,7 @@ function checkContract() {
   const called = new Set(
     [src("src/runner/index.js"), src("src/detox/index.js")]
       .join("\n")
-      .match(/native\.call\(\s*"[^"]+"/g)
+      .match(/(?:native\.call|inject)\(\s*"[^"]+"/g)
       .map((m) => m.match(/"([^"]+)"/)[1]),
   );
   const ios = src("ios/MantisAgent.m");
@@ -127,6 +128,17 @@ function checkContract() {
   assert(ios.includes(`@"v": @${PROTOCOL}`), "iOS agent PROTOCOL");
   assert(android.includes(`put("v", ${PROTOCOL})`), "Android agent PROTOCOL");
   assert(src("src/agent/index.js").includes(`const PROTOCOL = ${PROTOCOL};`), "JS agent PROTOCOL");
+  // the shipped types declare every export (the ones no app needs aside)
+  for (const [mod, dtsPath, internal] of [
+    ["./runner", "src/runner/index.d.ts", []],
+    ["./device", "src/device/index.d.ts", ["detoxDevice", "requireDetox"]],
+    ["../metro", "metro.d.ts", []],
+  ]) {
+    const dts = src(dtsPath);
+    for (const name of Object.keys(require(mod)))
+      if (!internal.includes(name))
+        assert(new RegExp(`export (declare )?(class|function|const) ${name}\\b`).test(dts), `${dtsPath} lacks ${name}`);
+  }
 }
 
 // Cabled iPhone: the runner dials the agents through usbmuxd. A fake usbmuxd on a unix socket answers ListDevices and
@@ -296,7 +308,7 @@ async function checkUsbmux() {
         ...(params.secret && (secretAsked = params.secret) && {}),
       }),
       "Action.check": () => checks.get(params.tag)?.() ?? { ok: true, point: { x: params.tag, y: 0 } },
-      "Input.scroll": () => (scrolled.push(params), onScroll(params), { ok: true }),
+      "Input.scroll": () => (scrolled.push(params), onScroll(params), { ok: true, from: { x: 200, y: 400 }, to: { x: 200, y: 400 - (params.dy ?? 0) } }),
       "Input.typeText": () =>
         typeable-- > 0 ? (typed.push(params.text), { ok: true, focusedTag: params.tags?.[0] }) : { ok: false, reason: "focused: null" },
       "Input.hideKeyboard": () => ({ ok: true }),
@@ -307,7 +319,7 @@ async function checkUsbmux() {
           touchStart({ nativeEvent: { target: drop > 0 ? -1 : params.x } });
         if (twice) touchStart({ nativeEvent: { target: params.x } });
         drop = Math.max(0, drop - 1);
-        return { ok: true };
+        return oldAgent ? { ok: true } : { ok: true, took: params.x }; // the fake's hit-test: the tag is the x
       },
     }[method]();
     if (result === undefined) return; // a stalled main thread doesn't answer
@@ -385,12 +397,38 @@ async function checkUsbmux() {
 
   // a point in screen dp: settled, the touch JS saw attributed like a locator's tap; never under a system window or keyboard
   taps.length = 0;
-  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true });
+  const touches = [];
+  app.on("touch", (t) => touches.push(t));
+  const sure = { seen: true, took: tagOf(minus) };
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
+  const [touch] = touches;
+  assert.deepEqual({ ...touch, start: 0, end: 0 }, { type: "tap", x: tagOf(minus), y: 5, dx: 0, dy: 0, start: 0, end: 0 });
+  assert(touch.start <= touch.end);
+  // a listener that throws doesn't fail the tap (the touch happened); its error is uncaught, as Node's
+  let uncaught;
+  process.once("uncaughtException", (e) => (uncaught = e));
+  const boom = () => {
+    throw new Error("listener bug");
+  };
+  app.on("touch", boom);
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
+  app.off("touch", boom);
+  assert.equal(uncaught?.message, "listener bug");
+  assert.equal(touches.length, 2);
   drop = 1; // landed on a view React had replaced: nothing pressed, and something else may be there now: no second tap
-  await assert.rejects(app.touchscreen.tap(tagOf(minus), 5), { code: "STALE", name: "MantisError" });
-  assert.equal(taps.length, 2);
+  await assert.rejects(app.touchscreen.tap(tagOf(minus), 5), { code: "STALE", name: "MantisError", tag: tagOf(minus) });
+  assert.equal(taps.length, 3);
+  // an agent that doesn't report took: null, and no "tag null" in the message
+  oldAgent = true;
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true, took: null });
+  drop = 1;
+  await assert.rejects(app.touchscreen.tap(tagOf(minus), 5), (e) => e.code === "STALE" && e.tag === null && !/tag null/.test(e.message));
+  oldAgent = false;
   silent = true; // unknown: a native view took it, or JS is busy
-  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5, { timeout: 100 }), { seen: false });
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5, { timeout: 100 }), { seen: false, took: tagOf(minus) });
+  const unseen = performance.now(); // timeout 0: only the settle, no waiting for JS
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5, { timeout: 0 }), { seen: false, took: tagOf(minus) });
+  assert(performance.now() - unseen < 100);
   silent = false;
   keyboard = { x: 0, y: 500, width: 400, height: 300 };
   await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /on the keyboard/ });
@@ -400,13 +438,13 @@ async function checkUsbmux() {
   await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /not focused/ });
   assert(performance.now() - covered >= 300); // waited for focus first (a window that just opened)
   setTimeout(() => (alert = null), 100); // focus arrives (Android: a Modal's Dialog, ~130 ms after it shows)
-  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true });
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
   alert = { ok: false };
   app.platform = "ios";
-  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true });
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
   app.platform = "android";
   alert = null;
-  assert.equal(taps.length, 5);
+  assert.equal(taps.length, 9);
   assert.equal(app.tapAt, undefined); // one API: touchscreen / keyboard
 
   // keyboard.type: one character per Input.typeText into the focused field; partial failure is DELIVERED
@@ -434,7 +472,7 @@ async function checkUsbmux() {
   const minusByTag = app.getByTag(tagOf(minus));
   const ctx = app.js.hello.ctx;
   app.js.hello.ctx = "reloaded";
-  await assert.rejects(minusByTag.tap({ force: true }), { code: "STALE", message: /reloaded/ });
+  await assert.rejects(minusByTag.tap({ force: true }), { code: "STALE", message: /reloaded/, tag: tagOf(minus) });
   await assert.rejects(expect(minusByTag).toBeAttached(), { code: "STALE" });
   app.js.hello.ctx = ctx;
   // an app built with an older Mantis: its JS agent can't match tags
@@ -590,11 +628,13 @@ async function checkUsbmux() {
   assert.deepEqual(scrolled, [{ tag: tagOf(page), dy: 650 }, { tag: tagOf(shelf), dx: 740 }]);
   // getByTag: a node gone from the tree fails at once, not after the auto-wait
   const stale = performance.now();
-  await assert.rejects(app.getByTag(99999).tap(), { code: "STALE" }); // (the fake keeps every root it saw: no unmounts)
+  await assert.rejects(app.getByTag(99999).tap(), { code: "STALE", tag: 99999 }); // (the fake keeps every root it saw: no unmounts)
   assert(performance.now() - stale < 100);
   // app.scroll(direction): the main scroll view of that axis, half its size
   scrolled.length = 0;
   assert.deepEqual(await app.scroll("down"), { ok: true, tag: tagOf(page), moved: true });
+  // the drag's "touch" event: where the finger went down and how far it moved
+  assert.deepEqual({ ...touches.at(-1), start: 0, end: 0 }, { type: "drag", x: 200, y: 400, dx: 0, dy: -400, start: 0, end: 0 });
   assert.deepEqual(await app.scroll("left"), { ok: true, tag: tagOf(shelf), moved: true });
   assert.deepEqual(scrolled, [{ tag: tagOf(page), dy: 400 }, { tag: tagOf(shelf), dx: -200 }]);
   keyboard = { x: 0, y: 500, width: 400, height: 300 };
