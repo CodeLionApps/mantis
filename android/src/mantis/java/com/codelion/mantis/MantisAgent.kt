@@ -6,6 +6,7 @@ import android.content.Context
 import android.graphics.Rect
 import android.graphics.RectF
 import android.graphics.drawable.Animatable
+import android.graphics.drawable.Drawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -592,22 +593,25 @@ object MantisAgent {
   }
 
   /**
-   * The first view in [v] showing a running Animatable drawable, for the draw clock: an AnimatedVectorDrawable (an
-   * indeterminate ProgressBar, i.e. RN's ActivityIndicator) animates on the RenderThread, so no draw listener fires.
-   * Only one a user sees, as on iOS: shown, not transparent itself or through an ancestor (a loading overlay faded out
-   * but mounted), some part on screen.
+   * The first view in [v] (a shown window root) with a running Animatable drawable, for the draw clock: an
+   * AnimatedVectorDrawable (an indeterminate ProgressBar, i.e. RN's ActivityIndicator) animates on the RenderThread,
+   * so no draw listener fires. As on iOS, not one that is visible = GONE / INVISIBLE, transparent itself or through an
+   * ancestor (a loading overlay faded out but mounted), or entirely off screen. ponytail: one covered by another view
+   * still counts (no occlusion check, iOS neither). Runs on every ping: no allocation until one is found.
    */
   private fun animating(v: View): String? {
-    if (!v.isShown || v.alpha < 0.01f) return null
-    val own = listOfNotNull((v as? ProgressBar)?.takeIf { it.isIndeterminate }?.indeterminateDrawable, (v as? ImageView)?.drawable,
-      v.background, if (Build.VERSION.SDK_INT >= 23) v.foreground else null)
-    own.firstOrNull { it is Animatable && it.isRunning }?.let {
-      if (visibleRatio(v) > 0)
-        return "${v.javaClass.simpleName} tag ${v.id} animating ${it.javaClass.simpleName}" + if (v is ProgressBar) " in a loop" else ""
-    }
+    if (v.visibility != View.VISIBLE || v.alpha < 0.01f) return null
+    val d = running((v as? ProgressBar)?.takeIf { it.isIndeterminate }?.indeterminateDrawable)
+      ?: running((v as? ImageView)?.drawable) ?: running(v.background) ?: running(v.foreground)
+    // the view's React tag: its own, else its nearest tagged ancestor's (RN's ProgressBar sits in a tagged container)
+    if (d != null && visibleRatio(v) > 0)
+      return "${v.javaClass.simpleName} tag ${ancestorTags(v).opt(0)} animating ${d.javaClass.simpleName}" +
+        if (v is ProgressBar) " in a loop" else ""
     if (v is ViewGroup) for (i in 0 until v.childCount) animating(v.getChildAt(i))?.let { return it }
     return null
   }
+
+  private fun running(d: Drawable?) = d?.takeIf { it is Animatable && it.isRunning }
 
   private val drawWatched = java.util.WeakHashMap<View, Boolean>()
   private var draws = 0
