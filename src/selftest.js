@@ -129,6 +129,108 @@ function checkContract() {
   assert(src("src/agent/index.js").includes(`const PROTOCOL = ${PROTOCOL};`), "JS agent PROTOCOL");
 }
 
+// Cabled iPhone: the runner dials the agents through usbmuxd. A fake usbmuxd on a unix socket answers ListDevices and
+// Connect (checking the port's byte order) and hands each tunnel to a fake phone: Runner.attach -> Agent.hello.
+async function checkUsbmux() {
+  const { isIosDevice } = require("./device");
+  for (const [deviceId, phone] of [
+    ["00001111-2222333344445555", true],
+    ["0123456789abcdef0123456789abcdef01234567", true],
+    ["11111111-2222-3333-4444-555555555555", false], // a simulator (and devicectl's identifier)
+    ["booted", false],
+    [undefined, false],
+  ])
+    assert.equal(isIosDevice({ platform: "ios", deviceId }), phone, String(deviceId));
+  assert.equal(isIosDevice({ platform: "android", deviceId: "00001111-2222333344445555" }), false);
+
+  const http = require("node:http");
+  const { WebSocketServer } = require("ws");
+  const usbmux = require("./runner/usbmux");
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const udid = "00001111-2222333344445555";
+  const port = 47213;
+  const frame = (dict) => {
+    const body = Buffer.from(`<?xml version="1.0"?><plist version="1.0"><dict>${dict}</dict></plist>`);
+    const head = Buffer.alloc(16);
+    head.writeUInt32LE(16 + body.length, 0);
+    head.writeUInt32LE(1, 4);
+    head.writeUInt32LE(8, 8);
+    return Buffer.concat([head, body]);
+  };
+  const props = (id, type) =>
+    `<dict><key>DeviceID</key><integer>${id}</integer><key>MessageType</key><string>Attached</string>` +
+    `<key>Properties</key><dict><key>ConnectionType</key><string>${type}</string><key>DeviceID</key>` +
+    `<integer>${id}</integer><key>EscapedFullServiceName</key><data>AAEC</data>` +
+    `<key>SerialNumber</key><string>${udid.replace("-", "")}</string></dict></dict>`;
+  let listening = false; // the app on the "phone" runs and listens
+  let connects = 0;
+  const sockets = { native: [], js: [] };
+  const phone = new WebSocketServer({ noServer: true });
+  phone.on("connection", (ws) =>
+    ws.on("message", (data) => {
+      const msg = JSON.parse(data);
+      if (msg.method === "Runner.attach") {
+        sockets[msg.params.role].push(ws);
+        const hello = { role: msg.params.role, platform: "ios", v: PROTOCOL, token: msg.params.token, ctx: "c" };
+        return ws.send(JSON.stringify({ method: "Agent.hello", params: hello }));
+      }
+      if (msg.method === "Layout.visibility") ws.send(JSON.stringify({ id: msg.id, result: { appState: 0, focused: true } }));
+      // "Hang": never answers
+    }),
+  );
+  const tunnels = http.createServer();
+  tunnels.on("upgrade", (req, sock, head) => phone.handleUpgrade(req, sock, head, (ws) => phone.emit("connection", ws)));
+  const sockPath = path.join(fs.mkdtempSync(path.join(os.tmpdir(), "mantis-")), "usbmuxd");
+  const fake = net.createServer((sock) => {
+    let buf = Buffer.alloc(0);
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (buf.length < 16 || buf.length < buf.readUInt32LE(0)) return;
+      const req = buf.subarray(16, buf.readUInt32LE(0)).toString();
+      const type = /<key>MessageType<\/key><string>(\w+)</.exec(req)[1];
+      if (type === "ListDevices")
+        return sock.end(frame(`<key>DeviceList</key><array>${props(3, "Network")}${props(7, "USB")}</array>`));
+      assert.equal(type, "Connect");
+      assert.match(req, /<key>DeviceID<\/key><integer>7</); // the USB one, not the Wi-Fi sync entry
+      const swapped = Number(/<key>PortNumber<\/key><integer>(\d+)</.exec(req)[1]);
+      assert.equal(swapped, ((port & 0xff) << 8) | (port >> 8)); // network byte order
+      connects++;
+      sock.off("data", onData);
+      sock.write(frame(`<key>MessageType</key><string>Result</string><key>Number</key><integer>${listening ? 0 : 3}</integer>`));
+      if (listening) tunnels.emit("connection", sock);
+      else sock.end();
+    };
+    sock.on("data", onData);
+  });
+  await new Promise((r) => fake.listen(sockPath, r));
+  usbmux.socket = sockPath;
+
+  await assert.rejects(new App(port, "ios", { usb: "ffffffff-ffffffffffffffff" }).start(), /no iPhone/);
+  const app = new App(port, "ios", { usb: udid });
+  await app.start();
+  await app.relaunch(async () => (listening = true));
+  assert(app.native.connected && app.js.connected);
+  // the native leg drops (app killed, cable out): the call in flight fails at once, the runner redials
+  const hang = app.native.call("Hang");
+  sockets.native[0].terminate();
+  await assert.rejects(hang, { code: "DISCONNECTED" });
+  await app.native.ready(2000);
+  assert.equal(sockets.native.length, 2);
+  // a close() and start() in quick succession: one dial loop per leg, not two
+  await app.close();
+  await app.start();
+  await app.native.ready(2000);
+  await sleep(2200); // past the 2 s backoff of a leg that closed without an accepted hello
+  assert.equal(phone.clients.size, 2); // a native and a JS leg, and nothing redials
+  const before = connects;
+  await app.close();
+  for (const ws of phone.clients) ws.terminate();
+  listening = false;
+  await sleep(200);
+  assert.equal(connects, before); // closed: nothing dials
+  fake.close();
+}
+
 (async () => {
   checkContract();
 
@@ -627,6 +729,7 @@ function checkContract() {
   const traced = fs.readFileSync(traceFile, "utf8");
   assert.match(traced, /Input\.typeText/);
   assert.doesNotMatch(traced, /hunter2/);
+  await checkUsbmux();
   console.log("mantis selftest: ok");
   native.close();
   await app.close();

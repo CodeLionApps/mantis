@@ -274,34 +274,41 @@ class App {
   // agent answers the native leg itself and relays the JS agent on the JS leg. Redialed whenever it drops (app
   // relaunched or not started yet, cable out: calls in flight fail with DISCONNECTED), until close().
   async #dial() {
-    this.legs = new Set();
+    const legs = (this.legs = new Set()); // a close() and start() in between must not leave this loop running
     // fail early on a wrong UDID or an iPhone that isn't cabled; later dials just retry
     await usbmux.deviceId(this.usb);
     const leg = async (peer) => {
       let last;
-      while (this.legs) {
+      while (this.legs === legs) {
+        let wait = 50; // ponytail: fixed 50 ms; a refused connect (the app isn't listening yet) costs ~1 ms on the Mac
         try {
           const sock = await usbmux.connect(this.usb, this.port);
-          if (!this.legs) {
+          if (this.legs !== legs) {
             sock.destroy();
             break;
           }
           const ws = new WebSocket(`ws://127.0.0.1:${this.port}/`, { createConnection: () => sock });
-          this.legs.add(ws);
+          legs.add(ws);
           ws.once("open", () =>
             ws.send(JSON.stringify({ method: "Runner.attach", params: { role: peer.role, token: this.token } })),
           );
           peer.attach(ws);
           await new Promise((r) => ws.once("close", r));
-          this.legs?.delete(ws);
+          legs.delete(ws);
+          // closed before an accepted hello: an app launched by someone else (another token), another platform's or
+          // version's agent, or no JS agent within the hello timeout. Don't hammer it.
+          if (peer.ws !== ws) {
+            wait = 2000;
+            if (last !== "no hello") trace({ event: "usbmux leg closed without an accepted hello", role: peer.role });
+            last = "no hello";
+          }
         } catch (e) {
           // refused (result 3) while the app isn't listening is the normal wait; trace anything else once
           if (e.result === undefined && e.message !== last)
             trace({ event: "usbmux error", role: peer.role, message: e.message });
           last = e.message;
         }
-        // ponytail: fixed 50 ms; a refused connect costs ~1 ms on the Mac
-        await sleep(50);
+        await sleep(wait);
       }
     };
     leg(this.native);
@@ -347,12 +354,16 @@ class App {
           "reachable from the device (Android: adb reverse; iPhone: cabled, launched with app.launchArgs)?",
       );
     }
+    timing("launch:agents", t0, t0);
     // A cabled iPhone's agents connect ~0.4 s before the app is active (its launch animation; a simulator's app is
     // active by then), and until then back / point taps / scroll report a system window in front. Wait for it, but not
     // for an alert that keeps it inactive. ponytail: fixed 1 s ceiling
-    for (const end = performance.now() + 1000; this.usb && performance.now() < end; await sleep(20))
-      if ((await this.native.call("Layout.visibility", { tags: [], hit: true })).appState === 0) break;
-    timing("launch:agents", t0, t0);
+    if (!this.usb) return;
+    let state;
+    for (const end = performance.now() + 1000; performance.now() < end; await sleep(20))
+      if ((state = (await this.native.call("Layout.visibility", { tags: [], hit: true })).appState) === 0) break;
+    if (state !== 0) trace({ event: "launch: app not active after 1000ms", appState: state });
+    timing(state === 0 ? "launch:active" : "launch:inactive", t0, t0);
   }
 
   /** Runs a JS reload (Detox device.reloadReactNative) and waits until the new JS context's agent said hello. */

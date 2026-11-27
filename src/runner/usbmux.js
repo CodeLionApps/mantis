@@ -2,7 +2,6 @@
 // Each message: 16-byte header (total length, version 1, type 8 = plist, tag), then an XML plist.
 const net = require("node:net");
 
-const SOCKET = "/var/run/usbmuxd";
 
 const plist = (msg) =>
   '<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict>' +
@@ -38,7 +37,7 @@ const reply = (sock) =>
 
 const open = () =>
   new Promise((resolve, reject) => {
-    const sock = net.connect(SOCKET, () => resolve(sock)).once("error", reject);
+    const sock = net.connect(usbmux.socket, () => resolve(sock)).once("error", reject);
   });
 
 /**
@@ -80,4 +79,6 @@ async function connect(udid, port) {
   return sock;
 }
 
-module.exports = { connect, deviceId };
+// socket: usbmuxd's, replaceable for a test (src/selftest.js runs a fake one)
+const usbmux = { socket: "/var/run/usbmuxd", connect, deviceId };
+module.exports = usbmux;

@@ -39,10 +39,9 @@ function target({ platform, deviceId } = {}) {
 }
 const adb = (t, ...args) => run("adb", "-s", t.deviceId, ...args);
 const isIos = (t) => t.platform === "ios";
-// ponytail: by the id's shape. Simulator UDIDs are UUIDs; an iPhone's hardware UDID is 8-16 or 40 hex digits (what
-// usbmuxd knows it by; devicectl's CoreDevice identifier looks like a simulator's, so pass the hardware UDID).
-const isIosDevice = (t) =>
-  isIos(t) && !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t.deviceId);
+// By the id's shape: an iPhone's hardware UDID is 8-16 hex digits (2018 on) or 40 (older), what usbmuxd knows it by.
+// Simulator UDIDs and devicectl's CoreDevice identifiers are UUIDs: not a cabled iPhone.
+const isIosDevice = (t) => isIos(t) && /^([0-9a-f]{8}-[0-9a-f]{16}|[0-9a-f]{40})$/i.test(t.deviceId ?? "");
 
 let cachedAppId;
 /** App id: opts.appId, else MANTIS_APP_ID, else the Detox app config. */

@@ -273,6 +273,7 @@ static id mantisToken(void) {
   nw_protocol_stack_prepend_application_protocol(nw_parameters_copy_default_protocol_stack(params), nw_ws_create_options(nw_ws_version_13));
   NSString *port = [NSString stringWithFormat:@"%ld", (long)mantisPort()];
   nw_parameters_set_local_endpoint(params, nw_endpoint_create_host("127.0.0.1", port.UTF8String));
+  nw_parameters_set_required_interface_type(params, nw_interface_type_loopback);
   nw_parameters_set_reuse_local_address(params, true); // a relaunch rebinds while the last process's sockets linger
   _listener = nw_listener_create(params);
   nw_listener_set_queue(_listener, dispatch_get_main_queue());
@@ -283,6 +284,10 @@ static id mantisToken(void) {
     });
     nw_connection_start(c);
     [self read:c];
+    // a connection that doesn't say what it is (frame:) within 5 s is not ours
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+      if (c != self->_native && c != self->_runnerJs && c != self->_js) nw_connection_cancel(c);
+    });
   });
   nw_listener_set_state_changed_handler(_listener, ^(nw_listener_state_t s, nw_error_t e) {
     if (s == nw_listener_state_failed) NSLog(@"[Mantis] listener on port %@ failed: %@", port, e);
@@ -306,6 +311,13 @@ static id mantisToken(void) {
   nw_connection_send(c, data, ctx, true, ^(nw_error_t e) {});
 }
 
+// constant time: a wrong guess doesn't learn how many leading characters matched
+static BOOL sameToken(id t) {
+  NSData *a = [t isKindOfClass:NSString.class] ? [t dataUsingEncoding:NSUTF8StringEncoding] : nil;
+  NSData *b = [mantisToken() dataUsingEncoding:NSUTF8StringEncoding]; // listen: never without a token
+  return a && b && a.length == b.length && timingsafe_bcmp(a.bytes, b.bytes, a.length) == 0;
+}
+
 // A connection says what it is in its first frame: the runner's Runner.attach {role, token} or the JS agent's hello.
 // Both carry the token of this launch, so another app on the phone (it can reach loopback too) can't take a leg.
 - (void)frame:(NSData *)d from:(nw_connection_t)c {
@@ -317,7 +329,7 @@ static id mantisToken(void) {
   }
   id msg = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
   NSDictionary *p = [msg isKindOfClass:NSDictionary.class] && [msg[@"params"] isKindOfClass:NSDictionary.class] ? msg[@"params"] : nil;
-  if (![p[@"token"] isEqual:mantisToken()]) return nw_connection_cancel(c);
+  if (!sameToken(p[@"token"])) return nw_connection_cancel(c);
   BOOL attach = [msg[@"method"] isEqual:@"Runner.attach"], hello = [msg[@"method"] isEqual:@"Agent.hello"];
   // a connection replaced by a newer one of the same kind is cancelled after the swap, so dropped: ignores it
   nw_connection_t old = nil;
