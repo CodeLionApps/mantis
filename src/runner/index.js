@@ -9,7 +9,9 @@ const usbmux = require("./usbmux");
 
 // Host port. iOS agents dial it directly (launch arg mantisPort, which src/detox adds); Android agents always dial
 // 9123 on the device and adb reverse maps that to this port (see src/device). One port per Jest worker, so parallel
-// workers (one device each) don't collide: MANTIS_PORT is the first worker's.
+// workers (one device each) don't collide: MANTIS_PORT is the first worker's. An Android runner given no port (and no
+// MANTIS_PORT) takes a free one instead: with two devices on one host, a Mantis app on the other device (an adb reverse
+// left from an earlier run) would otherwise reach this runner.
 const PORT =
   (Number(process.env.MANTIS_PORT) || 9123) +
   (Number(process.env.JEST_WORKER_ID) || 1) -
@@ -253,10 +255,13 @@ class Peer {
  * have happened), or an agent too old to report a drag's points.
  */
 class App extends EventEmitter {
-  /** usb: hardware UDID of a cabled iPhone: its agents listen on the phone, the runner dials them through usbmuxd. */
-  constructor(port = PORT, platform = "android", { usb } = {}) {
+  /**
+   * usb: hardware UDID of a cabled iPhone: its agents listen on the phone, the runner dials them through usbmuxd.
+   * port left out: PORT, but on Android without MANTIS_PORT a free port the OS picks; app.port has it after start().
+   */
+  constructor(port, platform = "android", { usb } = {}) {
     super();
-    this.port = port;
+    this.port = port ?? (platform === "android" && !process.env.MANTIS_PORT ? 0 : PORT);
     this.usb = usb;
     this.platform = platform;
     this.token = randomUUID();
@@ -299,7 +304,10 @@ class App extends EventEmitter {
       peer.attach(ws);
     });
     return new Promise((resolve, reject) => {
-      this.wss.once("listening", resolve);
+      this.wss.once("listening", () => {
+        this.port = this.wss.address().port; // port 0: the one the OS picked
+        resolve();
+      });
       this.wss.once("error", reject);
     });
   }
@@ -1130,7 +1138,7 @@ function expect(locator, negate = false) {
 function setupMantis(target = {}) {
   const device = require("../device");
   const { platform, deviceId } = device.target(target);
-  const app = new App(PORT, platform, { usb: device.isIosDevice({ platform, deviceId }) ? deviceId : undefined });
+  const app = new App(undefined, platform, { usb: device.isIosDevice({ platform, deviceId }) ? deviceId : undefined });
   const before = global.beforeAll ?? global.before;
   const after = global.afterAll ?? global.after;
   if (!before || !after)

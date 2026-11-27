@@ -26,6 +26,8 @@ commits, PRs or issues.
 - `npm test`: runner and query engine against fakes, no device.
 - Device, from `example/`: `npm run e2e:build:android` (or `:ios`), then `npm run e2e:android` (or `:ios`) for the
   Detox layer, and `node --test --test-concurrency=1 e2e/*.mantis.js` for the runner API.
-- The runner listens on host port 9123: only one Mantis app may be connected per host. Stop any other Mantis build
-  (and its `adb reverse`) before running the example, and run the `*.mantis.js` files one at a time.
+- The device side is fixed: Android agents dial 9123 on the device (a free host port behind `adb reverse`), iOS
+  simulators the host's 9123, a cabled iPhone listens on 9123. So one Mantis app per device, and per host for iOS
+  simulators. Stop any other Mantis build on the target before running the example, and run the `*.mantis.js` files
+  one at a time.
 - A change on one platform: check the other one too, or say in the PR that it is untested there.
