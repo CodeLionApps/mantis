@@ -188,7 +188,7 @@ export declare class App extends EventEmitter {
   getByTestId(testId: string): Locator;
   getByTag(tag: number): Locator;
   getByPlaceholder(text: TextMatch, opts?: { exact?: boolean }): Locator;
-  /** Raw RPC to the native agent, e.g. call("Page.screenshot") on iOS. */
+  /** Raw RPC to the native agent, e.g. call("Page.screenshot", { scale }) (README: { png, windows, fallbacks }). */
   readonly native: { call(method: string, params?: object): Promise<any> };
 
   on(event: "touch", listener: (touch: TouchEvent) => void): this;
