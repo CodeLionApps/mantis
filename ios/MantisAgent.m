@@ -209,10 +209,8 @@ static MantisAgent *shared;
   NSString *url = [NSString stringWithFormat:@"ws://localhost:%ld/?role=native", (long)port];
   _ws = [NSURLSession.sharedSession webSocketTaskWithURL:[NSURL URLWithString:url]];
   [_ws resume];
-  // v: src/runner PROTOCOL; token: proves to the runner that it launched this app (simulators share localhost);
-  // density: px per point, for the runner's touch events
-  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @2, @"token": token,
-                                                       @"density": @(UIScreen.mainScreen.scale)}}];
+  // v: src/runner PROTOCOL; token: proves to the runner that it launched this app (simulators share localhost)
+  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @2, @"token": token}}];
   [self receive];
 }
 

@@ -60,10 +60,14 @@
     "ws": "^8.18.0"
   },
   "peerDependencies": {
+    "@types/node": "*",
     "detox": ">=20",
     "react-native": ">=0.76"
   },
   "peerDependenciesMeta": {
+    "@types/node": {
+      "optional": true
+    },
     "detox": {
       "optional": true
     },

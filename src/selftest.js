@@ -99,6 +99,7 @@ const nativeTexts = new Map(); // tag -> an input's native text
 let secretAsked = []; // the secret tags of the last Layout.visibility
 const typed = []; // their text
 let twice = false; // JS sees two touches for one tap (e.g. a late one of an earlier tap)
+let oldAgent = false; // a native agent from before Input.tap reported took
 const URL = "ws://127.0.0.1:9199";
 const NodeWS = global.WebSocket; // the JS agent's gets replaced below
 const hello = (role, extra = {}) =>
@@ -216,7 +217,7 @@ function checkContract() {
           touchStart({ nativeEvent: { target: drop > 0 ? -1 : params.x } });
         if (twice) touchStart({ nativeEvent: { target: params.x } });
         drop = Math.max(0, drop - 1);
-        return { ok: true, took: params.x }; // the fake's hit-test: the tag is the x
+        return oldAgent ? { ok: true } : { ok: true, took: params.x }; // the fake's hit-test: the tag is the x
       },
     }[method]();
     if (result === undefined) return; // a stalled main thread doesn't answer
@@ -224,7 +225,7 @@ function checkContract() {
   };
   const connectNative = () => {
     const native = new NodeWS(`${URL}/?role=native`);
-    native.onopen = () => native.send(hello("native", { density: 2 }));
+    native.onopen = () => native.send(hello("native"));
     native.onmessage = nativeHandler(native);
     return native;
   };
@@ -296,16 +297,31 @@ function checkContract() {
   taps.length = 0;
   const touches = [];
   app.on("touch", (t) => touches.push(t));
-  const { nodes: seenNodes } = await app.snapshot(); // STALE's err.node comes from the last snapshot
-  const minusNode = seenNodes.find((n) => n.testID === "minus");
   const sure = { seen: true, took: tagOf(minus) };
   assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
   const [touch] = touches;
-  assert.deepEqual({ ...touch, start: 0, end: 0 }, { type: "tap", x: tagOf(minus), y: 5, dx: 0, dy: 0, start: 0, end: 0, density: 2 });
+  assert.deepEqual({ ...touch, start: 0, end: 0 }, { type: "tap", x: tagOf(minus), y: 5, dx: 0, dy: 0, start: 0, end: 0 });
   assert(touch.start <= touch.end);
+  // a listener that throws doesn't fail the tap (the touch happened); its error is uncaught, as Node's
+  let uncaught;
+  process.once("uncaughtException", (e) => (uncaught = e));
+  const boom = () => {
+    throw new Error("listener bug");
+  };
+  app.on("touch", boom);
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
+  app.off("touch", boom);
+  assert.equal(uncaught?.message, "listener bug");
+  assert.equal(touches.length, 2);
   drop = 1; // landed on a view React had replaced: nothing pressed, and something else may be there now: no second tap
-  await assert.rejects(app.touchscreen.tap(tagOf(minus), 5), { code: "STALE", name: "MantisError", tag: tagOf(minus), node: minusNode });
-  assert.equal(taps.length, 2);
+  await assert.rejects(app.touchscreen.tap(tagOf(minus), 5), { code: "STALE", name: "MantisError", tag: tagOf(minus) });
+  assert.equal(taps.length, 3);
+  // an agent that doesn't report took: null, and no "tag null" in the message
+  oldAgent = true;
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true, took: null });
+  drop = 1;
+  await assert.rejects(app.touchscreen.tap(tagOf(minus), 5), (e) => e.code === "STALE" && e.tag === null && !/tag null/.test(e.message));
+  oldAgent = false;
   silent = true; // unknown: a native view took it, or JS is busy
   assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5, { timeout: 100 }), { seen: false, took: tagOf(minus) });
   const unseen = performance.now(); // timeout 0: only the settle, no waiting for JS
@@ -326,7 +342,7 @@ function checkContract() {
   assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
   app.platform = "android";
   alert = null;
-  assert.equal(taps.length, 6);
+  assert.equal(taps.length, 9);
   assert.equal(app.tapAt, undefined); // one API: touchscreen / keyboard
 
   // keyboard.type: one character per Input.typeText into the focused field; partial failure is DELIVERED
@@ -354,8 +370,7 @@ function checkContract() {
   const minusByTag = app.getByTag(tagOf(minus));
   const ctx = app.js.hello.ctx;
   app.js.hello.ctx = "reloaded";
-  // err.node: the node as the last snapshot before getByTag had it, to find it again by
-  await assert.rejects(minusByTag.tap({ force: true }), { code: "STALE", message: /reloaded/, tag: tagOf(minus), node: minusNode });
+  await assert.rejects(minusByTag.tap({ force: true }), { code: "STALE", message: /reloaded/, tag: tagOf(minus) });
   await assert.rejects(expect(minusByTag).toBeAttached(), { code: "STALE" });
   app.js.hello.ctx = ctx;
   // an app built with an older Mantis: its JS agent can't match tags
@@ -511,13 +526,13 @@ function checkContract() {
   assert.deepEqual(scrolled, [{ tag: tagOf(page), dy: 650 }, { tag: tagOf(shelf), dx: 740 }]);
   // getByTag: a node gone from the tree fails at once, not after the auto-wait
   const stale = performance.now();
-  await assert.rejects(app.getByTag(99999).tap(), { code: "STALE", tag: 99999, node: null }); // (the fake keeps every root it saw: no unmounts)
+  await assert.rejects(app.getByTag(99999).tap(), { code: "STALE", tag: 99999 }); // (the fake keeps every root it saw: no unmounts)
   assert(performance.now() - stale < 100);
   // app.scroll(direction): the main scroll view of that axis, half its size
   scrolled.length = 0;
   assert.deepEqual(await app.scroll("down"), { ok: true, tag: tagOf(page), moved: true });
   // the drag's "touch" event: where the finger went down and how far it moved
-  assert.deepEqual({ ...touches.at(-1), start: 0, end: 0 }, { type: "drag", x: 200, y: 400, dx: 0, dy: -400, start: 0, end: 0, density: 2 });
+  assert.deepEqual({ ...touches.at(-1), start: 0, end: 0 }, { type: "drag", x: 200, y: 400, dx: 0, dy: -400, start: 0, end: 0 });
   assert.deepEqual(await app.scroll("left"), { ok: true, tag: tagOf(shelf), moved: true });
   assert.deepEqual(scrolled, [{ tag: tagOf(page), dy: 400 }, { tag: tagOf(shelf), dx: -200 }]);
   keyboard = { x: 0, y: 500, width: 400, height: 300 };

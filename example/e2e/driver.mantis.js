@@ -34,10 +34,10 @@ test('snapshot nodes: getByTag, a point tap, a stale tag', async () => {
   // took: the view the native hit-test found under the point, the text itself
   assert.deepEqual(await app.touchscreen.tap(...centre(node)), { seen: true, took: node.tag });
   await expect(app.getByText('Licznik: 2')).toBeVisible();
-  // the screen unmounted and mounted again: its views have new tags; the error says what the node was
+  // the screen unmounted and mounted again: its views have new tags; the error says which
   await app.getByText('Wstecz').tap();
   await app.getByText('Licznik').tap();
-  await assert.rejects(app.getByTag(button.tag).tap(), { code: 'STALE', tag: button.tag, node: button });
+  await assert.rejects(app.getByTag(button.tag).tap(), { code: 'STALE', tag: button.tag });
 });
 
 test('keyboard.type into the focused field, a key event per character; nothing focused: NOT_FOCUSED', async () => {
@@ -110,7 +110,7 @@ test('touch events: every touch Mantis injects, in screen dp', async () => {
   assert.equal(touches.length, 2);
   assert.equal(tap.type, 'tap');
   assert.deepEqual([tap.dx, tap.dy], [0, 0]);
-  assert.ok(tap.density > 1 && tap.start <= tap.end, JSON.stringify(tap));
+  assert.ok(tap.start <= tap.end, JSON.stringify(tap));
   // down reveals what is below: the finger moves up
   assert.equal(drag.type, 'drag');
   assert.ok(drag.dy < 0 && drag.dx === 0, JSON.stringify(drag));

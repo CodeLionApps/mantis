@@ -28,8 +28,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * a read-only RPC). NOT_ACTIONABLE: a tap / fill target never became actionable (reason: the last check's).
  * NOT_FOCUSED: no text field took the text. DELIVERED: the action reached the app or may have (an Input.* RPC timed out):
  * don't retry it blindly. STRICT: a locator matched several elements. STALE: what the snapshot showed is gone (a
- * getByTag node, a view under a point tap): snapshot again; err.tag / err.node say which (node: as the last snapshot
- * had it, null when it had none). COVERED: a point tap would land under a system window or the
+ * getByTag node, a view under a point tap): snapshot again; err.tag says which (null: unknown). COVERED: a point tap would land under a system window or the
  * keyboard. UNSUPPORTED: the app's agent is older than this runner. INVALID_ARGUMENT. NOT_CONNECTED: an agent didn't
  * connect in time. DISCONNECTED: it went away during a call (which may or may not have run), or is gone when idle / mark
  * ping it. AGENT_ERROR: the call threw inside the app's agent.
@@ -221,10 +220,11 @@ class Peer {
 }
 
 /**
- * Events: "touch", once for every touch Mantis injected (tap, a scroll's drag, fill's focusing tap), after it ended:
- * { type: "tap" | "drag", x, y, dx, dy, start, end, density }. x, y: where the finger went down, dx, dy: how far it
- * moved (0 for a tap), screen dp like snapshot rects; density: px per dp (null: an agent that doesn't send it);
- * start, end: Date.now() around the injection. For overlays on a screen recording.
+ * Events: "touch", once for every touch Mantis injected (tap, a scroll's drag, fill's focusing tap), once its RPC
+ * answered: { type: "tap" | "drag", x, y, dx, dy, start, end }. x, y: where the finger went down, dx, dy: how far it
+ * moved (0 for a tap), screen dp like snapshot rects (px: times snapshot().screen.density); start, end: the host's
+ * Date.now() before the RPC was sent and when it answered. None when the RPC failed or timed out (the touch may still
+ * have happened), or an agent too old to report a drag's points.
  */
 class App extends EventEmitter {
   constructor(port = PORT, platform = "android") {
@@ -235,7 +235,6 @@ class App extends EventEmitter {
     this.js = new Peer("js", platform, this.token);
     this.native = new Peer("native", platform, this.token);
     this.commitWaiters = [];
-    this.lastSnapshot = { ctx: null, nodes: new Map() }; // the last snapshot's nodes by tag, for STALE's err.node
     this.touch = { seq: 0 }; // last touch start JS saw (Input.touchStart)
     this.js.onHello = () => (this.touch = { seq: 0 }); // a new JS context counts touches from 0
     this.js.onEvent = (msg) => {
@@ -353,14 +352,15 @@ class App extends EventEmitter {
     return { touch: await this.touchAfter(seq, timeout), took };
   }
 
-  // A native Input.tap / Input.scroll, then its "touch" event (class doc) when it put a finger down.
+  // A native Input.tap / Input.scroll, then its "touch" event (class doc) when it put a finger down. Emitted in a
+  // microtask: a listener that throws can't fail the action (the touch happened); its error is uncaught, as Node's.
   async inject(method, params) {
     const start = Date.now();
     const r = await this.native.call(method, params);
     const from = method === "Input.tap" ? params : r?.from;
     if (from && r?.ok !== false && this.listenerCount("touch")) {
       const to = r.to ?? from;
-      this.emit("touch", {
+      const touch = {
         type: method === "Input.tap" ? "tap" : "drag",
         x: from.x,
         y: from.y,
@@ -368,15 +368,10 @@ class App extends EventEmitter {
         dy: to.y - from.y,
         start,
         end: Date.now(),
-        density: this.native.hello?.density ?? null,
-      });
+      };
+      queueMicrotask(() => this.emit("touch", touch));
     }
     return r;
-  }
-
-  // The last snapshot's node with this tag (null: not in it, or of another JS context), for STALE errors
-  seenNode(tag, ctx = this.js.hello?.ctx) {
-    return (this.lastSnapshot.ctx === ctx && this.lastSnapshot.nodes.get(tag)) || null;
   }
 
   /**
@@ -386,8 +381,7 @@ class App extends EventEmitter {
    * wait past settling): a native view RN doesn't handle took it (WebView, map), or JS is busy and may still handle it,
    * so tapping again may tap twice.
    * STALE: the touch reached a view React had already replaced (nothing was pressed; something else may be under the
-   * point now): snapshot again; err.tag = took, err.node = that node as the last snapshot had it. Not retried here,
-   * unlike Locator.tap, which finds its target again.
+   * point now): snapshot again; err.tag = took. Not retried here, unlike Locator.tap, which finds its target again.
    * COVERED, before tapping: the app's window has no focus (a system window or another app in front; an alert of the
    * app's own on iOS is fine, the touch is in-process) or the point is on the keyboard. The native agent injects into
    * the app's own windows, so such a tap would land in the app beneath, which no user can do.
@@ -409,8 +403,8 @@ class App extends EventEmitter {
     if (touch && !touch.mounted)
       throw new MantisError(
         "STALE",
-        `${at}: the view under the point (tag ${took}) was replaced before the touch reached it, nothing was pressed: take a new snapshot`,
-        { tag: took, node: this.seenNode(took) },
+        `${at}: the view under the point${took == null ? "" : ` (tag ${took})`} was replaced before the touch reached it, nothing was pressed: take a new snapshot`,
+        { tag: took },
       );
     timing(at, t0, t0);
     return { seen: !!touch, took };
@@ -518,7 +512,6 @@ class App extends EventEmitter {
         hit,
       });
     });
-    this.lastSnapshot = { ctx: this.js.hello?.ctx, nodes: new Map(out.map((n) => [n.tag, n])) };
     const { focused = null, keyboard = null, screen = null } = vis;
     const reasons = incompleteness(out, focused);
     return { commitId, nodes: out, focused, keyboard, screen, complete: !reasons.length, reasons };
@@ -661,12 +654,11 @@ class App extends EventEmitter {
    * The node of app.snapshot() with this tag (node.tag), auto-waiting like any locator. Tags live as long as the native
    * view: tap / fill on a node React re-mounted (a new key, a screen rebuilt) or unmounted fail at once with STALE
    * (expect sees it as absent); after a JS reload every use throws STALE (tags start over). Snapshot again then.
-   * STALE's err.node: the node as the last snapshot before getByTag had it (null: none had it), to find it again by.
+   * STALE's err.tag: the tag (look it up in your snapshot).
    */
   getByTag(tag) {
     // ctx: the JS context the tag belongs to (tags start over after a reload)
-    const ctx = this.js.hello?.ctx;
-    return new Locator(this, { tag, ctx }, { node: this.seenNode(tag, ctx) });
+    return new Locator(this, { tag, ctx: this.js.hello?.ctx });
   }
 
   // getByTag and scroll need a JS agent of this version (tag selector, snapshot horizontal / secret)
@@ -731,27 +723,25 @@ const loose = (v) =>
 class Locator {
   // visible: only matches with some part on screen natively; shown: only matches in a window and not hidden
   // natively (what Detox can match: screens below the top one are mounted in React but not shown)
-  // node: getByTag's node as the last snapshot had it, for STALE errors
   constructor(
     app,
     selector,
-    { index = null, visible = false, shown = false, node = null } = {},
+    { index = null, visible = false, shown = false } = {},
   ) {
     this.app = app;
     this.selector = selector;
     this.index = index;
     this.visible = visible;
     this.shown = shown;
-    this.node = node;
   }
 
   get opts() {
-    return { index: this.index, visible: this.visible, shown: this.shown, node: this.node };
+    return { index: this.index, visible: this.visible, shown: this.shown };
   }
 
-  // STALE for a getByTag locator: which tag, and the node as the snapshot had it
+  // STALE for a getByTag locator, with its tag
   stale(why) {
-    return new MantisError("STALE", `${this}: ${why}: take a new snapshot`, { tag: this.selector.tag, node: this.node });
+    return new MantisError("STALE", `${this}: ${why}: take a new snapshot`, { tag: this.selector.tag });
   }
 
   toString() {

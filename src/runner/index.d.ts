@@ -35,8 +35,6 @@ export class MantisError extends Error {
   typed?: number;
   /** STALE: the tag that is gone (getByTag's, or the view under a point tap; null: unknown). */
   tag?: number | null;
-  /** STALE: that node as the last snapshot had it; null when none had it. */
-  node?: SnapshotNode | null;
 }
 /** A wait that ran out (code TIMEOUT, or NOT_ACTIONABLE / NOT_FOCUSED for an action's auto-wait). */
 export class TimeoutError extends MantisError {}
@@ -152,18 +150,19 @@ export interface TapResult {
   took: number | null;
 }
 
-/** A touch Mantis injected: x, y where the finger went down, dx, dy how far it moved, screen dp. */
+/**
+ * A touch Mantis injected: x, y where the finger went down, dx, dy how far it moved, screen dp (px: times
+ * snapshot().screen.density).
+ */
 export interface TouchEvent {
   type: "tap" | "drag";
   x: number;
   y: number;
   dx: number;
   dy: number;
-  /** Date.now() around the injection */
+  /** the host's Date.now() before the RPC was sent and when it answered */
   start: number;
   end: number;
-  /** px per dp; null: an agent that doesn't send it */
-  density: number | null;
 }
 
 export declare class App extends EventEmitter {
@@ -193,8 +192,11 @@ export declare class App extends EventEmitter {
   readonly native: { call(method: string, params?: object): Promise<any> };
 
   on(event: "touch", listener: (touch: TouchEvent) => void): this;
+  on(event: string | symbol, listener: (...args: any[]) => void): this;
   once(event: "touch", listener: (touch: TouchEvent) => void): this;
+  once(event: string | symbol, listener: (...args: any[]) => void): this;
   off(event: "touch", listener: (touch: TouchEvent) => void): this;
+  off(event: string | symbol, listener: (...args: any[]) => void): this;
 }
 
 export interface Assertions {
