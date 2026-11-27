@@ -10,14 +10,24 @@
     "url": "git+https://github.com/CodeLionApps/mantis.git"
   },
   "main": "src/runner/index.js",
+  "types": "src/runner/index.d.ts",
   "exports": {
-    ".": "./src/runner/index.js",
+    ".": {
+      "types": "./src/runner/index.d.ts",
+      "default": "./src/runner/index.js"
+    },
     "./agent": "./src/agent/index.js",
     "./detox": "./src/detox/index.js",
-    "./device": "./src/device/index.js",
+    "./device": {
+      "types": "./src/device/index.d.ts",
+      "default": "./src/device/index.js"
+    },
     "./metro": "./metro.js",
     "./reset": "./src/reset.js",
-    "./runner": "./src/runner/index.js",
+    "./runner": {
+      "types": "./src/runner/index.d.ts",
+      "default": "./src/runner/index.js"
+    },
     "./package.json": "./package.json"
   },
   "files": [

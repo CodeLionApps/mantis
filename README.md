@@ -293,7 +293,8 @@ For a driver that decides from `app.snapshot()` (an LLM) rather than from select
 ### Errors
 
 Mantis's errors are `MantisError`s with a stable `code` and `name` (messages may change); waits that run out are
-`TimeoutError`s (a subclass), both exported. An exception inside an agent (the app) comes back as `AGENT_ERROR`.
+`TimeoutError`s (a subclass), both exported. TypeScript types ship with the package (the runner, `/runner` and
+`/device`), the error codes and every result included. An exception inside an agent (the app) comes back as `AGENT_ERROR`.
 
 | `code`             | Meaning                                                                                       |
 | ------------------ | --------------------------------------------------------------------------------------------- |
