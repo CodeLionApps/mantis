@@ -217,8 +217,18 @@ dump then. `screen.density` is the app's own; comparing it with the device's (`a
 Rects are screen dp as drawn natively (iOS: points), transforms in flight included: what `touchscreen.tap` takes, also
 for a Modal whose React root doesn't start at the top of the screen. `focused: false` = a system window (permission dialog, notification shade) is over the app, or on iOS
 an alert of the app's own. Both platforms report `hit`, `focused`, `keyboard` and `screen` (iOS: points, `density` =
-screen scale). On iOS, `app.native.call("Page.screenshot")` returns `{ png }` (base64) of the app's own windows,
-without XCTest: no status bar, keyboard or system alerts.
+screen scale).
+
+`app.native.call("Page.screenshot", { scale })` returns `{ png, windows, fallbacks }`: a PNG (base64) of the app's own
+windows composed as on screen, in-process (no XCTest, no `adb screencap`). Screen-sized, `scale` px per dp (iOS: per
+point; default 1). No status bar, navigation bar, keyboard or system dialogs: they are not the app's. `windows`: the
+windows drawn, bottom-up. Android: activity, Modals, dialogs and popups, read back by `PixelCopy` (hardware layers and
+`TextureView` included, a `SurfaceView` such as video or a map is not); a dialog that dims what is under it
+(`AlertDialog`) dims it in the picture too. PixelCopy reads any window on API 34+, only the activity's on 26–33; a window
+it can't read is drawn by `View.draw` (`fallbacks`: how many), which fails on a hardware `Bitmap` (Coil, Glide,
+expo-image): on API 29–33 a Modal showing one makes the call fail. Below API 29: the activity window only (Modals,
+dialogs and popups are not in the picture), on 24–25 by `View.draw`. iOS: `drawViewHierarchy`, `layer.renderInContext` for a
+window that can't (`fallbacks`; `render: true` forces it).
 
 `await app.back()` is the back button: `{ ok, via, reason }`, ~ms, in-process, settled like `tap`.
 
