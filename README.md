@@ -21,6 +21,22 @@ Playwright-style API (`getByTestId`, `expect(...).toBeVisible()`, auto-wait).
 Both agents stay passive until a runner listens. Their reconnect loops wait 2 s, so they don't keep Detox's
 synchronization busy, and Detox runs of the same build are unaffected.
 
+## Scope
+
+Mantis drives React Native apps in general. Core keeps only what holds for any RN app and can be done
+deterministically: locators, actions, waiting (idle, stability), the app snapshot, back, scroll, typed errors. It
+assumes React Native and nothing else: any navigation library, any language, any design system.
+
+Not in core, but in the tool built on top of Mantis:
+
+- knowledge of a particular app: its testIDs, labels, wording, screens, login flow, launch arguments;
+- agent logic: deciding what to do next, retry and fallback policy, judging results, prompts;
+- reporting: video, metrics, test management.
+
+Core returns facts (`moved: false`, `seen: false`, an error `code`) and leaves the decision to the caller. When a tool
+on top has to work around something missing in core, the fix belongs in core, stated as a generic problem, with a
+test in `example/`.
+
 ## Setup
 
 ```sh
