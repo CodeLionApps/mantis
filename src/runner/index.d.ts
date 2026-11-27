@@ -167,7 +167,10 @@ export interface TouchEvent {
 }
 
 export declare class App extends EventEmitter {
-  /** usb: hardware UDID of a cabled iPhone: the runner dials its agents through usbmuxd instead of listening. */
+  /**
+   * usb: hardware UDID of a cabled iPhone: the runner dials its agents through usbmuxd instead of listening.
+   * port left out: PORT, but on Android without MANTIS_PORT a free port the OS picks (read app.port after start()).
+   */
   constructor(port?: number, platform?: Platform, opts?: { usb?: string });
   readonly port: number;
   readonly usb: string | undefined;
@@ -214,6 +217,7 @@ export interface Assertions {
 
 export function expect(locator: Locator): Assertions;
 export function setupMantis(target?: { platform?: Platform; deviceId?: string }): App;
+/** Default host port: MANTIS_PORT (else 9123) + Jest worker - 1. Android runners given no port don't use it without MANTIS_PORT. */
 export const PORT: number;
 export const PROTOCOL: number;
 /** Detox's toBeVisible threshold, for toBeInViewport. */

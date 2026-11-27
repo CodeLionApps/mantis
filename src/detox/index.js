@@ -5,7 +5,7 @@
 // Covers: by.id/text/label, withAncestor, atIndex, tap, replaceText, typeText, clearText, scroll, scrollTo,
 // getAttributes, toBeVisible/toExist/toHaveText (+ .not), waitFor(...).withTimeout(). See README.md for the limits.
 const { performance } = require("node:perf_hooks");
-const { App, Locator, PORT, expect: mantisExpect } = require("../runner");
+const { App, Locator, expect: mantisExpect } = require("../runner");
 const mantisDevice = require("../device");
 
 // Detox's expect checks once, after the app is idle; it doesn't wait. Mantis has no idle signal, so it polls for a
@@ -16,10 +16,10 @@ const EXPECT_TIMEOUT = Number(process.env.MANTIS_EXPECT_TIMEOUT) || 1000;
 const { worker } = mantisDevice.requireDetox("detox/internals");
 const device = mantisDevice.detoxDevice("the Detox device");
 const ios = device.getPlatform() === "ios";
-const app = new App(PORT, device.getPlatform());
+const app = new App(undefined, device.getPlatform());
 beforeAll(async () => {
   await app.start();
-  mantisDevice.reversePort(PORT);
+  mantisDevice.reversePort(app.port);
   // MANTIS_NO_IDLE: Mantis starts the app itself (src/device launchApp), nothing waits for Detox's "app idle"
   const launch = process.env.MANTIS_NO_IDLE ? mantisDevice.launchApp : device.launchApp.bind(device);
   // same signature as Detox (params, bundleId); relaunch keeps the connections when only the running app was

@@ -262,8 +262,17 @@ async function checkUsbmux() {
   assert.match(iosApp.js.rejected, /wrong token/);
   iosApp.js.greet(sock, { role: "js", platform: "ios", v: PROTOCOL, token: iosApp.launchArgs.mantisToken });
   assert.equal(iosApp.js.hello?.token, iosApp.token);
+  // Android without a port: a free one each, so a Mantis app on another device (adb reverse to the default port)
+  // can't reach this runner; an explicit port and iOS keep theirs
+  delete process.env.MANTIS_PORT;
+  const free = [new App(), new App()];
+  await Promise.all(free.map((a) => a.start()));
+  assert(free[0].port > 0 && free[1].port > 0 && free[0].port !== free[1].port);
+  await Promise.all(free.map((a) => a.close()));
+  assert.equal(new App(undefined, "ios").port, require("./runner").PORT);
   const app = new App(9199);
   await app.start();
+  assert.equal(app.port, 9199);
 
   // garbage, unknown roles and old agents don't take the runner down or become a peer
   const junk = new NodeWS(`${URL}/?role=native`);

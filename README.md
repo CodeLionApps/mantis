@@ -11,7 +11,7 @@ Playwright-style API (`getByTestId`, `expect(...).toBeVisible()`, auto-wait).
 - **Native agent** (`android/`, `ios/`): measuring, visibility, hit-test, touch injection (Android `MotionEvent`,
   iOS synthesized `UITouch` + `IOHIDEvent`), scroll, text input, keyboard. Runs on its own socket, so it keeps
   working while JS is busy.
-- **Runner** (`src/runner`, Node): a WebSocket server on `127.0.0.1` both agents dial into (port 9123), plus locators
+- **Runner** (`src/runner`, Node): a WebSocket server on `127.0.0.1` both agents dial into, plus locators
   with auto-wait. Tap and fill wait until the target is visible, enabled, stable for 2 frames, in the viewport
   (scrolling it there if needed) and receives the touch at its centre (native hit-test).
 - **Detox layer** (`src/detox`): replaces Detox's `element` / `by` / `waitFor` / `expect` globals with the runner.
@@ -114,7 +114,7 @@ Defence in depth (recommended):
 | ----------------------- | -------------- | -------------------------------------------------------------------------------------- |
 | `MANTIS_E2E=1`           |                | build time: compile in / bundle the agents                                             |
 | `MANTIS_DEVICE=YES`      | `NO`           | iOS build setting of the mantis pod target, per configuration: allow device builds (Podfile, see [Physical iPhone](#physical-iphone)) |
-| `MANTIS_PORT`            | 9123           | first Jest worker's host port; worker N uses `MANTIS_PORT + N - 1` (iOS: launch arg `mantisPort`; Android: `adb reverse`) |
+| `MANTIS_PORT`            | 9123 (iOS), free port (Android) | first Jest worker's host port; worker N uses `MANTIS_PORT + N - 1` (iOS: launch arg `mantisPort`; Android: `adb reverse`) |
 | `MANTIS_APP_ID`          | from Detox     | package / bundle id; default: Detox app `bundleId`, else read from `binaryPath`        |
 | `MANTIS_EXPECT_TIMEOUT`  | 1000           | grace (ms) for Detox's one-shot `expect`, see below                                     |
 | `MANTIS_NO_IDLE=1`       |                | start the app with `am start` / `simctl launch` instead of Detox (no "wait for idle")  |
@@ -340,11 +340,15 @@ that export nothing. An exception inside an agent (the app) comes back as `AGENT
 
 ## Channel
 
-The runner listens on `127.0.0.1` only (Android reaches it through `adb reverse`). Agents say hello with the
+The runner listens on `127.0.0.1` only. Android agents dial 9123 on the device, and `adb reverse` maps it to the
+runner's host port: a free one the OS picks, unless you pass a port or set `MANTIS_PORT` (read `app.port` after
+`start()`). So a Mantis app on another device on the same host, with its own `adb reverse`, can't reach this runner.
+Agents say hello with the
 protocol version; an app built with another Mantis version is refused with an error that says so. iOS simulators share
 the Mac's localhost, so iOS agents must also echo the runner's token (launch arg `mantisToken`, which the Detox layer
 adds; `app.launchArgs` for the Playwright-style API). Only the greeted socket of each agent may answer calls or send
-events. Each Jest worker gets its own port, so parallel workers (one device each) work.
+events. Each Jest worker gets its own port, so parallel workers (one device each) work. Two Mantis apps on one
+Android device both dial its 9123: run one at a time.
 
 What the channel does not protect against:
 
@@ -363,14 +367,14 @@ The agents only dial a WebSocket and the runner is plain Node, so any test frame
 
 ```js
 const { test, before, after } = require("node:test");
-const { App, PORT, expect } = require("@codelionapps/mantis");
+const { App, expect } = require("@codelionapps/mantis");
 const { launchApp, reversePort } = require("@codelionapps/mantis/device");
 
 const target = { platform: "ios", deviceId: "<simulator UDID>", appId: "com.example.app" };
-const app = new App(PORT, target.platform);
+const app = new App(undefined, target.platform); // port left out: PORT (iOS), a free one (Android)
 before(async () => {
   await app.start();
-  reversePort(app.port, target); // Android only; no-op on iOS
+  reversePort(app.port, target); // Android only, after start(); no-op on iOS
 });
 after(() => app.close());
 
@@ -428,7 +432,7 @@ What keeps the agent out of the App Store build:
 
 ```js
 const target = { platform: "ios", deviceId: "<hardware UDID>", appId: "com.example.app" };
-const app = new App(PORT, "ios", { usb: target.deviceId }); // setupMantis(target) picks USB by itself
+const app = new App(undefined, "ios", { usb: target.deviceId }); // setupMantis(target) picks USB by itself
 before(() => app.start()); // fails at once if that iPhone isn't on USB
 after(() => app.close());
 

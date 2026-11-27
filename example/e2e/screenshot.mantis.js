@@ -5,11 +5,11 @@ const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const zlib = require('node:zlib');
 const { execFileSync } = require('node:child_process');
-const { App, PORT, expect } = require('@codelionapps/mantis');
+const { App, expect } = require('@codelionapps/mantis');
 const { isIosDevice, launchApp, reversePort } = require('@codelionapps/mantis/device');
 
 const target = { platform: process.env.PLATFORM || 'android', deviceId: process.env.DEVICE, appId: process.env.MANTIS_APP_ID || 'com.probespike' };
-const app = new App(PORT, target.platform, { usb: isIosDevice(target) ? target.deviceId : undefined });
+const app = new App(undefined, target.platform, { usb: isIosDevice(target) ? target.deviceId : undefined });
 before(async () => {
   await app.start();
   reversePort(app.port, target);
