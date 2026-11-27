@@ -2,27 +2,36 @@
 // src/runner.
 //
 // Compiled in only with MANTIS_E2E=1 in the build environment (mantis.podspec defines MANTIS_E2E_$(MANTIS_E2E), so only
-// that build gets MANTIS_E2E_1) and only for the simulator. Every other build compiles this file to nothing.
-// Private UIKit/IOKit API (touch synthesis) must never reach the App Store: App Store binaries are device builds, and a
-// device build with MANTIS_E2E=1 (e.g. the variable leaked into a release job) fails to compile instead.
+// that build gets MANTIS_E2E_1). Every other build compiles this file to nothing. Private UIKit/IOKit API (touch
+// synthesis) must never reach the App Store, and App Store binaries are device builds: a device build with MANTIS_E2E=1
+// fails to compile unless its configuration allows one (MANTIS_DEVICE=YES, which the podspec pins to NO so that the
+// environment can't set it: only a build setting of the mantis pod target, e.g. from the Podfile, per configuration).
 //
-// Passive until a runner listens: dials ws://localhost:<port> (simulators share the Mac's localhost; port: launch
-// argument -mantisPort N, default 9123), retries every 2 s. Own socket, independent of the JS thread. All view work on
-// the main thread. Coordinates are points (= JS units).
+// Simulator: passive until a runner listens: dials ws://localhost:<port> (simulators share the Mac's localhost; port:
+// launch argument -mantisPort N, default 9123), retries every 2 s.
+// Physical iPhone: its localhost is the phone, and dialing the Mac needs the user's Local Network consent. So the agent
+// listens on the phone's loopback instead, only when launched with -mantisToken, and the runner dials it over USB
+// (usbmuxd, src/runner/usbmux.js). The JS agent still dials ws://localhost:<port>, now this listener, which relays it to
+// the runner's JS leg.
+// Own socket, independent of the JS thread. All view work on the main thread. Coordinates are points (= JS units).
 #import <TargetConditionals.h>
-// mantis.podspec always defines exactly one MANTIS_E2E_<value>: unset gives MANTIS_E2E_, so any other value (true,
-// yes, "1 ") is a typo that would silently build without the agent
+// mantis.podspec always defines exactly one MANTIS_E2E_<value> and one MANTIS_DEVICE_<value>: unset gives MANTIS_E2E_,
+// so any other value (true, yes, "1 ") is a typo that would silently build without the agent
 #if !defined(MANTIS_E2E_) && !defined(MANTIS_E2E_0) && !defined(MANTIS_E2E_1)
 #error "MANTIS_E2E must be 1 (agent) or 0/unset (no agent)"
 #endif
-#if defined(MANTIS_E2E_1) && !TARGET_OS_SIMULATOR
-#error "MANTIS_E2E=1 in a device build: the Mantis agent is for simulator E2E builds only and must never ship"
+#if !defined(MANTIS_DEVICE_NO) && !defined(MANTIS_DEVICE_YES)
+#error "MANTIS_DEVICE must be YES or NO"
 #endif
-#if defined(MANTIS_E2E_1) && TARGET_OS_SIMULATOR
+#if defined(MANTIS_E2E_1) && !TARGET_OS_SIMULATOR && !defined(MANTIS_DEVICE_YES)
+#error "MANTIS_E2E=1 in a device build of a configuration that doesn't allow it: the Mantis agent must never ship. For a device E2E configuration set MANTIS_DEVICE=YES on the mantis pod target (README, Physical iPhone)"
+#endif
+#if defined(MANTIS_E2E_1)
 #import <UIKit/UIKit.h>
 #import <QuartzCore/QuartzCore.h>
 #import <dlfcn.h>
 #import <mach/mach_time.h>
+#import <Network/Network.h>
 #import <objc/runtime.h>
 #import <pthread.h>
 
@@ -179,11 +188,23 @@ static NSException *MantisError(NSString *reason) {
 }
 
 @implementation MantisAgent {
-  NSURLSessionWebSocketTask *_ws;
+  NSURLSessionWebSocketTask *_ws; // simulator: the socket to the runner
+  nw_listener_t _listener; // physical iPhone: the runner's legs and the JS agent connect here
+  nw_connection_t _native, _runnerJs, _js; // the runner's native leg, its JS leg, the JS agent
   CGRect _keyboard; // last keyboard end frame (UIKeyboardWillChangeFrame), screen points; off screen = none
 }
 
 static MantisAgent *shared;
+
+// launch arguments only (-mantisPort N -mantisToken T), not values the app may have persisted under the same keys
+static NSDictionary *launchArgs(void) {
+  return [NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain];
+}
+static NSInteger mantisPort(void) { return [launchArgs()[@"mantisPort"] integerValue] ?: 9123; }
+static id mantisToken(void) {
+  id t = launchArgs()[@"mantisToken"];
+  return [t isKindOfClass:NSString.class] ? t : NSNull.null;
+}
 
 + (void)load {
   // app extensions and logic test bundles load this binary too (use_frameworks!): no UIApplication there
@@ -197,25 +218,30 @@ static MantisAgent *shared;
     }];
     [NSNotificationCenter.defaultCenter addObserverForName:UIKeyboardWillHideNotification object:nil queue:nil
                                                 usingBlock:^(NSNotification *n) { shared->_keyboard = CGRectNull; }];
+#if TARGET_OS_SIMULATOR
     [shared connect];
+#else
+    [shared listen];
+#endif
   });
 }
 
+- (NSDictionary *)hello {
+  // v: src/runner PROTOCOL; token: proves to the runner that it launched this app (simulators share localhost)
+  return @{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @2, @"token": mantisToken()}};
+}
+
 - (void)connect {
-  // launch arguments only (-mantisPort N -mantisToken T), not values the app may have persisted under the same keys
-  NSDictionary *args = [NSUserDefaults.standardUserDefaults volatileDomainForName:NSArgumentDomain];
-  NSInteger port = [args[@"mantisPort"] integerValue] ?: 9123;
-  id token = [args[@"mantisToken"] isKindOfClass:NSString.class] ? args[@"mantisToken"] : NSNull.null;
-  NSString *url = [NSString stringWithFormat:@"ws://localhost:%ld/?role=native", (long)port];
+  NSString *url = [NSString stringWithFormat:@"ws://localhost:%ld/?role=native", (long)mantisPort()];
   _ws = [NSURLSession.sharedSession webSocketTaskWithURL:[NSURL URLWithString:url]];
   [_ws resume];
-  // v: src/runner PROTOCOL; token: proves to the runner that it launched this app (simulators share localhost)
-  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @2, @"token": token}}];
+  [self send:self.hello];
   [self receive];
 }
 
 - (void)send:(NSDictionary *)msg {
   NSData *d = [NSJSONSerialization dataWithJSONObject:msg options:0 error:nil];
+  if (_native) return [self write:d to:_native];
   [_ws sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithString:[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding]]
  completionHandler:^(NSError *e) {}];
 }
@@ -232,36 +258,142 @@ static MantisAgent *shared;
       });
       return;
     }
-    // validate before use: a binary / non-JSON / id-less frame has nothing to answer
-    id msg = m.type == NSURLSessionWebSocketMessageTypeString
-      ? [NSJSONSerialization JSONObjectWithData:[m.string dataUsingEncoding:NSUTF8StringEncoding] options:0 error:nil] : nil;
-    id mid = [msg isKindOfClass:NSDictionary.class] ? msg[@"id"] : nil;
-    if (![mid isKindOfClass:NSNumber.class]) {
-      NSLog(@"[Mantis] ignoring a frame that is not an RPC request");
-      [self receive];
-      return;
-    }
-    id method = msg[@"method"], params = msg[@"params"];
-    dispatch_async(dispatch_get_main_queue(), ^{
-      // exactly one reply per request, whatever path (sync, async callback, exception) gets there first
-      __block BOOL replied = NO;
-      void (^done)(id) = ^(id result) {
-        if (replied) return;
-        replied = YES;
-        NSDictionary *out = [result isKindOfClass:NSException.class]
-          ? @{@"id": mid, @"error": @{@"message": [NSString stringWithFormat:@"%@: %@", [result name], [result reason]]}}
-          : @{@"id": mid, @"result": result ?: NSNull.null};
-        if (![NSJSONSerialization isValidJSONObject:out]) // NaN / inf would make NSJSONSerialization throw
-          out = @{@"id": mid, @"error": @{@"message": [NSString stringWithFormat:@"%@: result not JSON-serializable", method]}};
-        [self send:out];
-      };
-      MantisGuard(done, ^{
-        if (![method isKindOfClass:NSString.class]) [NSException raise:@"MantisAgent" format:@"no method"];
-        [self handle:method params:[params isKindOfClass:NSDictionary.class] ? params : @{} done:done];
-      });
-    });
+    if (m.type == NSURLSessionWebSocketMessageTypeString) [self request:[m.string dataUsingEncoding:NSUTF8StringEncoding]];
+    else NSLog(@"[Mantis] ignoring a frame that is not an RPC request");
     [self receive];
   }];
+}
+
+// Physical iPhone: a WebSocket server on 127.0.0.1 only. usbmuxd delivers the runner's connections there; nothing off
+// the phone reaches it, and loopback needs no Local Network consent. Off without the token: an app launched by hand
+// (or by anything but a runner) never listens.
+- (void)listen {
+  if (mantisToken() == NSNull.null) return NSLog(@"[Mantis] no -mantisToken launch argument: agent off");
+  nw_parameters_t params = nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL, NW_PARAMETERS_DEFAULT_CONFIGURATION);
+  nw_protocol_stack_prepend_application_protocol(nw_parameters_copy_default_protocol_stack(params), nw_ws_create_options(nw_ws_version_13));
+  NSString *port = [NSString stringWithFormat:@"%ld", (long)mantisPort()];
+  nw_parameters_set_local_endpoint(params, nw_endpoint_create_host("127.0.0.1", port.UTF8String));
+  nw_parameters_set_required_interface_type(params, nw_interface_type_loopback);
+  nw_parameters_set_reuse_local_address(params, true); // a relaunch rebinds while the last process's sockets linger
+  _listener = nw_listener_create(params);
+  nw_listener_set_queue(_listener, dispatch_get_main_queue());
+  nw_listener_set_new_connection_handler(_listener, ^(nw_connection_t c) {
+    nw_connection_set_queue(c, dispatch_get_main_queue());
+    nw_connection_set_state_changed_handler(c, ^(nw_connection_state_t s, nw_error_t e) {
+      if (s == nw_connection_state_failed || s == nw_connection_state_cancelled) [self dropped:c];
+    });
+    nw_connection_start(c);
+    [self read:c];
+    // a connection that doesn't say what it is (frame:) within 5 s is not ours
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+      if (c != self->_native && c != self->_runnerJs && c != self->_js) nw_connection_cancel(c);
+    });
+  });
+  nw_listener_set_state_changed_handler(_listener, ^(nw_listener_state_t s, nw_error_t e) {
+    if (s == nw_listener_state_failed) NSLog(@"[Mantis] listener on port %@ failed: %@", port, e);
+  });
+  nw_listener_start(_listener);
+}
+
+- (void)read:(nw_connection_t)c {
+  nw_connection_receive_message(c, ^(dispatch_data_t content, nw_content_context_t ctx, bool complete, nw_error_t err) {
+    nw_protocol_metadata_t md = ctx ? nw_content_context_copy_protocol_metadata(ctx, nw_protocol_copy_ws_definition()) : nil;
+    if (err || !content || (md && nw_ws_metadata_get_opcode(md) == nw_ws_opcode_close)) return nw_connection_cancel(c);
+    [self frame:(NSData *)content from:c];
+    [self read:c];
+  });
+}
+
+- (void)write:(NSData *)d to:(nw_connection_t)c {
+  nw_content_context_t ctx = nw_content_context_create("mantis");
+  nw_content_context_set_metadata_for_protocol(ctx, nw_ws_create_metadata(nw_ws_opcode_text));
+  dispatch_data_t data = dispatch_data_create(d.bytes, d.length, nil, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+  nw_connection_send(c, data, ctx, true, ^(nw_error_t e) {});
+}
+
+// constant time: a wrong guess doesn't learn how many leading characters matched
+static BOOL sameToken(id t) {
+  NSData *a = [t isKindOfClass:NSString.class] ? [t dataUsingEncoding:NSUTF8StringEncoding] : nil;
+  NSData *b = [mantisToken() dataUsingEncoding:NSUTF8StringEncoding]; // listen: never without a token
+  return a && b && a.length == b.length && timingsafe_bcmp(a.bytes, b.bytes, a.length) == 0;
+}
+
+// A connection says what it is in its first frame: the runner's Runner.attach {role, token} or the JS agent's hello.
+// Both carry the token of this launch, so another app on the phone (it can reach loopback too) can't take a leg.
+- (void)frame:(NSData *)d from:(nw_connection_t)c {
+  if (c == _native) return [self request:d];
+  if (c == _runnerJs || c == _js) {
+    nw_connection_t to = c == _js ? _runnerJs : _js; // the JS agent's events before the runner attached: dropped
+    if (to) [self write:d to:to];
+    return;
+  }
+  id msg = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+  NSDictionary *p = [msg isKindOfClass:NSDictionary.class] && [msg[@"params"] isKindOfClass:NSDictionary.class] ? msg[@"params"] : nil;
+  if (!sameToken(p[@"token"])) return nw_connection_cancel(c);
+  BOOL attach = [msg[@"method"] isEqual:@"Runner.attach"], hello = [msg[@"method"] isEqual:@"Agent.hello"];
+  // a connection replaced by a newer one of the same kind is cancelled after the swap, so dropped: ignores it
+  nw_connection_t old = nil;
+  if (attach && [p[@"role"] isEqual:@"native"]) {
+    old = _native;
+    _native = c;
+    [self send:self.hello];
+  } else if (attach && [p[@"role"] isEqual:@"js"]) {
+    old = _runnerJs;
+    _runnerJs = c;
+    // the JS agent redials at once and says hello on this leg: a fresh hello, so the runner and the agent count
+    // touches from 0 together (after a cable drop the JS agent is still connected here)
+    if (_js) {
+      nw_connection_t js = _js;
+      _js = nil;
+      nw_connection_cancel(js);
+    }
+  } else if (hello && [p[@"role"] isEqual:@"js"]) {
+    old = _js;
+    _js = c;
+    if (_runnerJs) [self write:d to:_runnerJs];
+  } else {
+    return nw_connection_cancel(c);
+  }
+  if (old) nw_connection_cancel(old);
+}
+
+- (void)dropped:(nw_connection_t)c {
+  if (c == _native) _native = nil;
+  if (c == _runnerJs) _runnerJs = nil;
+  if (c == _js) {
+    // the JS context is gone (reload): drop the runner's JS leg too, so the runner sees the disconnect and redials
+    _js = nil;
+    nw_connection_t leg = _runnerJs;
+    _runnerJs = nil;
+    if (leg) nw_connection_cancel(leg);
+  }
+}
+
+// One RPC request from the runner (either transport); exactly one reply.
+- (void)request:(NSData *)d {
+  // validate before use: a non-JSON / id-less frame has nothing to answer
+  id msg = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
+  id mid = [msg isKindOfClass:NSDictionary.class] ? msg[@"id"] : nil;
+  if (![mid isKindOfClass:NSNumber.class]) return NSLog(@"[Mantis] ignoring a frame that is not an RPC request");
+  id method = msg[@"method"], params = msg[@"params"];
+  dispatch_async(dispatch_get_main_queue(), ^{
+    // exactly one reply per request, whatever path (sync, async callback, exception) gets there first
+    __block BOOL replied = NO;
+    void (^done)(id) = ^(id result) {
+      if (replied) return;
+      replied = YES;
+      NSDictionary *out = [result isKindOfClass:NSException.class]
+        ? @{@"id": mid, @"error": @{@"message": [NSString stringWithFormat:@"%@: %@", [result name], [result reason]]}}
+        : @{@"id": mid, @"result": result ?: NSNull.null};
+      if (![NSJSONSerialization isValidJSONObject:out]) // NaN / inf would make NSJSONSerialization throw
+        out = @{@"id": mid, @"error": @{@"message": [NSString stringWithFormat:@"%@: result not JSON-serializable", method]}};
+      [self send:out];
+    };
+    MantisGuard(done, ^{
+      if (![method isKindOfClass:NSString.class]) [NSException raise:@"MantisAgent" format:@"no method"];
+      [self handle:method params:[params isKindOfClass:NSDictionary.class] ? params : @{} done:done];
+    });
+  });
 }
 
 // All visible windows of this process, topmost first. RN Modal = a presented view controller in the same window;

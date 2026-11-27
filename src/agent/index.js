@@ -506,9 +506,10 @@ const handlers = {
 let launchArgs;
 function getLaunchArgs() {
   if (launchArgs) return launchArgs;
-  launchArgs = { port: 9123, token: null };
+  launchArgs = { port: 9123, token: null, ios: false };
   try {
     if (require("react-native").Platform.OS === "ios") {
+      launchArgs.ios = true;
       const m = require("react-native/Libraries/Settings/Settings"); // Android: a fallback that only warns
       const settings = m.default || m;
       launchArgs.port = Number(settings.get("mantisPort")) || 9123;
@@ -527,7 +528,10 @@ function send(msg) {
 }
 
 function connect() {
-  const { port, token } = getLaunchArgs();
+  const { port, token, ios } = getLaunchArgs();
+  // iOS: only an app a runner launched (its token) dials; the runner refuses a token-less iOS hello anyway. On a phone
+  // opened by hand nothing of ours listens on loopback, and whatever app binds the port would get the agent.
+  if (ios && !token) return;
   ws = new WebSocket(`ws://localhost:${port}/?role=js`);
   ws.onopen = () => {
     touchSeq = 0; // the runner counts this connection's touches from 0 (App.js.onHello), also when it attaches late

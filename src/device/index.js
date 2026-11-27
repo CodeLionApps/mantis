@@ -39,6 +39,9 @@ function target({ platform, deviceId } = {}) {
 }
 const adb = (t, ...args) => run("adb", "-s", t.deviceId, ...args);
 const isIos = (t) => t.platform === "ios";
+// By the id's shape: an iPhone's hardware UDID is 8-16 hex digits (2018 on) or 40 (older), what usbmuxd knows it by.
+// Simulator UDIDs and devicectl's CoreDevice identifiers are UUIDs: not a cabled iPhone.
+const isIosDevice = (t) => isIos(t) && /^([0-9a-f]{8}-[0-9a-f]{16}|[0-9a-f]{40})$/i.test(t.deviceId ?? "");
 
 let cachedAppId;
 /** App id: opts.appId, else MANTIS_APP_ID, else the Detox app config. */
@@ -62,7 +65,10 @@ async function appId(opts = {}) {
   return (cachedAppId = checkId(await new AAPT().getPackageName(path.resolve(app.binaryPath))));
 }
 
-/** Android: the agents dial 9123 on the device; map it to the runner's host port. iOS shares the Mac's localhost. */
+/**
+ * Android: the agents dial 9123 on the device; map it to the runner's host port. iOS: nothing (a simulator shares the
+ * Mac's localhost, the runner dials a cabled iPhone).
+ */
 function reversePort(hostPort, opts) {
   const t = target(opts);
   if (!isIos(t)) adb(t, "reverse", "tcp:9123", `tcp:${hostPort}`);
@@ -119,6 +125,7 @@ async function clearAppData({ permissions, ...opts } = {}) {
     );
     return;
   }
+  if (isIosDevice(t)) throw new Error("Mantis clearAppData: not supported on a physical iPhone; reinstall the app");
   const udid = t.deviceId;
   // cfprefsd caches the app's preferences and writes them back, so kill it before deleting (it respawns on demand)
   tryRun("xcrun", "simctl", "terminate", udid, id);
@@ -159,8 +166,15 @@ async function launchApp({ delete: reinstall = false, launchArgs = {}, permissio
   }
   const str = (v) => (typeof v === "string" ? v : JSON.stringify(v));
   if (isIos(t)) {
-    if (permissions) setIosPermissions(t, id, permissions);
     const args = Object.entries(launchArgs).flatMap(([k, v]) => [`-${k}`, str(v)]);
+    if (isIosDevice(t)) {
+      if (permissions) throw new Error("Mantis launchApp: permissions can't be set on a physical iPhone");
+      // `--`: otherwise devicectl takes the app's -key arguments as its own options
+      run("xcrun", "devicectl", "device", "process", "launch", "--device", t.deviceId, "--terminate-existing", id, "--",
+        ...args);
+      return;
+    }
+    if (permissions) setIosPermissions(t, id, permissions);
     run("xcrun", "simctl", "launch", "--terminate-running-process", t.deviceId, id, ...args);
     return;
   }
@@ -171,4 +185,4 @@ async function launchApp({ delete: reinstall = false, launchArgs = {}, permissio
   adb(t, "shell", "am", "start", "-W", "-n", shq(activity), ...extras);
 }
 
-module.exports = { appId, clearAppData, detoxDevice, launchApp, requireDetox, reversePort, target };
+module.exports = { appId, clearAppData, detoxDevice, isIosDevice, launchApp, requireDetox, reversePort, target };

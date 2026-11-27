@@ -166,8 +166,10 @@ export interface TouchEvent {
 }
 
 export declare class App extends EventEmitter {
-  constructor(port?: number, platform?: Platform);
+  /** usb: hardware UDID of a cabled iPhone: the runner dials its agents through usbmuxd instead of listening. */
+  constructor(port?: number, platform?: Platform, opts?: { usb?: string });
   readonly port: number;
+  readonly usb: string | undefined;
   platform: Platform;
   /** iOS launch args the agents need: this runner's port and token. */
   readonly launchArgs: { mantisPort: number; mantisToken: string };

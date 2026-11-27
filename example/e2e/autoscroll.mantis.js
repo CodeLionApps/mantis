@@ -1,14 +1,14 @@
 // Mantis without Detox (Playwright-style API): tap() scrolls its target into view first, along each scroll view's axis,
 // an outer one before a list nested in it. Detox's tap needs the target on screen (app.test.js scrolls with whileElement).
-// MANTIS_E2E=1 build installed; DEVICE=<adb serial or simulator UDID> [PLATFORM=ios MANTIS_APP_ID=<bundle id>]
+// MANTIS_E2E=1 build installed; DEVICE=<adb serial or simulator / iPhone UDID> [PLATFORM=ios MANTIS_APP_ID=<bundle id>]
 //   node --test e2e/autoscroll.mantis.js
 const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { App, PORT, expect } = require('@codelionapps/mantis');
-const { launchApp, reversePort } = require('@codelionapps/mantis/device');
+const { isIosDevice, launchApp, reversePort } = require('@codelionapps/mantis/device');
 
 const target = { platform: process.env.PLATFORM || 'android', deviceId: process.env.DEVICE, appId: process.env.MANTIS_APP_ID || 'com.probespike' };
-const app = new App(PORT, target.platform);
+const app = new App(PORT, target.platform, { usb: isIosDevice(target) ? target.deviceId : undefined });
 before(async () => {
   await app.start();
   reversePort(app.port, target);
