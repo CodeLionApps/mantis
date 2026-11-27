@@ -247,9 +247,11 @@ window that can't (`fallbacks`; `render: true` forces it).
   JS agent keeps the listeners, but only for `app.back()`.
 
 `await app.idle({ quietMs = 100, timeout, since, reactMs = 1000, netMaxMs = Infinity })` waits until the app stands still: no React commit and nothing changed on
-screen for `quietMs`, and no XHR / `fetch` in flight. On screen: Android, a window of the app drew; iOS, a layer changed
-or an animation runs (stack transitions, native-driver and Reanimated frames, scrolling, Modal fades; not the keyboard
-or a text cursor). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a
+screen for `quietMs`, and no XHR / `fetch` in flight. On screen: Android, a window of the app drew or a drawable animates
+on the render thread where no draw is seen (an `ActivityIndicator`); iOS, a layer changed or an animation runs (stack
+transitions, native-driver and Reanimated frames, scrolling, Modal fades; not the keyboard or a text cursor). A spinner
+that is mounted but hidden, transparent or off screen doesn't count, on either platform; one covered by another view
+still does (occlusion isn't checked). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a
 transition. On timeout it throws, naming what is still busy: a spinner or a looping animation never stops. JS timers
 are not tracked. On Android a focused text field's caret draws every 500 ms, so `quietMs` of 500 or more never passes
 while a field is focused.
@@ -275,12 +277,16 @@ For a driver that decides from `app.snapshot()` (an LLM) rather than from select
   live as long as the native view. `tap` / `fill` on a node React re-mounted (a new `key`, a screen rebuilt) or
   unmounted fail at once with `STALE` (a node only hidden or filtered out waits as usual); `expect` treats it as absent,
   so `expect(app.getByTag(t)).not.toBeAttached()` works. After a JS reload tags start over, so every use of a locator
-  made before it throws `STALE`. An app built with an older Mantis: `UNSUPPORTED` (rebuild it).
+  made before it throws `STALE`. The error says which: `err.tag` (look it up in the snapshot you took it from,
+  to find the node again by its `testID`, `label`, `text`). An app built with an older Mantis: `UNSUPPORTED` (rebuild it).
 - `await app.touchscreen.tap(x, y, { timeout = 1000 })`: a tap at a point in screen dp (snapshot rects), settled like
-  `Locator.tap`. `{ seen: true }`: the app's JS saw the touch. `{ seen: false }` is unknown: a native view RN doesn't
-  handle took it (WebView, map), or JS is busy and may still handle it, so tapping again may tap twice. `STALE`: the
-  touch reached a view React had already replaced, nothing was pressed; it is not tapped again (something else may be
-  under the point now): snapshot again. `COVERED` instead of tapping when the app's window has no focus (after waiting
+  `Locator.tap`. `{ seen, took }`. `took`: the tag of the innermost React view the native hit-test found under the
+  point when the finger went down (`null`: none, or an app built with an older Mantis); look it up in the snapshot (a
+  WebView, a map, the button you meant). `seen: true`: the app's JS saw the touch. `seen: false` is unknown: a native
+  view RN doesn't handle took it (WebView, map), or JS is busy and may still handle it, so tapping again may tap twice.
+  `seen` waits up to `timeout` after the tap settled; `timeout: 0` doesn't wait. `STALE`: the touch reached a view
+  React had already replaced, nothing was pressed; it is not tapped again (something else may be under the point now):
+  snapshot again (`err.tag` = `took`). `COVERED` instead of tapping when the app's window has no focus (after waiting
   300 ms for it: a window that just opened gets focus a little later) or the point is on the keyboard: the touch would
   land in the app beneath.
 - `await app.keyboard.type(text, { timeout = 1000 })`: into the text field that has focus, one character (code point)
@@ -296,13 +302,22 @@ For a driver that decides from `app.snapshot()` (an LLM) rather than from select
   what is below / to the right, by half the scroll view's size. `{ ok: true, tag, moved }` (`moved: false`: at the end),
   or `{ ok: false, reason }`: no focus (after waiting 300 ms for it), no such scroll view, or the keyboard is up (unlike
   a locator's auto-scroll, which hides it).
+- `app.on("touch", (t) => ...)` (`App` is an `EventEmitter`): once for every touch Mantis injects (a locator's or a
+  point tap, `fill`'s focusing tap, the drag of a scroll or auto-scroll), once its RPC answered:
+  `{ type: "tap" | "drag", x, y, dx, dy, start, end }`. `x`, `y`: where the finger went down, `dx`, `dy`: how far it
+  moved (0 for a tap), screen dp (px = dp × `snapshot().screen.density`); `start`, `end`: the host's `Date.now()` before
+  the RPC was sent and when it answered, not device times. No event when the RPC failed or timed out (the touch may
+  still have happened), nor for a drag from an app built with an older Mantis. Listeners run in a microtask: one that
+  throws doesn't fail the action (its error is uncaught). Costs nothing without a listener.
 - `idle({ since })` counts any commit or draw after the mark as the app reacting, a press ripple or a caret blink too:
   a heuristic for actions the app handles a while later (back), not proof that the action's result is on screen.
 
 ### Errors
 
 Mantis's errors are `MantisError`s with a stable `code` and `name` (messages may change); waits that run out are
-`TimeoutError`s (a subclass), both exported. An exception inside an agent (the app) comes back as `AGENT_ERROR`.
+`TimeoutError`s (a subclass), both exported. TypeScript types ship with the package (the runner, `/runner`, `/device`
+and `/metro`), the error codes and every result included (the runner's need `@types/node`: `App` is an `EventEmitter`); `/agent`, `/detox` and `/reset` are side-effect imports
+that export nothing. An exception inside an agent (the app) comes back as `AGENT_ERROR`.
 
 | `code`             | Meaning                                                                                       |
 | ------------------ | --------------------------------------------------------------------------------------------- |
@@ -311,7 +326,7 @@ Mantis's errors are `MantisError`s with a stable `code` and `name` (messages may
 | `NOT_FOCUSED`      | no text field took the text (`fill`, `keyboard.type`)                                        |
 | `DELIVERED`        | the touch or text reached the app, or may have (an `Input.*` RPC that never answered): retrying could do it twice |
 | `STRICT`           | a locator matched several elements                                                            |
-| `STALE`            | what a snapshot showed is gone (a `getByTag` node, the view under a point tap, a JS reload): snapshot again |
+| `STALE`            | what a snapshot showed is gone (a `getByTag` node, the view under a point tap, a JS reload): snapshot again; `err.tag` says which |
 | `COVERED`          | `touchscreen.tap` at a point under a system window or the keyboard                            |
 | `UNSUPPORTED`      | the app's agent is older than this runner: rebuild the app                                    |
 | `INVALID_ARGUMENT` | e.g. `scroll("sideways")`                                                                    |
