@@ -102,7 +102,8 @@ object MantisAgent {
       override fun onOpen(webSocket: WebSocket, response: Response) {
         // v: src/runner PROTOCOL
         webSocket.send(JSONObject().put("method", "Agent.hello")
-          .put("params", JSONObject().put("role", "native").put("platform", "android").put("v", 2)).toString())
+          .put("params", JSONObject().put("role", "native").put("platform", "android").put("v", 2)
+            .put("density", density)).toString())
       }
       // OkHttp's reader thread: an exception here would restart the socket and fail every RPC in flight, so validate
       // the frame first; a frame without a numeric id has nothing to answer
@@ -439,15 +440,17 @@ object MantisAgent {
         }
       }
 
+      // took: the innermost React view under the point (hit-test before the DOWN), null = none (another window's)
       "Input.tap" -> {
         val x = p.getDouble("x").toFloat() * density
         val y = p.getDouble("y").toFloat() * density
         val win = windowAt(x, y) ?: error("no window at (${x / density}, ${y / density})")
+        val took = hitTest(x / density, y / density).optJSONArray("chain")?.opt(0) ?: JSONObject.NULL
         val (f, end) = fingerDown(win, x, y, done)
         // hold = until next frame (~16 ms), enough for Pressable / gesture handlers to see DOWN
         onFrame(end) {
           move(f, MotionEvent.ACTION_UP, x, y)
-          end(JSONObject().put("ok", true))
+          end(JSONObject().put("ok", true).put("took", took))
         }
       }
 
@@ -502,7 +505,10 @@ object MantisAgent {
               // 2 frames: lets the scroll events of the UP (momentum begin) reach the JS queue before the runner
               // queries again, so the "scroll view animating" check cannot miss them
               // moved: false = the drag happened but the content didn't move (at its end), the runner stops scrolling
-              onFrame(end) { onFrame(end) { end(JSONObject().put("ok", true).put("px", amount).put("moved", (sv.scrollX to sv.scrollY) != start)) } }
+              // from / to: the drag's start and end point (dp), for the runner's touch event
+              onFrame(end) { onFrame(end) { end(JSONObject().put("ok", true).put("px", amount).put("moved", (sv.scrollX to sv.scrollY) != start)
+                .put("from", JSONObject().put("x", x0 / density).put("y", y0 / density))
+                .put("to", JSONObject().put("x", x1 / density).put("y", y1 / density))) } }
               return@guard
             }
             Choreographer.getInstance().postFrameCallback(this)

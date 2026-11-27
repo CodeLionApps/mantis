@@ -31,12 +31,13 @@ test('snapshot nodes: getByTag, a point tap, a stale tag', async () => {
   assert.equal(button.pressable, true);
   await app.getByTag(button.tag).tap();
   await expect(app.getByText('Licznik: 1')).toBeVisible();
-  assert.deepEqual(await app.touchscreen.tap(...centre(node)), { seen: true });
+  // took: the view the native hit-test found under the point, the text itself
+  assert.deepEqual(await app.touchscreen.tap(...centre(node)), { seen: true, took: node.tag });
   await expect(app.getByText('Licznik: 2')).toBeVisible();
-  // the screen unmounted and mounted again: its views have new tags
+  // the screen unmounted and mounted again: its views have new tags; the error says what the node was
   await app.getByText('Wstecz').tap();
   await app.getByText('Licznik').tap();
-  await assert.rejects(app.getByTag(button.tag).tap(), { code: 'STALE' });
+  await assert.rejects(app.getByTag(button.tag).tap(), { code: 'STALE', tag: button.tag, node: button });
 });
 
 test('keyboard.type into the focused field, a key event per character; nothing focused: NOT_FOCUSED', async () => {
@@ -91,8 +92,28 @@ test('snapshot rects are screen dp: an iOS page sheet', async () => {
   const js = (await app.js.call('Tree.snapshot')).nodes.find(n => n.tag === node.tag).rect;
   // iOS: the sheet's React root starts below the top of the screen, so its JS layout is off by that much
   if (target.platform === 'ios') assert.ok(node.rect.y - js.y > 20, `native ${node.rect.y}, JS ${js.y}`);
-  assert.deepEqual(await app.touchscreen.tap(...centre(node)), { seen: true });
+  assert.equal((await app.touchscreen.tap(...centre(node))).seen, true);
   await expect(app.getByText('Zamknij arkusz')).not.toBeAttached();
+});
+
+test('touch events: every touch Mantis injects, in screen dp', async () => {
+  const touches = [];
+  const listener = t => touches.push(t);
+  app.on('touch', listener);
+  try {
+    await app.getByText('Przewijanie').tap();
+    assert.equal((await app.scroll('down')).ok, true);
+  } finally {
+    app.off('touch', listener);
+  }
+  const [tap, drag] = touches;
+  assert.equal(touches.length, 2);
+  assert.equal(tap.type, 'tap');
+  assert.deepEqual([tap.dx, tap.dy], [0, 0]);
+  assert.ok(tap.density > 1 && tap.start <= tap.end, JSON.stringify(tap));
+  // down reveals what is below: the finger moves up
+  assert.equal(drag.type, 'drag');
+  assert.ok(drag.dy < 0 && drag.dx === 0, JSON.stringify(drag));
 });
 
 test('scroll at the end: moved false', async () => {

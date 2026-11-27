@@ -114,7 +114,7 @@ function checkContract() {
   const called = new Set(
     [src("src/runner/index.js"), src("src/detox/index.js")]
       .join("\n")
-      .match(/native\.call\(\s*"[^"]+"/g)
+      .match(/(?:native\.call|inject)\(\s*"[^"]+"/g)
       .map((m) => m.match(/"([^"]+)"/)[1]),
   );
   const ios = src("ios/MantisAgent.m");
@@ -205,7 +205,7 @@ function checkContract() {
         ...(params.secret && (secretAsked = params.secret) && {}),
       }),
       "Action.check": () => checks.get(params.tag)?.() ?? { ok: true, point: { x: params.tag, y: 0 } },
-      "Input.scroll": () => (scrolled.push(params), onScroll(params), { ok: true }),
+      "Input.scroll": () => (scrolled.push(params), onScroll(params), { ok: true, from: { x: 200, y: 400 }, to: { x: 200, y: 400 - (params.dy ?? 0) } }),
       "Input.typeText": () =>
         typeable-- > 0 ? (typed.push(params.text), { ok: true, focusedTag: params.tags?.[0] }) : { ok: false, reason: "focused: null" },
       "Input.hideKeyboard": () => ({ ok: true }),
@@ -216,7 +216,7 @@ function checkContract() {
           touchStart({ nativeEvent: { target: drop > 0 ? -1 : params.x } });
         if (twice) touchStart({ nativeEvent: { target: params.x } });
         drop = Math.max(0, drop - 1);
-        return { ok: true };
+        return { ok: true, took: params.x }; // the fake's hit-test: the tag is the x
       },
     }[method]();
     if (result === undefined) return; // a stalled main thread doesn't answer
@@ -224,7 +224,7 @@ function checkContract() {
   };
   const connectNative = () => {
     const native = new NodeWS(`${URL}/?role=native`);
-    native.onopen = () => native.send(hello("native"));
+    native.onopen = () => native.send(hello("native", { density: 2 }));
     native.onmessage = nativeHandler(native);
     return native;
   };
@@ -294,12 +294,23 @@ function checkContract() {
 
   // a point in screen dp: settled, the touch JS saw attributed like a locator's tap; never under a system window or keyboard
   taps.length = 0;
-  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true });
+  const touches = [];
+  app.on("touch", (t) => touches.push(t));
+  const { nodes: seenNodes } = await app.snapshot(); // STALE's err.node comes from the last snapshot
+  const minusNode = seenNodes.find((n) => n.testID === "minus");
+  const sure = { seen: true, took: tagOf(minus) };
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
+  const [touch] = touches;
+  assert.deepEqual({ ...touch, start: 0, end: 0 }, { type: "tap", x: tagOf(minus), y: 5, dx: 0, dy: 0, start: 0, end: 0, density: 2 });
+  assert(touch.start <= touch.end);
   drop = 1; // landed on a view React had replaced: nothing pressed, and something else may be there now: no second tap
-  await assert.rejects(app.touchscreen.tap(tagOf(minus), 5), { code: "STALE", name: "MantisError" });
+  await assert.rejects(app.touchscreen.tap(tagOf(minus), 5), { code: "STALE", name: "MantisError", tag: tagOf(minus), node: minusNode });
   assert.equal(taps.length, 2);
   silent = true; // unknown: a native view took it, or JS is busy
-  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5, { timeout: 100 }), { seen: false });
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5, { timeout: 100 }), { seen: false, took: tagOf(minus) });
+  const unseen = performance.now(); // timeout 0: only the settle, no waiting for JS
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5, { timeout: 0 }), { seen: false, took: tagOf(minus) });
+  assert(performance.now() - unseen < 100);
   silent = false;
   keyboard = { x: 0, y: 500, width: 400, height: 300 };
   await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /on the keyboard/ });
@@ -309,13 +320,13 @@ function checkContract() {
   await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /not focused/ });
   assert(performance.now() - covered >= 300); // waited for focus first (a window that just opened)
   setTimeout(() => (alert = null), 100); // focus arrives (Android: a Modal's Dialog, ~130 ms after it shows)
-  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true });
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
   alert = { ok: false };
   app.platform = "ios";
-  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), { seen: true });
+  assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
   app.platform = "android";
   alert = null;
-  assert.equal(taps.length, 5);
+  assert.equal(taps.length, 6);
   assert.equal(app.tapAt, undefined); // one API: touchscreen / keyboard
 
   // keyboard.type: one character per Input.typeText into the focused field; partial failure is DELIVERED
@@ -343,7 +354,8 @@ function checkContract() {
   const minusByTag = app.getByTag(tagOf(minus));
   const ctx = app.js.hello.ctx;
   app.js.hello.ctx = "reloaded";
-  await assert.rejects(minusByTag.tap({ force: true }), { code: "STALE", message: /reloaded/ });
+  // err.node: the node as the last snapshot before getByTag had it, to find it again by
+  await assert.rejects(minusByTag.tap({ force: true }), { code: "STALE", message: /reloaded/, tag: tagOf(minus), node: minusNode });
   await assert.rejects(expect(minusByTag).toBeAttached(), { code: "STALE" });
   app.js.hello.ctx = ctx;
   // an app built with an older Mantis: its JS agent can't match tags
@@ -499,11 +511,13 @@ function checkContract() {
   assert.deepEqual(scrolled, [{ tag: tagOf(page), dy: 650 }, { tag: tagOf(shelf), dx: 740 }]);
   // getByTag: a node gone from the tree fails at once, not after the auto-wait
   const stale = performance.now();
-  await assert.rejects(app.getByTag(99999).tap(), { code: "STALE" }); // (the fake keeps every root it saw: no unmounts)
+  await assert.rejects(app.getByTag(99999).tap(), { code: "STALE", tag: 99999, node: null }); // (the fake keeps every root it saw: no unmounts)
   assert(performance.now() - stale < 100);
   // app.scroll(direction): the main scroll view of that axis, half its size
   scrolled.length = 0;
   assert.deepEqual(await app.scroll("down"), { ok: true, tag: tagOf(page), moved: true });
+  // the drag's "touch" event: where the finger went down and how far it moved
+  assert.deepEqual({ ...touches.at(-1), start: 0, end: 0 }, { type: "drag", x: 200, y: 400, dx: 0, dy: -400, start: 0, end: 0, density: 2 });
   assert.deepEqual(await app.scroll("left"), { ok: true, tag: tagOf(shelf), moved: true });
   assert.deepEqual(scrolled, [{ tag: tagOf(page), dy: 400 }, { tag: tagOf(shelf), dx: -200 }]);
   keyboard = { x: 0, y: 500, width: 400, height: 300 };

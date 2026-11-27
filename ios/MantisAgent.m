@@ -209,8 +209,10 @@ static MantisAgent *shared;
   NSString *url = [NSString stringWithFormat:@"ws://localhost:%ld/?role=native", (long)port];
   _ws = [NSURLSession.sharedSession webSocketTaskWithURL:[NSURL URLWithString:url]];
   [_ws resume];
-  // v: src/runner PROTOCOL; token: proves to the runner that it launched this app (simulators share localhost)
-  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @2, @"token": token}}];
+  // v: src/runner PROTOCOL; token: proves to the runner that it launched this app (simulators share localhost);
+  // density: px per point, for the runner's touch events
+  [self send:@{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @2, @"token": token,
+                                                       @"density": @(UIScreen.mainScreen.scale)}}];
   [self receive];
 }
 
@@ -553,12 +555,14 @@ static NSString *transitionReason(UIWindow *w) {
   } else if ([method isEqualToString:@"Input.tap"]) {
     // finger down, held 30 ms, then up. 1 frame is 8 ms at 120 Hz and iOS 26 UISwitch then misses the tap (spike:
     // 1 frame 2/6 toggles, >= 16 ms 12/12), so hold for time, not frames.
+    // took: the innermost React view under the point (hit-test before the touch), null = none
     CGPoint pt = CGPointMake([p[@"x"] doubleValue], [p[@"y"] doubleValue]);
+    id took = [[self hitTest:pt][@"chain"] firstObject] ?: NSNull.null;
     void (^end)(id) = [self fingerDown:pt done:done];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
       MantisGuard(end, ^{
         [self synth:UITouchPhaseEnded at:pt];
-        end(@{@"ok": @YES});
+        end(@{@"ok": @YES, @"took": took});
       });
     });
   } else if ([method isEqualToString:@"Input.scroll"]) {
@@ -615,7 +619,9 @@ static NSString *transitionReason(UIWindow *w) {
           [self afterFrames:2 done:end do:^{
             CGPoint now = clampedOffset(sv, sv.contentOffset);
             BOOL moved = fabs(now.x - startOffset.x) >= 0.5 || fabs(now.y - startOffset.y) >= 0.5;
-            end(@{@"ok": @YES, @"pt": @(amount), @"moved": @(moved)});
+            // from / to: the drag's start and end point, for the runner's touch event
+            end(@{@"ok": @YES, @"pt": @(amount), @"moved": @(moved), @"from": @{@"x": @(a.x), @"y": @(a.y)},
+                  @"to": @{@"x": @(b.x), @"y": @(b.y)}});
           }];
         }
       });

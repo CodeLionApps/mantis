@@ -1,4 +1,6 @@
 // Types of the runner's public API (README: Playwright-style API, Driving from a snapshot, Errors).
+import { EventEmitter } from "node:events";
+
 export type Platform = "android" | "ios";
 
 /** Screen dp (iOS: points), as drawn natively. */
@@ -31,6 +33,10 @@ export class MantisError extends Error {
   reason?: string;
   /** keyboard.type: how many characters went in (NOT_FOCUSED: 0; DELIVERED: before cause). */
   typed?: number;
+  /** STALE: the tag that is gone (getByTag's, or the view under a point tap; null: unknown). */
+  tag?: number | null;
+  /** STALE: that node as the last snapshot had it; null when none had it. */
+  node?: SnapshotNode | null;
 }
 /** A wait that ran out (code TIMEOUT, or NOT_ACTIONABLE / NOT_FOCUSED for an action's auto-wait). */
 export class TimeoutError extends MantisError {}
@@ -142,9 +148,25 @@ export type ScrollResult =
 export interface TapResult {
   /** the app's JS saw the touch */
   seen: boolean;
+  /** tag of the innermost React view the native hit-test found under the point; null: none, or an older agent */
+  took: number | null;
 }
 
-export declare class App {
+/** A touch Mantis injected: x, y where the finger went down, dx, dy how far it moved, screen dp. */
+export interface TouchEvent {
+  type: "tap" | "drag";
+  x: number;
+  y: number;
+  dx: number;
+  dy: number;
+  /** Date.now() around the injection */
+  start: number;
+  end: number;
+  /** px per dp; null: an agent that doesn't send it */
+  density: number | null;
+}
+
+export declare class App extends EventEmitter {
   constructor(port?: number, platform?: Platform);
   readonly port: number;
   platform: Platform;
@@ -169,6 +191,10 @@ export declare class App {
   getByPlaceholder(text: TextMatch, opts?: { exact?: boolean }): Locator;
   /** Raw RPC to the native agent, e.g. call("Page.screenshot") on iOS. */
   readonly native: { call(method: string, params?: object): Promise<any> };
+
+  on(event: "touch", listener: (touch: TouchEvent) => void): this;
+  once(event: "touch", listener: (touch: TouchEvent) => void): this;
+  off(event: "touch", listener: (touch: TouchEvent) => void): this;
 }
 
 export interface Assertions {

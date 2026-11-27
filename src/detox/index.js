@@ -89,7 +89,7 @@ class Element {
   async scroll(offset, direction = "down") {
     const n = await this.scrollView();
     const d = direction === "up" || direction === "left" ? -offset : offset;
-    const r = await app.native.call("Input.scroll", {
+    const r = await app.inject("Input.scroll", {
       tag: n.tag,
       ...(direction === "left" || direction === "right" ? { dx: d } : { dy: d }),
     });
