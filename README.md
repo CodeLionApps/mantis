@@ -237,9 +237,10 @@ without XCTest: no status bar, keyboard or system alerts.
   JS agent keeps the listeners, but only for `app.back()`.
 
 `await app.idle({ quietMs = 100, timeout, since, reactMs = 1000, netMaxMs = Infinity })` waits until the app stands still: no React commit and nothing changed on
-screen for `quietMs`, and no XHR / `fetch` in flight. On screen: Android, a window of the app drew; iOS, a layer changed
-or an animation runs (stack transitions, native-driver and Reanimated frames, scrolling, Modal fades; not the keyboard
-or a text cursor). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a
+screen for `quietMs`, and no XHR / `fetch` in flight. On screen: Android, a window of the app drew or a drawable animates
+on the render thread where no draw is seen (an `ActivityIndicator`); iOS, a layer changed or an animation runs (stack
+transitions, native-driver and Reanimated frames, scrolling, Modal fades; not the keyboard or a text cursor). A spinner
+that is mounted but not seen (transparent, off screen) doesn't count, on either platform. `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a
 transition. On timeout it throws, naming what is still busy: a spinner or a looping animation never stops. JS timers
 are not tracked. On Android a focused text field's caret draws every 500 ms, so `quietMs` of 500 or more never passes
 while a field is focused.
