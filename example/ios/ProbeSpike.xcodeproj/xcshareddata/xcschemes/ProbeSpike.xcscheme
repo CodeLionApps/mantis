@@ -38,16 +38,6 @@
                ReferencedContainer = "container:ProbeSpike.xcodeproj">
             </BuildableReference>
          </TestableReference>
-         <TestableReference
-            skipped = "NO">
-            <BuildableReference
-               BuildableIdentifier = "primary"
-               BlueprintIdentifier = "A2A7E9E9B1426EB5382B16AB"
-               BuildableName = "ProbeSpikeUITests.xctest"
-               BlueprintName = "ProbeSpikeUITests"
-               ReferencedContainer = "container:ProbeSpike.xcodeproj">
-            </BuildableReference>
-         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction

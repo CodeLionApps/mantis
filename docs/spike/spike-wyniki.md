@@ -28,7 +28,7 @@ Kod: `ProbeSpike/` (aplikacja + agent + runner). Odniesienia do sekcji z `rn-e2e
 - `index.e2e.js` to osobny entry (agent musi być pierwszy). Android: `jsMainModulePath`/`entryFile`, iOS: `ENTRY_FILE` w fazie bundlowania.
 - `android/.../ProbeAgent.kt` to natywny agent z **własnym WebSocketem** (OkHttp), niezależnym od wątku JS. Robi pomiar, stabilność w 2 klatkach `Choreographer`, hit-test przez RN-owy `TouchTargetHelper` + IME jako overlay, tap przez `MotionEvent` → `decorView.dispatchTouchEvent`, tekst przez `InputConnection.commitText`, reload.
 - `ios/ProbeSpike/ProbeAgent.m` to natywny agent iOS (start przez `+load`, `NSURLSessionWebSocketTask`): `viewWithTag`, `hitTest:`, stabilność na `presentationLayer`, reload przez `RCTTriggerReloadCommandListeners`. Bez syntezy dotyku.
-- `ios/ProbeSpikeUITests/` zawiera pomiary Q4 (XCUITest).
+- `ios/ProbeSpikeUITests/` zawierał pomiary Q4 (XCUITest); usunięty z `example/`, jest w historii gita (np. commit `9b58f2b`, `example/ios/ProbeSpikeUITests/`).
 - `probe/runner/probe.mjs` to runner: serwer WS, `getByRole/Text/Label`, `tap`, `fill`, `expect().toBeVisible()`, actionability loop z retry na `commit | 1 klatka`.
 
 ## 2. Kryterium fazy 0 (Android)
@@ -136,5 +136,5 @@ cd ios && xcodebuild build-for-testing -workspace ProbeSpike.xcworkspace -scheme
 # Q1–Q3: zainstaluj build/dd/Build/Products/Release-iphonesimulator/ProbeSpike.app, potem:
 node ../probe/runner/questions-ios.mjs   # i uruchom apkę (Android musi być zatrzymany: wspólny port 9123)
 # Q4:
-xcodebuild test-without-building ... -only-testing:ProbeSpikeUITests   # grep PROBE_Q4
+xcodebuild test-without-building ... -only-testing:ProbeSpikeUITests   # grep PROBE_Q4 (target tylko w historii gita, patrz wyżej)
 ```

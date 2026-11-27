@@ -10,51 +10,26 @@
 		01706A0D78EB55384AC9CE35 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */; };
 		0C80B921A6F3F58F76C31292 /* libPods-ProbeSpike.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 5DCACB8F33CDC322A6C60F78 /* libPods-ProbeSpike.a */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
-		4C6E307C9F66E5F8B1132017 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 793AAD8EDEB638DF3D289626 /* Foundation.framework */; };
-		515842E46BE8B151FA5CACC2 /* FastTapTests.m in Sources */ = {isa = PBXBuildFile; fileRef = DE506BF41F44049C56B3C697 /* FastTapTests.m */; };
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
 		761780EF2CA45674006654EF /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EE2CA45674006654EF /* SceneDelegate.swift */; };
 		81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */; };
-		C3AC4592B477F3EF8633F107 /* TapLatencyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15D1E3EE24AF3259FF935D60 /* TapLatencyTests.swift */; };
 /* End PBXBuildFile section */
-
-/* Begin PBXContainerItemProxy section */
-		27F1AF7D0F7B421FEBE9A147 /* PBXContainerItemProxy */ = {
-			isa = PBXContainerItemProxy;
-			containerPortal = 83CBB9F71A601CBA00E9B192 /* Project object */;
-			proxyType = 1;
-			remoteGlobalIDString = 13B07F861A680F5B00A75B9A;
-			remoteInfo = ProbeSpike;
-		};
-/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		13B07F961A680F5B00A75B9A /* ProbeSpike.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = ProbeSpike.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = ProbeSpike/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = ProbeSpike/Info.plist; sourceTree = "<group>"; };
 		13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = PrivacyInfo.xcprivacy; path = ProbeSpike/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
-		15D1E3EE24AF3259FF935D60 /* TapLatencyTests.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TapLatencyTests.swift; sourceTree = "<group>"; };
-		209C0465FEC0374DB7EA48E1 /* ProbeSpikeUITests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = ProbeSpikeUITests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		3B4392A12AC88292D35C810B /* Pods-ProbeSpike.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-ProbeSpike.debug.xcconfig"; path = "Target Support Files/Pods-ProbeSpike/Pods-ProbeSpike.debug.xcconfig"; sourceTree = "<group>"; };
 		5709B34CF0A7D63546082F79 /* Pods-ProbeSpike.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-ProbeSpike.release.xcconfig"; path = "Target Support Files/Pods-ProbeSpike/Pods-ProbeSpike.release.xcconfig"; sourceTree = "<group>"; };
 		5DCACB8F33CDC322A6C60F78 /* libPods-ProbeSpike.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-ProbeSpike.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		761780EC2CA45674006654EE /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = ProbeSpike/AppDelegate.swift; sourceTree = "<group>"; };
 		761780EE2CA45674006654EF /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = SceneDelegate.swift; path = ProbeSpike/SceneDelegate.swift; sourceTree = "<group>"; };
-		793AAD8EDEB638DF3D289626 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		81AB9BB72411601600AC10FF /* LaunchScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = LaunchScreen.storyboard; path = ProbeSpike/LaunchScreen.storyboard; sourceTree = "<group>"; };
-		DE506BF41F44049C56B3C697 /* FastTapTests.m */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.c.objc; path = FastTapTests.m; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		08A8C62ECF4047614F339D29 /* Frameworks */ = {
-			isa = PBXFrameworksBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				4C6E307C9F66E5F8B1132017 /* Foundation.framework in Frameworks */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 		13B07F8C1A680F5B00A75B9A /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -104,7 +79,6 @@
 				83CBBA001A601CBA00E9B192 /* Products */,
 				2D16E6871FA4F8E400B85C8A /* Frameworks */,
 				BBD78D7AC51CEA395F1C20DB /* Pods */,
-				92A1B3745A0B2594F6E05AE1 /* ProbeSpikeUITests */,
 			);
 			indentWidth = 2;
 			sourceTree = "<group>";
@@ -115,19 +89,8 @@
 			isa = PBXGroup;
 			children = (
 				13B07F961A680F5B00A75B9A /* ProbeSpike.app */,
-				209C0465FEC0374DB7EA48E1 /* ProbeSpikeUITests.xctest */,
 			);
 			name = Products;
-			sourceTree = "<group>";
-		};
-		92A1B3745A0B2594F6E05AE1 /* ProbeSpikeUITests */ = {
-			isa = PBXGroup;
-			children = (
-				15D1E3EE24AF3259FF935D60 /* TapLatencyTests.swift */,
-				DE506BF41F44049C56B3C697 /* FastTapTests.m */,
-			);
-			name = ProbeSpikeUITests;
-			path = ProbeSpikeUITests;
 			sourceTree = "<group>";
 		};
 		BBD78D7AC51CEA395F1C20DB /* Pods */ = {
@@ -142,7 +105,6 @@
 		D0E41F3D94DBA970FBBA862D /* iOS */ = {
 			isa = PBXGroup;
 			children = (
-				793AAD8EDEB638DF3D289626 /* Foundation.framework */,
 			);
 			name = iOS;
 			sourceTree = "<group>";
@@ -171,24 +133,6 @@
 			productReference = 13B07F961A680F5B00A75B9A /* ProbeSpike.app */;
 			productType = "com.apple.product-type.application";
 		};
-		A2A7E9E9B1426EB5382B16AB /* ProbeSpikeUITests */ = {
-			isa = PBXNativeTarget;
-			buildConfigurationList = 1D5D3D353B3248E9C4A0A204 /* Build configuration list for PBXNativeTarget "ProbeSpikeUITests" */;
-			buildPhases = (
-				3D473A93C300C3CB3A673C50 /* Sources */,
-				08A8C62ECF4047614F339D29 /* Frameworks */,
-				E3341D1FF4BD11997C3D9572 /* Resources */,
-			);
-			buildRules = (
-			);
-			dependencies = (
-				5A6517E1DA07645ECEC78B23 /* PBXTargetDependency */,
-			);
-			name = ProbeSpikeUITests;
-			productName = ProbeSpikeUITests;
-			productReference = 209C0465FEC0374DB7EA48E1 /* ProbeSpikeUITests.xctest */;
-			productType = "com.apple.product-type.bundle.ui-testing";
-		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -216,7 +160,6 @@
 			projectRoot = "";
 			targets = (
 				13B07F861A680F5B00A75B9A /* ProbeSpike */,
-				A2A7E9E9B1426EB5382B16AB /* ProbeSpikeUITests */,
 			);
 		};
 /* End PBXProject section */
@@ -229,13 +172,6 @@
 				81AB9BB82411601600AC10FF /* LaunchScreen.storyboard in Resources */,
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
 				01706A0D78EB55384AC9CE35 /* PrivacyInfo.xcprivacy in Resources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
-		E3341D1FF4BD11997C3D9572 /* Resources */ = {
-			isa = PBXResourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -326,25 +262,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
-		3D473A93C300C3CB3A673C50 /* Sources */ = {
-			isa = PBXSourcesBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-				C3AC4592B477F3EF8633F107 /* TapLatencyTests.swift in Sources */,
-				515842E46BE8B151FA5CACC2 /* FastTapTests.m in Sources */,
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-		};
 /* End PBXSourcesBuildPhase section */
-
-/* Begin PBXTargetDependency section */
-		5A6517E1DA07645ECEC78B23 /* PBXTargetDependency */ = {
-			isa = PBXTargetDependency;
-			name = ProbeSpike;
-			target = 13B07F861A680F5B00A75B9A /* ProbeSpike */;
-			targetProxy = 27F1AF7D0F7B421FEBE9A147 /* PBXContainerItemProxy */;
-		};
-/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		13B07F941A680F5B00A75B9A /* Debug */ = {
@@ -402,37 +320,6 @@
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = "1,2";
 				VERSIONING_SYSTEM = "apple-generic";
-			};
-			name = Release;
-		};
-		348254C5486B68A2AE7D408D /* Debug */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CLANG_ENABLE_OBJC_WEAK = NO;
-				CODE_SIGN_STYLE = Automatic;
-				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
-				PRODUCT_BUNDLE_IDENTIFIER = org.reactjs.native.example.ProbeSpikeUITests;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = iphoneos;
-				SWIFT_VERSION = 5.0;
-				TEST_TARGET_NAME = ProbeSpike;
-			};
-			name = Debug;
-		};
-		7AED3E51A8A05683076B3A0C /* Release */ = {
-			isa = XCBuildConfiguration;
-			buildSettings = {
-				CLANG_ENABLE_OBJC_WEAK = NO;
-				CODE_SIGN_STYLE = Automatic;
-				GENERATE_INFOPLIST_FILE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
-				PRODUCT_BUNDLE_IDENTIFIER = org.reactjs.native.example.ProbeSpikeUITests;
-				PRODUCT_NAME = "$(TARGET_NAME)";
-				SDKROOT = iphoneos;
-				SWIFT_VERSION = 5.0;
-				TEST_TARGET_NAME = ProbeSpike;
-				VALIDATE_PRODUCT = YES;
 			};
 			name = Release;
 		};
@@ -600,15 +487,6 @@
 			buildConfigurations = (
 				13B07F941A680F5B00A75B9A /* Debug */,
 				13B07F951A680F5B00A75B9A /* Release */,
-			);
-			defaultConfigurationIsVisible = 0;
-			defaultConfigurationName = Release;
-		};
-		1D5D3D353B3248E9C4A0A204 /* Build configuration list for PBXNativeTarget "ProbeSpikeUITests" */ = {
-			isa = XCConfigurationList;
-			buildConfigurations = (
-				7AED3E51A8A05683076B3A0C /* Release */,
-				348254C5486B68A2AE7D408D /* Debug */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
