@@ -3,14 +3,24 @@ package com.codelion.mantis
 import android.app.Activity
 import android.app.Application
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Matrix
+import android.graphics.Paint
+import android.graphics.Point
 import android.graphics.Rect
 import android.graphics.RectF
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
+import android.util.Base64
 import android.util.TypedValue
+import android.view.PixelCopy
+import android.view.WindowManager
 import android.view.Choreographer
 import android.view.InputDevice
 import android.view.KeyCharacterMap
@@ -580,8 +590,71 @@ object MantisAgent {
         done(JSONObject().put("draws", draws).put("idleMs", SystemClock.uptimeMillis() - lastDraw))
       }
 
+      // The app's own windows, bottom-up, composed as on screen, as PNG base64 (iOS: same). No system UI: status bar
+      // icons, navigation bar, keyboard (another process), system dialogs. scale: px per dp (default 1).
+      "Page.screenshot" -> screenshot(p.optDouble("scale", 1.0).takeIf { it > 0 }?.toFloat() ?: 1f, done)
+
       else -> error("unknown method $method")
     }
+  }
+
+  private val shot by lazy { Handler(HandlerThread("mantis-screenshot").apply { start() }.looper) }
+
+  /**
+   * Each window read back by PixelCopy (what the GPU drew: hardware layers, TextureView; not a SurfaceView's own
+   * surface), then scaled, composed and PNG-encoded on [shot]: the UI thread only starts the copies.
+   * PixelCopy needs API 34 for any window (Dialog, popup), 26 for the activity's; a window it can't copy is drawn
+   * by View.draw on the UI thread (`fallbacks`). A dimming window (FLAG_DIM_BEHIND: an AlertDialog) dims what is under it.
+   */
+  private fun screenshot(scale: Float, done: (Any?) -> Unit) {
+    val k = scale / density
+    val size = Point().also { @Suppress("DEPRECATION") (app.getSystemService(Context.WINDOW_SERVICE) as WindowManager).defaultDisplay.getRealSize(it) }
+    class Layer(val win: View) {
+      val at = IntArray(2).also { win.getLocationOnScreen(it) }
+      val dim = (win.layoutParams as? WindowManager.LayoutParams)?.takeIf { it.flags and WindowManager.LayoutParams.FLAG_DIM_BEHIND != 0 }?.dimAmount ?: 0f
+      var bmp: Bitmap? = null
+    }
+    val layers = roots().filter { it.width > 0 && it.height > 0 }.reversed().map { Layer(it) }
+    val compose = { fallbacks: Int ->
+      val out = Bitmap.createBitmap((size.x * k).roundToInt(), (size.y * k).roundToInt(), Bitmap.Config.ARGB_8888)
+      val c = Canvas(out)
+      c.drawColor(Color.BLACK)
+      val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+      for (l in layers) {
+        if (l.dim > 0) c.drawColor(Color.argb((l.dim * 255).roundToInt(), 0, 0, 0))
+        val b = l.bmp ?: continue
+        // a surface is larger than its window by its insets (an elevated dialog's shadow), the same on every side
+        c.drawBitmap(b, Matrix().apply {
+          setTranslate(l.at[0] - (b.width - l.win.width) / 2f, l.at[1] - (b.height - l.win.height) / 2f)
+          postScale(k, k)
+        }, paint)
+      }
+      val png = java.io.ByteArrayOutputStream().also { out.compress(Bitmap.CompressFormat.PNG, 100, it) }.toByteArray()
+      done(JSONObject().put("ok", true).put("fallbacks", fallbacks)
+        .put("windows", JSONArray(layers.map { it.win.javaClass.simpleName })).put("png", Base64.encodeToString(png, Base64.NO_WRAP)))
+    }
+    // after the last copy: the windows PixelCopy couldn't read drawn on the UI thread, then composed on [shot]
+    val finish = { main.post { guard(done) {
+      val missing = layers.filter { it.bmp == null }
+      for (l in missing) l.bmp = Bitmap.createBitmap(l.win.width, l.win.height, Bitmap.Config.ARGB_8888).also { l.win.draw(Canvas(it)) }
+      shot.post { guard(done) { compose(missing.size) } }
+    } } }
+    var pending = layers.size
+    val copied = { l: Layer, b: Bitmap? -> l.bmp = b; if (--pending == 0) finish() } // on [shot]
+    for (l in layers) if (!pixelCopy(l.win) { copied(l, it) }) shot.post { copied(l, null) }
+    if (layers.isEmpty()) finish()
+  }
+
+  /** Starts a PixelCopy of [win]'s window: [cb] on [shot], with its surface (insets included) or null. false = not on this API. */
+  private fun pixelCopy(win: View, cb: (Bitmap?) -> Unit): Boolean {
+    if (Build.VERSION.SDK_INT >= 34) return runCatching {
+      PixelCopy.request(PixelCopy.Request.Builder.ofWindow(win).build(), { shot.post(it) }) {
+        cb(if (it.status == PixelCopy.SUCCESS) it.bitmap else null)
+      }
+    }.isSuccess
+    val w = activity?.window?.takeIf { it.decorView === win && Build.VERSION.SDK_INT >= 26 } ?: return false
+    val b = Bitmap.createBitmap(win.width, win.height, Bitmap.Config.ARGB_8888)
+    return runCatching { PixelCopy.request(w, b, { cb(if (it == PixelCopy.SUCCESS) b else null) }, shot) }.isSuccess
   }
 
   private val drawWatched = java.util.WeakHashMap<View, Boolean>()
