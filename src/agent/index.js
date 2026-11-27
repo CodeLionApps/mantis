@@ -143,6 +143,7 @@ function matchText(actual, expected) {
 
 function matchesSelf(fiber, sel) {
   const p = fiber.memoizedProps || {};
+  if (sel.tag != null) return nativeTagOf(fiber) === sel.tag;
   if (sel.testId != null) return p.testID === sel.testId;
   if (sel.role != null)
     return roleOf(p) === sel.role && matchText(accessibleName(fiber), sel.name);
@@ -270,9 +271,9 @@ function query(sel) {
 }
 
 // Whole-screen snapshot for an LLM driver: one pass over the fibers, host nodes worth showing (text,
-// testID, label, role, text input, touch handler, scroll view). parent = index of the nearest included host
-// ancestor. rect = getBoundingClientRect: dp from the React root's origin (= screen dp for an edge-to-edge root).
-// Empty boxes and boxes fully outside the screen are dropped; what's covered or on screens below is the native
+// testID, label, role, text input, touch handler, scroll view, WebView: a page the tree doesn't show). parent = index
+// of the nearest included host ancestor. rect = getBoundingClientRect: dp from the React root's origin (= screen dp
+// for an edge-to-edge root). Empty boxes and boxes fully outside the screen are dropped; what's covered or on screens below is the native
 // half's job (App.snapshot joins both). ponytail: a <Text> is one node, links nested in it aren't listed.
 // <Modal>'s host: "ModalHostView" (its codegen name, Fabric), "RCTModalHostView" before RN dropped the Paper name
 const isModal = (f) => f.type === "ModalHostView" || f.type === "RCTModalHostView";
@@ -323,10 +324,12 @@ function snapshot() {
       const pressable =
         f.type === "RNGestureHandlerButton" || (tap && !detector) || PRESS_PROPS.some((k) => typeof p[k] === "function") ||
         PRESS_ROLES.includes(role) || (p.accessible === true && typeof p.onAccessibilityTap === "function");
-      const scroll = isScroller(f);
+      // scrollEnabled false: no finger scrolls it
+      const scroll = isScroller(f) && p.scrollEnabled !== false;
+      const web = /webview/i.test(f.type);
       let i = -1;
       // a Modal's host sits where <Modal> is in the tree, not where its window is: only its content counts
-      if (!isModal(f) && (own || p.testID != null || label != null || role != null || input || pressable || scroll)) {
+      if (!isModal(f) && (own || p.testID != null || label != null || role != null || input || pressable || scroll || web)) {
         const rect = rectOf(f);
         const onScreen =
           rect.width > 0 && rect.height > 0 && rect.x < screen.width && rect.y < screen.height &&
@@ -342,9 +345,11 @@ function snapshot() {
             name: null, // below, once the subtree's text is known
             text: own,
             role: role ?? null,
-            // RN passes value ?? defaultValue as text: an uncontrolled input shows its default, not what was typed since
-            // (that lives natively). Never a password or code: a mask when there is one.
-            value: !input ? null : isSecret(f) && (p.text ?? p.value) ? "••••••••" : (p.text ?? p.value ?? null),
+            // a controlled input's value (TextInput passes its props on); an uncontrolled one's text lives natively:
+            // null, not its defaultValue. Never a password or code: a mask when there is one.
+            // the runner takes the native text instead when the native agent reports it (uncontrolled ones too)
+            value: !input || typeof p.value !== "string" ? null : isSecret(f) && p.value ? "••••••••" : p.value,
+            secret: isSecret(f),
             placeholder: input ? (p.placeholder ?? null) : null,
             editable: input && p.editable !== false,
             pressable,
@@ -352,6 +357,7 @@ function snapshot() {
             selected: s.selected ?? p["aria-selected"] ?? null,
             checked: s.checked ?? p["aria-checked"] ?? null,
             scroll,
+            horizontal: scroll && isHorizontal(f),
             rect,
           }) - 1;
         }
@@ -537,6 +543,8 @@ function connect() {
         error: checkInternals(),
         ctx: CTX,
         commitId,
+        // the runner's getByTag / scroll need this agent: tag selector, snapshot horizontal / WebView / secret
+        features: ["driver"],
       },
     });
   };

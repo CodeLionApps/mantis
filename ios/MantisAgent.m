@@ -344,6 +344,14 @@ static UIScrollView *nearestScroller(UIView *v) {
   return nil;
 }
 
+// o clamped to the scroll view's range: a drag at the end bounces past it, which moves nothing
+static CGPoint clampedOffset(UIScrollView *sv, CGPoint o) {
+  UIEdgeInsets in = sv.adjustedContentInset;
+  CGFloat maxX = MAX(-in.left, sv.contentSize.width + in.right - sv.bounds.size.width);
+  CGFloat maxY = MAX(-in.top, sv.contentSize.height + in.bottom - sv.bounds.size.height);
+  return CGPointMake(MIN(MAX(o.x, -in.left), maxX), MIN(MAX(o.y, -in.top), maxY));
+}
+
 // RN's tagged RCTScrollViewComponentView wraps the actual UIScrollView
 static UIScrollView *scrollViewIn(UIView *v) {
   if ([v isKindOfClass:UIScrollView.class]) return (UIScrollView *)v;
@@ -468,17 +476,34 @@ static NSString *transitionReason(UIWindow *w) {
       [ratios addObject:@(visibleRatio(v))];
       [shownOut addObject:@(v && shown(v))];
     }
-    if (![p[@"hit"] boolValue]) return done(@{@"ratios": ratios, @"shown": shownOut});
+    // inputs (tags): texts, each one's text as it is natively (an uncontrolled input's too), masked for the tags in secret
+    // (passwords never leave the device); null = no text field there
+    NSMutableDictionary *res = [@{@"ratios": ratios, @"shown": shownOut} mutableCopy];
+    if ([p[@"inputs"] isKindOfClass:NSArray.class]) {
+      NSSet *secret = [NSSet setWithArray:[p[@"secret"] isKindOfClass:NSArray.class] ? p[@"secret"] : @[]];
+      NSMutableArray *texts = [NSMutableArray array];
+      for (id t in p[@"inputs"]) {
+        UIView *ti = [t isKindOfClass:NSNumber.class] ? textInputIn([self viewForTag:[t integerValue]]) : nil;
+        NSString *s = [ti respondsToSelector:@selector(text)] ? [(id)ti text] : nil;
+        [texts addObject:!s ? NSNull.null : [secret containsObject:t] ? (s.length ? @"••••••••" : @"") : s];
+      }
+      res[@"texts"] = texts;
+    }
+    if (![p[@"hit"] boolValue]) return done(res);
     // hit: true (App.snapshot), as on Android: per tag whether a touch at the centre of its visible part reaches it, and
     // once focused (app active, no UIAlertController on top: a system alert makes the app inactive), keyboard (frame
-    // from UIKeyboardWillChangeFrame, screen points, or null) and screen size. Points = dp, density = scale.
+    // from UIKeyboardWillChangeFrame, screen points, or null) and screen size. Points = dp, density = scale. rects: each
+    // tag's screen rect as drawn now (null = not shown).
     NSMutableArray *hits = [NSMutableArray array], *ats = [NSMutableArray array]; // at: tag the centre touch landed on
+    NSMutableArray *rects = [NSMutableArray array];
     NSArray *tags = p[@"tags"];
     for (NSUInteger i = 0; i < tags.count; i++) {
       UIView *v = [tags[i] isKindOfClass:NSNumber.class] ? [self viewForTag:[tags[i] integerValue]] : nil;
       id at = NSNull.null;
-      [hits addObject:[ratios[i] doubleValue] > 0 && [self reaches:v at:&at] ? @YES : @NO];
+      BOOL seen = [ratios[i] doubleValue] > 0;
+      [hits addObject:seen && [self reaches:v at:&at] ? @YES : @NO];
       [ats addObject:at];
+      [rects addObject:seen ? R(presentedRect(v)) : NSNull.null];
     }
     UIViewController *top = self.windows.firstObject.rootViewController;
     for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
@@ -488,10 +513,11 @@ static NSString *transitionReason(UIWindow *w) {
     CGRect kb = CGRectIntersection(_keyboard, screen);
     // appState (UIApplicationState: 0 active, 1 inactive = a system alert / Control Center / the lock screen over it, 2 background),
     // why focused is false: an alert of the app's own or the system's, or a screen that is off.
-    done(@{@"ratios": ratios, @"shown": shownOut, @"hit": hits, @"at": ats, @"focused": @(focused),
+    [res addEntriesFromDictionary:@{@"hit": hits, @"at": ats, @"rects": rects, @"focused": @(focused),
            @"appState": @(UIApplication.sharedApplication.applicationState), @"top": NSStringFromClass(top.class) ?: NSNull.null,
            @"keyboard": CGRectIsNull(kb) || kb.size.height < 1 ? NSNull.null : R(kb),
-           @"screen": @{@"width": @(screen.size.width), @"height": @(screen.size.height), @"density": @(UIScreen.mainScreen.scale)}});
+           @"screen": @{@"width": @(screen.size.width), @"height": @(screen.size.height), @"density": @(UIScreen.mainScreen.scale)}}];
+    done(res);
   } else if ([method isEqualToString:@"Action.check"]) {
     // Actionability, native half: mounted, stable over 2 frames, in viewport (not clipped by a scroll view; delta
     // tells the runner where to scroll), no VC transition, hit-test reaches it.
@@ -551,7 +577,7 @@ static NSString *transitionReason(UIWindow *w) {
     double want = [p[horizontal ? @"dx" : @"dy"] doubleValue];
     // 0 would put down and up on one point: a tap on whatever is under it
     if (want == 0) return done(@{@"ok": @NO, @"reason": @"dx/dy is 0, nothing to scroll"});
-    CGPoint startOffset = sv.contentOffset;
+    CGPoint startOffset = clampedOffset(sv, sv.contentOffset);
     double amount = MIN(fabs(want) + slop, (horizontal ? vp.size.width : vp.size.height) * 0.8) * (want < 0 ? -1 : 1);
     // the drag: a -> b through the visible centre, along the axis
     CGVector half = horizontal ? CGVectorMake(amount / 2, 0) : CGVectorMake(0, amount / 2);
@@ -587,7 +613,9 @@ static NSString *transitionReason(UIWindow *w) {
           // 2 frames: lets the scroll events of the release reach the JS queue before the runner queries again
           // moved: NO = the drag happened but the content didn't move (at its end), the runner stops scrolling
           [self afterFrames:2 done:end do:^{
-            end(@{@"ok": @YES, @"pt": @(amount), @"moved": @(!CGPointEqualToPoint(startOffset, sv.contentOffset))});
+            CGPoint now = clampedOffset(sv, sv.contentOffset);
+            BOOL moved = fabs(now.x - startOffset.x) >= 0.5 || fabs(now.y - startOffset.y) >= 0.5;
+            end(@{@"ok": @YES, @"pt": @(amount), @"moved": @(moved)});
           }];
         }
       });
@@ -617,7 +645,23 @@ static NSString *transitionReason(UIWindow *w) {
       return done(@{@"ok": @NO, @"reason": [NSString stringWithFormat:@"focus still on tag %@", ftag]});
     id<UITextInput> ti = (id<UITextInput>)fr;
     if ([p[@"replace"] boolValue]) ti.selectedTextRange = [ti textRangeFromPosition:ti.beginningOfDocument toPosition:ti.endOfDocument];
-    [ti insertText:p[@"text"]];
+    // key: as the keyboard types, the field's delegate first (RN: onKeyPress, maxLength; it may insert a cut version
+    // itself and say NO), the text only if it agrees. insertText: alone skips the delegate.
+    BOOL go = YES;
+    if ([p[@"key"] boolValue]) {
+      UITextRange *sel = ti.selectedTextRange;
+      NSRange range = NSMakeRange([ti offsetFromPosition:ti.beginningOfDocument toPosition:sel.start], [ti offsetFromPosition:sel.start toPosition:sel.end]);
+      if ([fr isKindOfClass:UITextField.class]) {
+        UITextField *tf = (UITextField *)fr;
+        if ([tf.delegate respondsToSelector:@selector(textField:shouldChangeCharactersInRange:replacementString:)])
+          go = [tf.delegate textField:tf shouldChangeCharactersInRange:range replacementString:p[@"text"]];
+      } else if ([fr isKindOfClass:UITextView.class]) {
+        UITextView *tv = (UITextView *)fr;
+        if ([tv.delegate respondsToSelector:@selector(textView:shouldChangeTextInRange:replacementText:)])
+          go = [tv.delegate textView:tv shouldChangeTextInRange:range replacementText:p[@"text"]];
+      }
+    }
+    if (go) [ti insertText:p[@"text"]];
     done(@{@"ok": @YES, @"focusedTag": ftag});
   } else if ([method isEqualToString:@"Input.focus"]) {
     // fill on a text input no tap can reach (see transparent): focus it the way a tap would
