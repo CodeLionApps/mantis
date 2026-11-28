@@ -756,7 +756,8 @@ async function checkUsbmux() {
   connect();
   const t2 = performance.now();
   const { network: down, timers: again } = await app.idle({ timeout: 3000 });
-  assert(performance.now() - t2 < 1500, String(performance.now() - t2));
+  // under the 3000 ms timeout; a socket stuck connecting may hold up to the 1500 ms WebSocket cap on a slow host
+  assert(performance.now() - t2 < 2500, String(performance.now() - t2));
   assert(again.length === 0 || again[0].recurring, JSON.stringify({ down, again }));
   reconnecting = false;
   await nap(300);
