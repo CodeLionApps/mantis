@@ -763,7 +763,8 @@ async function checkUsbmux() {
   assert(again.length === 0 || again[0].recurring, JSON.stringify({ down, again }));
   reconnecting = false;
   await nap(300); // a reconnect timer that was pending has fired by now
-  await last.closed; // a failed connect can take seconds on some hosts (CI)
+  last.close(); // a failed connect can take seconds (or hang) on some hosts (CI): end the last attempt ourselves
+  await Promise.race([last.closed, nap(2000)]);
   await nap(50);
   assert.deepEqual(await app.idle(), { network: [], timers: [] });
 
