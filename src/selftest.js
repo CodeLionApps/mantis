@@ -264,8 +264,10 @@ async function checkStuck() {
   const app = new App(); // Android, a free port
   await app.start();
   const url = (role) => `ws://127.0.0.1:${app.port}/?role=${role}`;
-  let mainMs = 100; // the native agent's Agent.alive; Infinity: no answer (the whole app is suspended)
+  let beat = performance.now(); // the native main thread's last heartbeat; null: it beats right now (runs)
   let mainStuck = false; // the native main thread runs nothing: its calls wait
+  let woke = 0; // the next n Agent.alive answers count a sleep the process just woke from
+  let silentApp = false; // nothing in the app answers (suspended)
   let jsStuck = false; // the JS thread runs nothing: its calls wait until it runs again
   const queued = [];
   const agent = (role, features, answer) => {
@@ -274,11 +276,17 @@ async function checkStuck() {
     ws.onmessage = (e) => answer(JSON.parse(e.data), (id, result) => ws.send(JSON.stringify({ id, result })));
     return ws;
   };
-  const native = agent("native", ["token", "alive"], ({ id, method, params }, reply) => {
-    if (method === "Agent.alive") return mainMs !== Infinity && reply(id, { mainMs });
-    if (method === "Slow") return setTimeout(() => reply(id, {}), 1500); // a long call; main keeps running
-    if (!mainStuck) reply(id, method === "Agent.ping" ? { draws: 0, idleMs: 1000 } : { ratios: [] });
-  });
+  const native = () =>
+    agent("native", ["token", "alive"], ({ id, method }, reply) => {
+      if (method === "Agent.alive") {
+        if (silentApp) return;
+        if (!mainStuck) beat = performance.now();
+        return reply(id, { mainMs: woke-- > 0 ? 60000 : performance.now() - beat });
+      }
+      if (method === "Slow") return setTimeout(() => reply(id, {}), 1500); // a long call; main keeps running
+      if (!mainStuck) reply(id, method === "Agent.ping" ? { draws: 0, idleMs: 1000 } : { ratios: [] });
+    });
+  let nativeWs = native();
   const js = agent("js", ["driver", "token"], (msg, reply) => {
     const answer = () => reply(msg.id, msg.method === "Agent.ping" ? { commitId: 1, idleMs: 1000 } : { nodes: [] });
     if (jsStuck) queued.push(answer);
@@ -290,40 +298,68 @@ async function checkStuck() {
     await assert.rejects(p, expected);
     return performance.now() - t;
   };
+  const isMain = (code) => (e) => e.code === code && e.stuck.thread === "main" && e.stuck.forMs >= 60000;
 
-  // main stuck long ago (a crash dialog): the first call knows at its first probe, the next ones at once
-  mainMs = 60000;
+  // a process that just woke (suspended, Android's freezer) answers once with the sleep counted: not stuck
+  woke = 1;
+  assert.equal(await app.native.probe(), null);
+  assert.equal(await app.native.probe(), null);
+
+  // main stuck long ago (a crash dialog): the first call knows at its second probe, the next ones at once
   mainStuck = true;
-  const main = { thread: "main", forMs: 60000 };
-  assert(await took(app.native.call("Layout.visibility", { tags: [] }), { code: "TIMEOUT", name: "TimeoutError", stuck: main }) < 3000);
-  assert(await took(app.native.call("Layout.visibility", { tags: [] }), { code: "TIMEOUT", stuck: main, message: /main thread is stuck/ }) < 1500);
+  beat = performance.now() - 60000;
+  assert(await took(app.native.call("Layout.visibility", { tags: [] }), isMain("TIMEOUT")) < 3000);
+  assert(await took(app.native.call("Layout.visibility", { tags: [] }), (e) => isMain("TIMEOUT")(e) && /main thread is stuck/.test(e.message)) < 1500);
   // an action may still run once main does: DELIVERED, with the fact
-  await assert.rejects(app.native.call("Input.tap", { x: 1, y: 1 }), { code: "DELIVERED", stuck: main });
-  await assert.rejects(app.idle(), { code: "TIMEOUT", stuck: main, busy: { thread: "main" }, message: /^app not idle: the app's main thread is stuck/ });
+  await assert.rejects(app.native.call("Input.tap", { x: 1, y: 1 }), isMain("DELIVERED"));
+  await assert.rejects(app.idle(), (e) => isMain("TIMEOUT")(e) && e.busy.thread === "main" && /^app not idle: the app's main thread is stuck/.test(e.message));
+  await assert.rejects(app.mark(), (e) => isMain("TIMEOUT")(e) && /^mark: the app's main thread is stuck/.test(e.message));
+  // an agent without Agent.alive (older Mantis): never stuck
+  const features = app.native.hello.features;
+  app.native.hello.features = ["token"];
+  assert.equal(await app.native.probe(), null);
+  app.native.hello.features = features;
+  // iOS: the JS agent's socket runs on the main queue, so a JS call reports main
+  app.platform = "ios";
+  await app.js.probe(); // the first answer since the one above (no Agent.alive) can't tell
+  assert.equal((await app.js.probe())?.thread, "main");
+  app.platform = "android";
+  assert.equal(await app.js.probe(), null); // Android: JS answers on its own
   // main runs again: calls work; a long call while main keeps running is not stuck
-  mainMs = 100;
   mainStuck = false;
   await app.native.call("Layout.visibility", { tags: [] });
   await app.native.call("Slow");
+  // a reconnect (relaunch) starts over: nothing remembered
+  mainStuck = true;
+  beat = performance.now() - 60000;
+  await app.native.probe();
+  app.native.stuck = await app.native.probe();
+  assert.equal(app.native.stuck?.thread, "main");
+  mainStuck = false;
+  nativeWs.close();
+  await new Promise((r) => setTimeout(r, 50));
+  nativeWs = native();
+  await app.native.ready();
+  assert.deepEqual([app.native.stuck, app.native.asked, app.native.lastAlive], [null, null, null]);
 
   // JS stuck: silent since asked, while the native agent answers
   jsStuck = true;
   const first = await took(app.js.call("Tree.query", {}), (e) => e.code === "TIMEOUT" && e.stuck.thread === "JS" && e.stuck.forMs >= STUCK_MS);
   assert(first >= STUCK_MS && first < STUCK_MS + 3000, String(first));
   assert(await took(app.js.call("Tree.query", {}), (e) => e.code === "TIMEOUT" && e.stuck.thread === "JS") < 1500);
-  // an action that ran natively, then JS doesn't take it: DELIVERED, not a TIMEOUT that invites a retry
-  await assert.rejects(app.settle(), (e) => e.code === "DELIVERED" && e.stuck.thread === "JS");
+  // an action that ran natively, then JS doesn't take it: DELIVERED (not a TimeoutError), not a TIMEOUT inviting a retry
+  await assert.rejects(app.settle(), (e) => e.code === "DELIVERED" && e.name === "MantisError" && e.stuck.thread === "JS");
   // the whole app silent (suspended in the background, stopped in a debugger): not called stuck
-  mainMs = Infinity;
+  silentApp = true;
   assert.equal(await app.js.probe(), null);
-  mainMs = 100;
+  silentApp = false;
   // JS runs again and answers what it was asked: no longer silent
   jsStuck = false;
   queued.splice(0).forEach((f) => f());
   await app.js.call("Tree.query", {});
   assert.equal(await app.js.probe(), null);
 
-  native.close();
+  nativeWs.close();
   js.close();
   await app.close();
 }
