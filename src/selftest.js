@@ -766,6 +766,13 @@ async function checkStuck() {
   assert((await waited({ netMaxMs: 50 })) < 100);
   await assert.rejects(app.idle({ timeout: 100 }), /request in flight/);
   xhr.dispatchEvent(new Event("loadend"));
+  // native image loads: in the network facts, held like a request (netMaxMs), past the WebSocket's 1500 ms cap too
+  const image = { ms: 2000, url: "https://cdn.example/a.png", image: true };
+  screen = () => ({ draws: 3, idleMs: 1000, busy: null, net: [image] });
+  await assert.rejects(app.idle({ timeout: 50 }), (e) =>
+    /image loading for 2000ms: https:\/\/cdn\.example\/a\.png$/.test(e.message) && e.busy.network[0].image === true);
+  assert.deepEqual((await app.idle({ netMaxMs: 1000 })).network, [image]);
+  screen = () => ({ draws: 3, idleMs: 1000, busy: null });
 
   // JS timers: a one-off timeout of at most timerMaxMs holds idle until it fired (a tap that navigates 150 ms later),
   // and quietMs after it (what it started may show a frame later)...

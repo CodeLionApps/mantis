@@ -34,6 +34,7 @@
 #import <dlfcn.h>
 #import <mach/mach_time.h>
 #import <Network/Network.h>
+#import <objc/message.h>
 #import <objc/runtime.h>
 #import <pthread.h>
 #import <stdatomic.h>
@@ -128,6 +129,68 @@ static BOOL mantisShown(CALayer *l, BOOL loop) {
       return !loop || CGRectIntersectsRect([l convertRect:l.bounds toLayer:s], s.bounds);
   }
   return NO;
+}
+
+// Image loads in flight for Agent.ping (Android: Fresco's pipeline). RN's <Image> and Image.prefetch load through
+// RCTImageLoader (cache, network via RCTNetworking, decode); every one of its load methods ends in the one hooked here
+// (Image.getSize doesn't). A load ends when its completion block ran (it hands the image to the view, an error too)
+// or when it's cancelled (the view went away): Fabric calls the returned request's cancellationBlock, Paper its
+// -cancel, so the hook returns a request whose block ends it too. A loader that's gone (a JS reload) never calls back:
+// its loads end with it. No RN headers (the pod doesn't depend on React): by name, at load, once the app is up, else
+// from a ping; only if the methods have the shape this expects (another RN version: not hooked, no loads).
+// ponytail: image libraries with a pipeline of their own (SDWebImage: expo-image, FastImage) aren't seen.
+@interface MantisImageLoad : NSObject
+@property (nonatomic, copy) NSString *url; // without query
+@property (nonatomic) CFTimeInterval at; // CACurrentMediaTime at its start
+@property (nonatomic, weak) id loader;
+@end
+@implementation MantisImageLoad
+@end
+
+static NSMutableDictionary<NSNumber *, MantisImageLoad *> *mantisImages;
+
+static void mantisHookImages(void) {
+  static BOOL hooked;
+  if (hooked) return;
+  Class loader = NSClassFromString(@"RCTImageLoader"), req = NSClassFromString(@"RCTImageURLLoaderRequest");
+  SEL sel = NSSelectorFromString(@"loadImageWithURLRequest:size:scale:clipped:resizeMode:priority:attribution:"
+                                 "progressBlock:partialLoadBlock:completionBlock:");
+  SEL init = NSSelectorFromString(@"initWithRequestId:imageURL:cancellationBlock:");
+  Method m = loader && req ? class_getInstanceMethod(loader, sel) : NULL;
+  if (!m || method_getNumberOfArguments(m) != 12 || ![req instancesRespondToSelector:init]) return;
+  for (NSString *key in @[@"requestId", @"imageURL", @"cancellationBlock"])
+    if (![req instancesRespondToSelector:NSSelectorFromString(key)]) return;
+  hooked = YES;
+  mantisImages = [NSMutableDictionary new];
+  typedef void (^Done)(NSError *, UIImage *, id);
+  // resizeMode, priority: NSInteger enums; attribution: a C++ const reference, i.e. a pointer, passed through
+  id (*orig)(id, SEL, NSURLRequest *, CGSize, CGFloat, BOOL, NSInteger, NSInteger, const void *, id, id, Done) =
+      (void *)method_getImplementation(m);
+  id (*make)(id, SEL, NSString *, NSURL *, dispatch_block_t) = (void *)objc_msgSend;
+  method_setImplementation(m, imp_implementationWithBlock(^id(id self, NSURLRequest *r, CGSize size, CGFloat scale,
+      BOOL clipped, NSInteger mode, NSInteger priority, const void *attribution, id progress, id partial, Done done) {
+    static NSUInteger next;
+    NSString *url = [r.URL.absoluteString componentsSeparatedByString:@"?"].firstObject ?: @"";
+    MantisImageLoad *load = [MantisImageLoad new];
+    load.url = [url substringToIndex:MIN(url.length, 200)];
+    load.at = CACurrentMediaTime();
+    load.loader = self;
+    NSNumber *key;
+    @synchronized (mantisImages) {
+      key = @(++next);
+      mantisImages[key] = load;
+    }
+    dispatch_block_t end = ^{ @synchronized (mantisImages) { [mantisImages removeObjectForKey:key]; } };
+    // ended after done: the view gets the image on the main queue, so a ping that sees the load gone comes after it
+    id request = orig(self, sel, r, size, scale, clipped, mode, priority, attribution, progress, partial,
+                      ^(NSError *e, UIImage *image, id meta) { if (done) done(e, image, meta); end(); });
+    if (!request) { end(); return nil; }
+    dispatch_block_t cancel = [request valueForKey:@"cancellationBlock"];
+    return make([req alloc], init, [request valueForKey:@"requestId"], [request valueForKey:@"imageURL"], ^{
+      end();
+      if (cancel) cancel();
+    });
+  }));
 }
 
 static UITouch *_touch; // synthesized finger between Began and Ended/Cancelled; nil = no gesture in progress
@@ -239,8 +302,10 @@ static id mantisToken(void) {
   // app extensions and logic test bundles load this binary too (use_frameworks!): no UIApplication there
   if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) return;
   mantisHookLayers();
+  mantisHookImages();
   netQ = dispatch_queue_create("mantis.net", DISPATCH_QUEUE_SERIAL);
   dispatch_async(dispatch_get_main_queue(), ^{
+    mantisHookImages(); // React in a framework loaded after this one
     shared = [MantisAgent new];
     [NSNotificationCenter.defaultCenter addObserverForName:UIKeyboardWillChangeFrameNotification object:nil queue:nil
                                                 usingBlock:^(NSNotification *n) {
@@ -1021,8 +1086,22 @@ static void uncaptured(CALayer *l, NSUInteger w, NSMutableArray *out) {
   } else if ([method isEqualToString:@"Agent.ping"]) {
     // Draw clock for the runner's idle wait, as on Android: idleMs = ms since something in the app's windows last
     // changed on screen, draws = how many changes so far. busy, for the runner's error: the animation still running,
-    // else the last change (its view's class and React tag, the setter).
+    // else the last change (its view's class and React tag, the setter). net: image loads in flight (mantisImages), as
+    // the JS agent's requests: ms, url, image: true.
     CFTimeInterval now = CACurrentMediaTime();
+    mantisHookImages(); // not yet: React loaded later still
+    NSMutableArray *net = [NSMutableArray new];
+    @synchronized (mantisImages) {
+      for (NSNumber *k in mantisImages.allKeys)
+        if (!mantisImages[k].loader) [mantisImages removeObjectForKey:k];
+      NSArray *loads = [mantisImages.allValues sortedArrayUsingComparator:^(MantisImageLoad *a, MantisImageLoad *b) {
+        return a.at < b.at ? NSOrderedAscending : a.at > b.at ? NSOrderedDescending : NSOrderedSame;
+      }];
+      for (MantisImageLoad *i in loads) {
+        if (net.count == 100) break;
+        [net addObject:@{@"ms": @(round((now - i.at) * 1000)), @"url": i.url, @"image": @YES}];
+      }
+    }
     NSString *busy;
     for (CALayer *l in mantisAnims.keyEnumerator.allObjects) {
       NSMutableDictionary<NSString *, NSNumber *> *ends = [mantisAnims objectForKey:l];
@@ -1042,7 +1121,7 @@ static void uncaptured(CALayer *l, NSUInteger w, NSMutableArray *out) {
     }
     CFTimeInterval last = busy ? now : MAX(mantisChangedAt, mantisAnimEnd);
     busy = busy ?: [NSString stringWithFormat:@"%@ tag %ld %s", mantisChangedClass, (long)mantisChangedTag, mantisChangedHow];
-    done(@{@"draws": @(mantisChanges), @"idleMs": @((now - last) * 1000), @"busy": busy});
+    done(@{@"draws": @(mantisChanges), @"idleMs": @((now - last) * 1000), @"busy": busy, @"net": net});
   } else if ([method isEqualToString:@"Input.hideKeyboard"]) {
     // what a user does when the keyboard covers the next target (Detox's replaceText never opens it)
     done(@{@"ok": @([UIApplication.sharedApplication sendAction:@selector(resignFirstResponder) to:nil from:nil forEvent:nil])});

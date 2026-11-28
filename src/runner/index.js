@@ -849,14 +849,15 @@ class App extends EventEmitter {
   }
 
   /**
-   * Waits until the app stands still: no React commit and nothing changed on screen for quietMs, no request in flight,
-   * no JS timer about to fire. Screen: Android, a window of the app drew; iOS, a layer changed or an animation runs
-   * (transitions, native-driver and Reanimated frames, scrolling). Throws on timeout, naming what is still busy (a
-   * spinner never stops); err.busy has it as facts. Resolves to what is still pending but didn't hold the wait.
+   * Waits until the app stands still: no React commit and nothing changed on screen for quietMs, no request or image
+   * load in flight, no JS timer about to fire. Screen: Android, a window of the app drew; iOS, a layer changed or an
+   * animation runs (transitions, native-driver and Reanimated frames, scrolling). Throws on timeout, naming what is
+   * still busy (a spinner never stops); err.busy has it as facts. Resolves to what is still pending but didn't hold the
+   * wait.
    * since (app.mark() taken before an action): idle counts only once the app reacted to it (a commit or a draw since),
    * or reactMs passed without one; for actions the app handles a while later (back, a tap whose handler awaits).
-   * netMaxMs: a request in flight longer than this no longer holds the wait (polling, a hung request). A WebSocket
-   * connecting or waiting for a reply holds it WS_HOLD_MS at most (or netMaxMs, if less).
+   * netMaxMs: a request or image load in flight longer than this no longer holds the wait (polling, a hung request). A
+   * WebSocket connecting or waiting for a reply holds it WS_HOLD_MS at most (or netMaxMs, if less).
    * timerMaxMs: a one-off setTimeout / requestAnimationFrame set for at most this holds it (Detox: 1.5 s), and quietMs
    * after it fired; intervals and recurring timers (the agent: its delay bucket fired twice in a row) never do.
    * ponytail: Android's clock can't tell which view drew, so a focused text field's caret (a draw every 500 ms) keeps
@@ -874,7 +875,7 @@ class App extends EventEmitter {
       const iter = performance.now();
       const [js, ui] = await Promise.all([ping(this.js, "JS"), nativePing(ping(this.native, "main"))]);
       reacted ||= js.commitId !== since.commitId || (ui.draws != null && ui.draws !== since.draws) || iter - t0 >= reactMs;
-      const network = js.net ?? [];
+      const network = [...(js.net ?? []), ...(ui.net ?? [])]; // native: image loads (an agent older than that: none)
       const timers = js.timers ?? []; // an agent older than timer tracking: none
       const busy = {};
       const net = network.filter((r) => r.ms < (r.ws ? Math.min(netMaxMs, WS_HOLD_MS) : netMaxMs));
@@ -942,8 +943,9 @@ class App extends EventEmitter {
 
 // idle's err.busy as the message: what still holds the wait
 function busyText({ network = [], timers = [], react, screen, reacted }) {
-  const out = network.map(({ ms, url, ws }) =>
+  const out = network.map(({ ms, url, ws, image }) =>
     ws === "connecting" ? `WebSocket connecting for ${ms}ms: ${url}`
+    : image ? `image loading for ${ms}ms: ${url}`
     : ws ? `WebSocket waiting ${ms}ms for a reply: ${url}`
     : `request in flight for ${ms}ms: ${url}`);
   for (const t of timers)

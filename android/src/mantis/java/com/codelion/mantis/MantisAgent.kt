@@ -43,6 +43,10 @@ import android.widget.ScrollView
 import androidx.activity.findViewTreeOnBackPressedDispatcherOwner
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.facebook.drawee.backends.pipeline.Fresco
+import com.facebook.imagepipeline.listener.ForwardingRequestListener
+import com.facebook.imagepipeline.listener.RequestListener
+import com.facebook.imagepipeline.request.ImageRequest
 import com.facebook.react.modules.websocket.WebSocketModule
 import com.facebook.react.uimanager.RootView
 import com.facebook.react.uimanager.TouchTargetHelper
@@ -110,6 +114,7 @@ object MantisAgent {
     // an app that sets its own custom builder replaces this one and only loses TCP_NODELAY. ponytail: RN has no getter
     // to chain the two
     WebSocketModule.setCustomClientBuilder { it.socketFactory(NoDelay) }
+    hookImages()
     app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
       override fun onActivityResumed(a: Activity) { activity = a }
       override fun onActivityPaused(a: Activity) { if (activity == a) activity = null }
@@ -159,6 +164,49 @@ object MantisAgent {
       override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = retry()
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = retry()
     })
+  }
+
+  /**
+   * Image loads in flight for the runner's idle wait: request id -> URL (no query, as the JS agent's requests), start.
+   * From Fresco's image pipeline, which RN's <Image> loads through (memory and disk cache, network, decode), so a load
+   * ends when the decoded image is handed to the view, or on failure or cancellation (the view went away). A listener
+   * added to the pipeline once Fresco is up (FrescoModule, at React's start; or the app, earlier), and again to a new
+   * pipeline: an app that initializes Fresco itself gets it replaced when FrescoModule initializes it once more.
+   * Checked every 16 ms for 30 s from launch, then on each ping. ponytail: image libraries with a pipeline of their own
+   * (Glide: expo-image, FastImage) aren't seen.
+   */
+  private val images = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
+  private var hooked: RequestListener? = null // the pipeline's listener last seen (ImageLoads added, if it could be)
+  private fun hookImages(tries: Int = 30000 / 16) {
+    if (tries > 0) main.postDelayed({ hookImages(tries - 1) }, 16)
+    if (!Fresco.hasBeenInitialized()) return
+    // the pipeline's own listener, forwarding to those of its config (getCombinedRequestListener(null) returns it)
+    val pipeline = Fresco.getImagePipeline().getCombinedRequestListener(null)
+    if (pipeline === hooked) return
+    // not a ForwardingRequestListener (another Fresco): nothing to add to; a new pipeline is tried again
+    hooked = pipeline
+    (pipeline as? ForwardingRequestListener)?.addRequestListener(ImageLoads)
+  }
+
+  // The Java interface, not Kotlin's BaseRequestListener: its non-null callerContext would throw on RN's (null), and
+  // the pipeline swallows a listener's exceptions
+  private object ImageLoads : RequestListener {
+    override fun onRequestStart(request: ImageRequest?, callerContext: Any?, requestId: String?, isPrefetch: Boolean) {
+      val url = request?.sourceUri?.toString() ?: return
+      images[requestId ?: return] = url.substringBefore('?').take(200) to SystemClock.uptimeMillis()
+    }
+    private fun end(requestId: String?) { if (requestId != null) images.remove(requestId) }
+    override fun onRequestSuccess(request: ImageRequest?, requestId: String?, isPrefetch: Boolean) = end(requestId)
+    override fun onRequestFailure(request: ImageRequest?, requestId: String?, t: Throwable?, prefetch: Boolean) =
+      end(requestId)
+    override fun onRequestCancellation(requestId: String?) = end(requestId)
+    override fun onProducerStart(id: String?, producer: String?) {}
+    override fun onProducerEvent(id: String?, producer: String?, event: String?) {}
+    override fun onProducerFinishWithSuccess(id: String?, producer: String?, extra: Map<String, String>?) {}
+    override fun onProducerFinishWithFailure(id: String?, producer: String?, t: Throwable?, x: Map<String, String>?) {}
+    override fun onProducerFinishWithCancellation(id: String?, producer: String?, extra: Map<String, String>?) {}
+    override fun onUltimateProducerReached(id: String?, producer: String?, successful: Boolean) {}
+    override fun requiresExtraMap(id: String?) = false
   }
 
   // Main thread heartbeat for Agent.alive: lastBeat = when main last ran it. Started by the first RPC (a runner is
@@ -707,15 +755,21 @@ object MantisAgent {
       // a fling, a fragment transition (none of which commits in React). Windows are watched from their first poll on;
       // a window seen for the first time counts as just drawn (a Modal that opened since the last poll).
       // A drawable animating on the RenderThread draws no UI frame (see animating): changing now, busy names it.
+      // net: image loads in flight (see images), as the JS agent's requests: ms, url, image: true.
       "Agent.ping" -> {
+        hookImages(0)
         val roots = roots()
         for (r in roots) if (drawWatched.put(r, true) == null) {
           r.viewTreeObserver.addOnDrawListener { draws++; lastDraw = SystemClock.uptimeMillis() }
           lastDraw = SystemClock.uptimeMillis()
         }
         val busy = roots.firstNotNullOfOrNull { animating(it) }
-        done(JSONObject().put("draws", draws).put("idleMs", if (busy != null) 0 else SystemClock.uptimeMillis() - lastDraw)
-          .put("busy", busy ?: JSONObject.NULL))
+        val now = SystemClock.uptimeMillis()
+        val net = JSONArray(images.values.sortedBy { it.second }.take(100).map { (url, at) ->
+          JSONObject().put("ms", now - at).put("url", url).put("image", true)
+        })
+        done(JSONObject().put("draws", draws).put("idleMs", if (busy != null) 0 else now - lastDraw)
+          .put("busy", busy ?: JSONObject.NULL).put("net", net))
       }
 
       // The app's own windows, bottom-up, composed as on screen, as PNG base64 (iOS: same). No system UI: status bar

@@ -14,13 +14,15 @@ const target = { platform: process.env.PLATFORM || 'android', deviceId: process.
 const app = new App(undefined, target.platform, { usb: isIosDevice(target) ? target.deviceId : undefined });
 // the app reaches the test's server at localhost (Android: adb reverse); a cabled iPhone's localhost is the phone
 const lab = { skip: isIosDevice(target) && "a cabled iPhone can't reach the host's localhost:9124" };
-// the screen "Później"'s server (App.tsx LAB): an image after 800 ms; on a socket, "hej" gets a reply after 600 ms, then a
-// ping every 200 ms
+// the screen "Później"'s server (App.tsx LAB): an image after 800 ms (/slow.png: 5 s; /missing.png: a 404 after
+// 800 ms); on a socket, "hej" gets a reply after 600 ms, then a ping every 200 ms
 const LAB = 9124;
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==', 'base64');
-const server = http.createServer((req, res) =>
-  setTimeout(() => res.writeHead(200, { 'content-type': 'image/png' }).end(PNG), 800),
-);
+const server = http.createServer((req, res) => {
+  const path = req.url.split('?')[0];
+  if (path === '/missing.png') return setTimeout(() => res.writeHead(404).end(), 800);
+  setTimeout(() => res.writeHead(200, { 'content-type': 'image/png' }).end(PNG), path === '/slow.png' ? 5000 : 800);
+});
 const wss = new WebSocketServer({ server });
 wss.on('connection', ws =>
   ws.on('message', m => {
@@ -130,9 +132,34 @@ test('a looping animation: times out, saying what moves', async () => {
   await assert.rejects(tapIdle('Pętla', { timeout: 1500, quietMs: 300 }), e => e.code === 'TIMEOUT' && !!(e.busy.screen || e.busy.thread === 'main'));
 });
 
-test('an image from the network: idle waits for it', { ...lab, todo: 'native image loads are not tracked' }, async () => {
+test('an image from the network: idle waits for it, reporting the load', lab, async () => {
   await later();
+  const since = await app.mark();
   await app.getByText('Obrazek').tap();
+  await assert.rejects(app.idle({ since, timeout: 500 }), e =>
+    e.code === 'TIMEOUT' && !!e.busy.network?.some(r => r.image && r.url === 'http://localhost:9124/image.png'));
   await app.idle();
   assert.ok(await shows('Stan: obrazek'));
+});
+
+// the image view unmounted while it loads: the load is cancelled and holds nothing (the server would answer in 5 s)
+test('an image left before it loaded: idle returns, no load reported', lab, async () => {
+  await later();
+  const since = await app.mark();
+  await app.getByText('Wolny obrazek').tap();
+  await assert.rejects(app.idle({ since, timeout: 500 }), e => !!e.busy.network?.some(r => r.image));
+  await app.getByText('Wstecz').tap();
+  await expect(app.getByText('Później')).toBeVisible();
+  const { network } = await app.idle({ timeout: 3000 });
+  assert.deepEqual(network.filter(r => r.image), []);
+});
+
+// the server answers 404 after 800 ms; onError's commit may land just after the load ended (nothing draws on a failure)
+test('an image that fails: idle waits for the failure, then holds nothing', lab, async () => {
+  await later();
+  const t = performance.now();
+  await tapIdle('Zły obrazek');
+  assert.ok(performance.now() - t >= 700);
+  await expect(app.getByText('Stan: błąd obrazka')).toBeVisible();
+  assert.deepEqual((await app.idle()).network.filter(r => r.image), []);
 });

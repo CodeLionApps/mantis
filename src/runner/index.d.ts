@@ -205,12 +205,16 @@ export interface IdleOptions {
   timerMaxMs?: number;
 }
 
-/** An XHR / fetch in flight (URL without query), or a WebSocket connecting or waiting for a reply to a message it sent. */
+/**
+ * An XHR / fetch in flight (URL without query), a WebSocket connecting or waiting for a reply to a message it sent, or
+ * an image loading natively (RN's <Image>: fetch and decode).
+ */
 export interface PendingRequest {
   url: string;
   /** ms in flight (WebSocket reply: since the message it sent) */
   ms: number;
   ws?: "connecting" | "reply";
+  image?: true;
 }
 
 /** A pending JS timer (in err.busy also one that just fired: fired true). */
