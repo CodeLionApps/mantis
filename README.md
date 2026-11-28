@@ -347,15 +347,18 @@ Agents say hello with the
 protocol version; an app built with another Mantis version is refused with an error that says so. Agents must also
 echo the runner's token (launch arg `mantisToken`, which the Detox layer adds; `app.launchArgs` for the Playwright-style
 API): iOS simulators share the Mac's localhost, and every Mantis app on an Android device dials the same 9123. A hello
-without it is refused, and `relaunch` / calls then fail with `NOT_CONNECTED` saying why: `no token` (launched without
-`app.launchArgs`, or on Android an app built with an older Mantis: rebuild it) or `wrong token` (launched by another
-runner). Only the greeted socket of each agent may answer calls or send events, so another Mantis app on the device can't
+without it is refused. When the agents don't connect, `NOT_CONNECTED` lists the distinct reasons hellos were refused
+since the launch: `no token` (launched without `app.launchArgs`; on Android also an app built with an older Mantis),
+`wrong token` (launched by another runner), another protocol version. Any Mantis app on the device can dial in, so a
+reason may come from another app than the one launched. Only the greeted socket of each agent may answer calls or send events, so another Mantis app on the device can't
 take over the runner. Each Jest worker gets its own port, so parallel workers (one device each) work.
 
 Android: the native agent reads the token from the intent of the app's first activity (Detox's `launchArgs` bundle,
 or `am start --es mantisToken`), and starts dialing then; the JS agent reads it through the `Mantis` native module (a
 legacy module: needs the New Architecture's TurboModule interop, on by default). A launch that reuses the running
-process (Detox `newInstance: false`) keeps the token of the process's first launch.
+process (Detox `newInstance: false`) keeps the token of the process's first launch. An app that starts React before
+any activity (prewarmed in `Application.onCreate`, headless JS) has no token yet then: its JS agent asks again after
+2 s, so it connects about 2 s later.
 
 What the channel does not protect against:
 

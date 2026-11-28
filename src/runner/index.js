@@ -88,8 +88,10 @@ class Peer {
     this.seq = 0;
     this.pending = new Map();
     this.hello = null;
-    this.rejected = null; // why the last hello was refused, for the "not connected" error
-    this.held = false; // rejected: another app holds the port (cabled iPhone)
+    // why hellos were refused since the last launch (relaunch clears it), for the "not connected" error. Any app on the
+    // device or host can dial in, so this is a fact about some socket, not necessarily the app the caller launched.
+    this.refused = new Set();
+    this.held = null; // why: another app holds the port (cabled iPhone)
     this.waiters = []; // ready(): { since, done, fail }
   }
 
@@ -133,37 +135,40 @@ class Peer {
     });
   }
 
+  // Before the hello is accepted every field is untrusted (any app on the device can send it): nothing here may throw.
   greet(ws, p) {
+    const show = (v) => (typeof v === "string" ? v : JSON.stringify(v)); // ${v} throws on {"toString": 1}
     const why =
       p.role !== this.role
-        ? `role ${p.role} on the ${this.role} socket`
+        ? `role ${show(p.role)} on the ${this.role} socket`
         : // iOS simulators share the Mac's localhost, so another platform's Mantis build can dial in too
           p.platform !== this.platform
-          ? `platform ${p.platform}, runner ${this.platform}`
+          ? `platform ${show(p.platform)}, runner ${this.platform}`
           : p.v !== PROTOCOL
-            ? `protocol v${p.v}, runner v${PROTOCOL}: rebuild the app with this Mantis version`
+            ? `protocol v${show(p.v)}, runner v${PROTOCOL}: rebuild the app with this Mantis version`
             : p.error
-              ? p.error
+              ? show(p.error)
               : // ...and other runners' apps, or (Android) any other Mantis app on the device, which dials the same port:
                 // agents must echo this runner's token (launch arg mantisToken)
                 p.token !== this.token
-                ? this.platform === "android" && !p.features?.includes("token")
+                ? this.platform === "android" && !(Array.isArray(p.features) && p.features.includes("token"))
                   ? "no token: an app built with an older Mantis version (rebuild it with this one)"
                   : p.token == null
                     ? "no token: launch with the runner's launchArgs (app.launchArgs)"
                     : "wrong token: launched by another runner; launch with this runner's launchArgs (app.launchArgs)"
                 : null;
     if (why) {
-      this.rejected = `${this.role} agent rejected: ${why}`;
-      this.held = false;
+      // ponytail: the first 5 distinct reasons; a socket redialing every 2 s with the same one adds nothing
+      if (this.refused.size < 5) this.refused.add(why.slice(0, 200));
+      this.held = null;
       trace({ event: "hello rejected", role: this.role, why });
-      return ws.close(1008, why.slice(0, 120));
+      // a close reason is at most 123 bytes
+      return ws.close(1008, why.replace(/[^\x20-\x7e]/g, "?").slice(0, 120));
     }
     if (this.ws !== ws) this.failPending("agent reconnected");
     this.ws = ws;
     this.hello = p;
-    this.rejected = null;
-    this.held = false;
+    this.held = null;
     this.onHello?.(p);
     this.waiters.splice(0).forEach((w) => w.done());
   }
@@ -171,8 +176,7 @@ class Peer {
   // Cabled iPhone: what answered on this agent's port is another app. Fails the waits that started HELD_GRACE before that
   // dial did: an earlier one may have reached the app this launch just sent to the background, before it freed the port.
   heldBy(dialed, why) {
-    this.rejected = why;
-    this.held = true;
+    this.held = why;
     trace({ event: "port held", role: this.role, why });
     for (const w of this.waiters.filter((w) => w.since <= dialed)) w.fail();
   }
@@ -195,7 +199,7 @@ class Peer {
       const w = {
         since,
         done: () => end(resolve),
-        fail: () => end(() => reject(new MantisError("PORT_IN_USE", this.rejected))),
+        fail: () => end(() => reject(new MantisError("PORT_IN_USE", this.held))),
       };
       const timer = setTimeout(
         () =>
@@ -203,7 +207,13 @@ class Peer {
             reject(
               new MantisError(
                 this.held ? "PORT_IN_USE" : "NOT_CONNECTED",
-                `${this.role} agent not connected after ${timeout}ms` + (this.rejected ? ` (${this.rejected})` : ""),
+                `${this.role} agent not connected after ${timeout}ms` +
+                  (this.held
+                    ? ` (${this.held})`
+                    : this.refused.size
+                      ? " (hellos refused since the last launch, from this launch or another Mantis app on the device: " +
+                        `${[...this.refused].join(" | ")})`
+                      : ""),
               ),
             ),
           ),
@@ -395,6 +405,9 @@ class App extends EventEmitter {
    */
   async relaunch(launch, { timeout = CONNECT_TIMEOUT } = {}) {
     const before = [this.js.ws, this.native.ws];
+    // refusals before this launch (an app it replaces, an earlier launch's) say nothing about this one
+    this.js.refused.clear();
+    this.native.refused.clear();
     const t0 = performance.now();
     await launch();
     timing("launch:started", t0, t0);
@@ -407,15 +420,21 @@ class App extends EventEmitter {
       this.native.ws === before[1]
     )
       return;
+    const ready = [this.js.ready(timeout), this.native.ready(timeout)];
     try {
-      await Promise.all([this.js.ready(timeout), this.native.ready(timeout)]);
-    } catch (e) {
+      await Promise.all(ready);
+    } catch {
       // the JS agent's wait can run out first; a cabled iPhone's port taken by another app is the cause then too
-      if (this.native.held) throw new MantisError("PORT_IN_USE", `Mantis agents not connected after launch: ${this.native.rejected}`);
+      if (this.native.held) throw new MantisError("PORT_IN_USE", `Mantis agents not connected after launch: ${this.native.held}`);
+      // both agents' reasons (the other wait ends at about the same time): each may have had hellos refused
+      const why = (await Promise.allSettled(ready))
+        .filter((r) => r.status === "rejected")
+        .map((r) => r.reason.message)
+        .join("; ");
       throw new MantisError(
         "NOT_CONNECTED",
         `Mantis agents not connected ${timeout}ms after launch (js: ${this.js.connected}, native: ${this.native.connected}): ` +
-          `${e.message}. Is this a Mantis build (MANTIS_E2E=1, withMantis() in metro.config.js) and is port ${this.port} ` +
+          `${why}. Is this a Mantis build (MANTIS_E2E=1, withMantis() in metro.config.js) and is port ${this.port} ` +
           "reachable from the device (Android: adb reverse, launched with app.launchArgs; iPhone: cabled, launched with " +
           "app.launchArgs, and no other Mantis app holding the port: one suspended in the background refuses connections " +
           `like a free port, the app's log ` +
@@ -437,6 +456,7 @@ class App extends EventEmitter {
   /** Runs a JS reload (Detox device.reloadReactNative) and waits until the new JS context's agent said hello. */
   async reloadJs(reload, { timeout = CONNECT_TIMEOUT } = {}) {
     this.js.hello = null;
+    this.js.refused.clear();
     await reload();
     await this.js.ready(timeout);
   }
