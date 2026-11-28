@@ -264,7 +264,8 @@ focused.
   (a pong to its ping) and doesn't count; an open socket waiting for nothing doesn't either. Native SDKs (images,
   Firebase-like SDKs with their own network stack) aren't tracked.
 - Timers: a pending `setTimeout` / `requestAnimationFrame` set for at most `timerMaxMs` (the tap that navigates 800 ms
-  later). Intervals and timers re-armed as one of the same delay fires (a poll loop, an `await sleep()` loop, a
+  later), and `quietMs` after it fired (what it started may draw a frame later: `Animated`'s `delay` is a JS timer that
+  then starts a native animation; in `err.busy` its `left` is negative). Intervals and timers re-armed as one of the same delay fires (a poll loop, an `await sleep()` loop, a
   `requestAnimationFrame` loop) never end and don't hold it; neither do longer timers. `timerMaxMs: 0` ignores timers.
 - Resolves to what is still pending but didn't hold the wait, as facts: `{ network, timers }` (requests older than
   `netMaxMs`, timers longer than `timerMaxMs` or recurring), e.g. to tell that a screen still polls.
