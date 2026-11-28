@@ -67,7 +67,8 @@ import javax.net.SocketFactory
  * dialing once the first activity is created: the hello carries the runner's token from that activity's intent (every
  * Mantis app on the device dials the same port, the runner accepts only its own launch).
  * Own socket, independent of the JS thread, so measuring / hit-testing / input work while JS is busy.
- * All view work on the main thread. Coordinates exchanged with the runner are dp (= JS units).
+ * All view work on the main thread. Agent.alive is answered on the socket's own thread: how long the main thread hasn't
+ * run (a crash dialog, an ANR, a deadlock), which the runner can't learn from an RPC that main never runs. Coordinates exchanged with the runner are dp (= JS units).
  */
 object MantisAgent {
   private const val URL = "ws://localhost:9123/?role=native"
@@ -132,7 +133,7 @@ object MantisAgent {
         webSocket.send(JSONObject().put("method", "Agent.hello")
           .put("params", JSONObject().put("role", "native").put("platform", "android").put("v", 2)
             .put("token", token.takeUnless { it.isNullOrEmpty() } ?: JSONObject.NULL)
-            .put("features", JSONArray().put("token"))).toString())
+            .put("features", JSONArray().put("token").put("alive"))).toString())
       }
       // OkHttp's reader thread: an exception here would restart the socket and fail every RPC in flight, so validate
       // the frame first; a frame without a numeric id has nothing to answer
@@ -141,6 +142,7 @@ object MantisAgent {
         val id = (msg.opt("id") as? Number)?.toInt() ?: return
         val method = msg.optString("method")
         val params = msg.optJSONObject("params") ?: JSONObject()
+        beat()
         // exactly one reply per request, whatever path (sync, frame callback, exception) gets there first
         var replied = false
         val done: (Any?) -> Unit = { result ->
@@ -149,13 +151,31 @@ object MantisAgent {
             if (result is Throwable) reply(id, null, result.toString()) else reply(id, result, null)
           }
         }
-        main.post { guard(done) { handle(method, params, done) } }
+        if (method == "Agent.alive") done(JSONObject().put("mainMs", SystemClock.uptimeMillis() - lastBeat))
+        else main.post { guard(done) { handle(method, params, done) } }
       }
       // the runner closes gracefully (e.g. a refused hello); OkHttp calls onClosed only once both sides sent close
       override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(1000, null) }
       override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = retry()
       override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = retry()
     })
+  }
+
+  // Main thread heartbeat for Agent.alive: lastBeat = when main last ran it. Started by the first RPC (a runner is
+  // driving this process), not by connecting, so a build no runner talks to never beats; once started it beats for the
+  // process's life. Re-posted by itself, so one at a time. Not Choreographer: no frames while nothing draws or the app is
+  // in the background, where main still runs.
+  @Volatile private var lastBeat = 0L
+  private val beater = object : Runnable {
+    override fun run() {
+      lastBeat = SystemClock.uptimeMillis()
+      main.postDelayed(this, 250)
+    }
+  }
+  private fun beat() {
+    if (lastBeat != 0L) return
+    lastBeat = SystemClock.uptimeMillis() // socket reader thread: one per connection, never two at once
+    main.post(beater)
   }
 
   // 2 s like the iOS and JS agents (README); the runner is either up already or a test file away

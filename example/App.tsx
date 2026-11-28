@@ -416,6 +416,24 @@ function Later({ onBack }: { onBack: () => void }) {
   );
 }
 
+// e2e/stuck.mantis.js: a thread that runs nothing for 9 s (main: through the app's own URL, see MainActivity and
+// SceneDelegate), a crash (Android: the main thread, behind the system's crash dialog)
+function Stuck({ onBack }: { onBack: () => void }) {
+  const busy = () => {
+    for (const end = Date.now() + 9000; Date.now() < end; );
+  };
+  return (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Zawieszenie</Text>
+      <Button title="Wątek główny" onPress={() => Linking.openURL('probespike://hang?ms=9000')} />
+      {/* later: the tap's own RPCs run first */}
+      <Button title="Wątek JS" onPress={() => setTimeout(busy, 300)} />
+      <Button title="Awaria" onPress={() => Linking.openURL('probespike://crash')} />
+      <Button title="Wstecz" onPress={onBack} />
+    </View>
+  );
+}
+
 const SCREENS = {
   Logowanie: LoginFlow,
   Licznik: Counter,
@@ -429,6 +447,7 @@ const SCREENS = {
   Okna: Windows,
   Alerty: Alerts,
   Później: Later,
+  Zawieszenie: Stuck,
 };
 
 export default function App() {

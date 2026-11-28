@@ -13,7 +13,9 @@
 // listens on the phone's loopback instead, only when launched with -mantisToken, and the runner dials it over USB
 // (usbmuxd, src/runner/usbmux.js). The JS agent still dials ws://localhost:<port>, now this listener, which relays it to
 // the runner's JS leg.
-// Own socket, independent of the JS thread. All view work on the main thread. Coordinates are points (= JS units).
+// Own socket, independent of the JS thread and of the main thread: sockets live on their own serial queue (netQ), so
+// Agent.alive is answered while main is stuck (a hang, a deadlock), and a cabled iPhone still relays the JS agent then.
+// All view work on the main thread. Coordinates are points (= JS units).
 #import <TargetConditionals.h>
 // mantis.podspec always defines exactly one MANTIS_E2E_<value> and one MANTIS_DEVICE_<value>: unset gives MANTIS_E2E_,
 // so any other value (true, yes, "1 ") is a typo that would silently build without the agent
@@ -34,6 +36,7 @@
 #import <Network/Network.h>
 #import <objc/runtime.h>
 #import <pthread.h>
+#import <stdatomic.h>
 
 // Draw clock for Agent.ping (Android: an OnDrawListener per window). iOS has no draw callback, so two hooks on CALayer,
 // installed at load. A property set to a new value on the main thread: a mount, a native-driver / Reanimated frame, a
@@ -196,6 +199,31 @@ static NSException *MantisError(NSString *reason) {
 }
 
 static MantisAgent *shared;
+static dispatch_queue_t netQ; // the sockets: _ws, the listener and its connections; never the main queue
+
+// Main thread heartbeat for Agent.alive: when main last ran it. Started by the first RPC (a runner drives this process),
+// not by connecting, so a build no runner talks to never beats; once started it beats for the process's life. A timer on
+// a background queue, not dispatch_after on main (DetoxSync counts main-queue dispatch_after up to 1.5 s as busy), nor
+// CADisplayLink (no frames in the background). One beat queued on main at a time: a deadlocked main doesn't pile them up.
+static volatile CFTimeInterval mantisBeat;
+static atomic_bool mantisBeatQueued;
+static void mantisBeatStart(void) {
+  static dispatch_once_t once;
+  static dispatch_source_t timer;
+  dispatch_once(&once, ^{
+    mantisBeat = CACurrentMediaTime();
+    timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
+    dispatch_source_set_event_handler(timer, ^{
+      if (atomic_exchange(&mantisBeatQueued, true)) return;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        mantisBeat = CACurrentMediaTime();
+        atomic_store(&mantisBeatQueued, false);
+      });
+    });
+    dispatch_resume(timer);
+  });
+}
 
 // launch arguments only (-mantisPort N -mantisToken T), not values the app may have persisted under the same keys
 static NSDictionary *launchArgs(void) {
@@ -211,6 +239,7 @@ static id mantisToken(void) {
   // app extensions and logic test bundles load this binary too (use_frameworks!): no UIApplication there
   if (![NSBundle.mainBundle.bundlePath hasSuffix:@".app"]) return;
   mantisHookLayers();
+  netQ = dispatch_queue_create("mantis.net", DISPATCH_QUEUE_SERIAL);
   dispatch_async(dispatch_get_main_queue(), ^{
     shared = [MantisAgent new];
     [NSNotificationCenter.defaultCenter addObserverForName:UIKeyboardWillChangeFrameNotification object:nil queue:nil
@@ -220,7 +249,7 @@ static id mantisToken(void) {
     [NSNotificationCenter.defaultCenter addObserverForName:UIKeyboardWillHideNotification object:nil queue:nil
                                                 usingBlock:^(NSNotification *n) { shared->_keyboard = CGRectNull; }];
 #if TARGET_OS_SIMULATOR
-    [shared connect];
+    dispatch_async(netQ, ^{ [shared connect]; });
 #else
     [shared listen];
     // in the background the port is free for another Mantis app (iOS keeps a suspended app's socket bound, and its
@@ -236,48 +265,58 @@ static id mantisToken(void) {
 
 - (NSDictionary *)hello {
   // v: src/runner PROTOCOL; token: proves to the runner that it launched this app (simulators share localhost)
-  return @{@"method": @"Agent.hello", @"params": @{@"role": @"native", @"platform": @"ios", @"v": @2, @"token": mantisToken()}};
+  return @{@"method": @"Agent.hello",
+           @"params": @{@"role": @"native", @"platform": @"ios", @"v": @2, @"token": mantisToken(), @"features": @[@"alive"]}};
 }
 
+// netQ
 - (void)connect {
   NSString *url = [NSString stringWithFormat:@"ws://localhost:%ld/?role=native", (long)mantisPort()];
   _ws = [NSURLSession.sharedSession webSocketTaskWithURL:[NSURL URLWithString:url]];
   [_ws resume];
   [self send:self.hello];
-  [self receive];
+  [self receive:_ws];
 }
 
+// any thread
 - (void)send:(NSDictionary *)msg {
   NSData *d = [NSJSONSerialization dataWithJSONObject:msg options:0 error:nil];
-  if (_native) return [self write:d to:_native];
-  [_ws sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithString:[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding]]
- completionHandler:^(NSError *e) {}];
+  dispatch_async(netQ, ^{
+    if (self->_native) return [self write:d to:self->_native];
+    [self->_ws sendMessage:[[NSURLSessionWebSocketMessage alloc] initWithString:[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding]]
+         completionHandler:^(NSError *e) {}];
+  });
 }
 
-- (void)receive {
-  NSURLSessionWebSocketTask *ws = _ws;
+// completions on the session's queue: _ws is netQ's, so the socket comes as ws
+- (void)receive:(NSURLSessionWebSocketTask *)ws {
   [ws receiveMessageWithCompletionHandler:^(NSURLSessionWebSocketMessage *m, NSError *err) {
     if (err) {
-      // 2 s, not less: Detox iOS (DetoxSync) tracks main-queue dispatch_after up to 1.5 s as "app busy", so a faster
-      // loop would stall Detox runs of the same build
+      // 2 s like the Android and JS agents (the JS agent's must not be shorter: Detox counts JS timers under 1.5 s)
       [ws cancel];
-      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), netQ, ^{
         if (ws == self->_ws) [self connect];
       });
       return;
     }
     if (m.type == NSURLSessionWebSocketMessageTypeString) [self request:[m.string dataUsingEncoding:NSUTF8StringEncoding]];
     else NSLog(@"[Mantis] ignoring a frame that is not an RPC request");
-    [self receive];
+    [self receive:ws];
   }];
 }
 
 // Physical iPhone: a WebSocket server on 127.0.0.1 only. usbmuxd delivers the runner's connections there; nothing off
 // the phone reaches it, and loopback needs no Local Network consent. Off without the token: an app launched by hand
 // (or by anything but a runner) never listens.
+// main (applicationState); the listener itself on netQ
 - (void)listen {
   if (mantisToken() == NSNull.null) return NSLog(@"[Mantis] no -mantisToken launch argument: agent off");
-  if (_listener || UIApplication.sharedApplication.applicationState == UIApplicationStateBackground) return;
+  if (UIApplication.sharedApplication.applicationState == UIApplicationStateBackground) return;
+  dispatch_async(netQ, ^{ [self listenNow]; });
+}
+
+- (void)listenNow {
+  if (_listener) return;
   nw_parameters_t params = nw_parameters_create_secure_tcp(NW_PARAMETERS_DISABLE_PROTOCOL, NW_PARAMETERS_DEFAULT_CONFIGURATION);
   nw_protocol_stack_prepend_application_protocol(nw_parameters_copy_default_protocol_stack(params), nw_ws_create_options(nw_ws_version_13));
   NSString *port = [NSString stringWithFormat:@"%ld", (long)mantisPort()];
@@ -285,16 +324,16 @@ static id mantisToken(void) {
   nw_parameters_set_required_interface_type(params, nw_interface_type_loopback);
   nw_parameters_set_reuse_local_address(params, true); // a relaunch rebinds while the last process's sockets linger
   nw_listener_t l = _listener = nw_listener_create(params);
-  nw_listener_set_queue(l, dispatch_get_main_queue());
+  nw_listener_set_queue(l, netQ);
   nw_listener_set_new_connection_handler(l, ^(nw_connection_t c) {
-    nw_connection_set_queue(c, dispatch_get_main_queue());
+    nw_connection_set_queue(c, netQ);
     nw_connection_set_state_changed_handler(c, ^(nw_connection_state_t s, nw_error_t e) {
       if (s == nw_connection_state_failed || s == nw_connection_state_cancelled) [self dropped:c];
     });
     nw_connection_start(c);
     [self read:c];
     // a connection that doesn't say what it is (frame:) within 5 s is not ours
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), netQ, ^{
       if (c != self->_native && c != self->_runnerJs && c != self->_js) nw_connection_cancel(c);
     });
   });
@@ -313,10 +352,12 @@ static id mantisToken(void) {
 }
 
 - (void)unlisten {
-  if (_listener) nw_listener_cancel(_listener);
-  _listener = nil;
-  nw_connection_t all[] = {_native, _runnerJs, _js}; // each one's dropped: clears it
-  for (int i = 0; i < 3; i++) if (all[i]) nw_connection_cancel(all[i]);
+  dispatch_async(netQ, ^{
+    if (self->_listener) nw_listener_cancel(self->_listener);
+    self->_listener = nil;
+    nw_connection_t all[] = {self->_native, self->_runnerJs, self->_js}; // each one's dropped: clears it
+    for (int i = 0; i < 3; i++) if (all[i]) nw_connection_cancel(all[i]);
+  });
 }
 
 - (void)read:(nw_connection_t)c {
@@ -393,13 +434,17 @@ static BOOL sameToken(id t) {
   }
 }
 
-// One RPC request from the runner (either transport); exactly one reply.
+// One RPC request from the runner (either transport, off the main queue); exactly one reply.
 - (void)request:(NSData *)d {
   // validate before use: a non-JSON / id-less frame has nothing to answer
   id msg = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
   id mid = [msg isKindOfClass:NSDictionary.class] ? msg[@"id"] : nil;
   if (![mid isKindOfClass:NSNumber.class]) return NSLog(@"[Mantis] ignoring a frame that is not an RPC request");
   id method = msg[@"method"], params = msg[@"params"];
+  mantisBeatStart();
+  // answered here, not on main: how long the main thread hasn't run (stuck: it never runs a request)
+  if ([method isEqual:@"Agent.alive"])
+    return [self send:@{@"id": mid, @"result": @{@"mainMs": @((CACurrentMediaTime() - mantisBeat) * 1000)}}];
   dispatch_async(dispatch_get_main_queue(), ^{
     // exactly one reply per request, whatever path (sync, async callback, exception) gets there first
     __block BOOL replied = NO;

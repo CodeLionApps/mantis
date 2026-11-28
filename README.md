@@ -398,10 +398,10 @@ that export nothing. An exception inside an agent (the app) comes back as `AGENT
 
 | `code`             | Meaning                                                                                       |
 | ------------------ | --------------------------------------------------------------------------------------------- |
-| `TIMEOUT`          | a wait ran out: `idle`, `expect`, a read-only RPC                                             |
+| `TIMEOUT`          | a wait ran out: `idle`, `expect`, a read-only RPC; or was cut short because the app's thread it waits on is stuck (`err.stuck`, see [A stuck app](#a-stuck-app)) |
 | `NOT_ACTIONABLE`   | a tap / fill target never became actionable; `err.reason`: the last check (`not found`, `disabled`, `covered by ...`) |
 | `NOT_FOCUSED`      | no text field took the text (`fill`, `keyboard.type`)                                        |
-| `DELIVERED`        | the touch or text reached the app, or may have (an `Input.*` RPC that never answered): retrying could do it twice |
+| `DELIVERED`        | the touch or text reached the app, or may have (an `Input.*` RPC that never answered, `err.stuck` when its thread is stuck; an action that ran natively and JS then didn't answer): retrying could do it twice |
 | `STRICT`           | a locator matched several elements                                                            |
 | `STALE`            | what a snapshot showed is gone (a `getByTag` node, the view under a point tap, a JS reload): snapshot again; `err.tag` says which |
 | `COVERED`          | `touchscreen.tap` at a point under a system window or the keyboard; `err.state`, `err.keyboard` |
@@ -411,6 +411,47 @@ that export nothing. An exception inside an agent (the app) comes back as `AGENT
 | `PORT_IN_USE`      | a cabled iPhone: another app answered on the agent's port (another Mantis build, or a launch of another runner) and this launch's agent never did (`relaunch`, a call waiting for the agents) |
 | `DISCONNECTED`     | an agent went away during a call (relaunch, crash); the call may or may not have run. `idle` and `mark` throw it at once when an agent is gone (other calls wait for it to reconnect) |
 | `AGENT_ERROR`      | the call threw inside the app's agent                                                         |
+
+### A stuck app
+
+When the app's main or JS thread runs nothing (a crashed app behind the system's crash dialog, an ANR, a deadlock, long
+synchronous work), its agents' sockets stay open, and a call would wait for the RPC timeout (15 s). Instead, while a call
+waits, the runner asks every 500 ms whether the thread it needs runs:
+
+- Main: the native agent answers `Agent.alive` off the main thread, with how long main hasn't run its heartbeat (every
+  250 ms, from the runner's first call on; not frame-based, so it beats in the background too). iOS: the agent's sockets
+  live on a queue of their own (a cabled iPhone's too, which relays the JS agent off the main thread as well).
+- JS: the JS agent is that thread, so the fact is its silence: how long since the runner asked it something (a ping
+  keeps asking) without a word back. It counts only while the native agent answers. iOS: the JS agent's socket is RN's
+  WebSocket module, which runs on the main queue, so a stuck main thread holds JS calls too (`thread: "main"`).
+
+A thread that ran nothing for 5000 ms (Android's ANR threshold) is stuck (main: two answers in a row say so, the second
+larger, so one right after the process woke from a sleep, which counts the sleep, doesn't): the call fails with `err.stuck` =
+`{ thread: "main" | "JS", forMs }` and `TIMEOUT`, or `DELIVERED` for an `Input.*` call (it is queued on that thread and
+may still run when the thread does). The next call to that agent asks at once, so it fails within a round trip while
+the thread is stuck and works again once it runs. `idle` and `mark` too (`err.busy.thread` names the same thread). An
+action that ran natively and then waits for JS to take it (`tap`, `fill`, `scroll`, `back`, `keyboard.type`) is
+`DELIVERED` when JS doesn't answer, stuck or not (a `MantisError`, no longer a `TimeoutError`: `instanceof` checks change).
+Android's crash dialog keeps the crashed thread (main) blocked until it is dismissed, so the app stays connected and its
+main thread is stuck; its JS thread may still answer. On iOS a crash ends the process: `DISCONNECTED`.
+
+Not called stuck, the call runs to its timeout as before:
+
+- a whole app that answers nothing: iOS suspends an app in the background, Android's cached-app freezer freezes one that
+  stays in the background a while (until then its main thread runs), a native debugger stopped at a breakpoint (lldb,
+  Android Studio's default suspend-all);
+- an app built with an older Mantis (no `Agent.alive`).
+
+A long call whose thread keeps running isn't either (a long drag: main draws its frames).
+
+Behaviour change (this version): a thread busy for 5 to 15 s in one go (a debug build, a loaded emulator, a heavy first
+render) used to answer late and the call succeeded; now the call fails at about 5 s (`TIMEOUT`, or `DELIVERED` for
+`Input.*`) with `err.stuck`. There is no option to wait longer: the caller decides what to do with the fact (wait and
+call again, which works as soon as the thread runs).
+
+Limits: a JS thread paused in a JS debugger (debug builds) reads as stuck; the first call after a thread got stuck
+waits until it has been stuck for about 5000 ms; iOS, a JS call silent for 5 s while main has been stuck for less is
+reported as `thread: "JS"` (main holds the JS agent's socket there, so the cause may be main).
 
 ## Channel
 

@@ -21,6 +21,12 @@ const DEFAULT_TIMEOUT = 10000;
 // well under that; a socket that takes longer is a push channel, a one-way send or a backend that's down)
 const WS_HOLD_MS = 1500;
 const CONNECT_TIMEOUT = 15000;
+const RPC_TIMEOUT = 15000;
+// A thread that ran nothing for this long is stuck: Android's ANR threshold (input not handled in 5 s). An RPC waiting on
+// it fails then instead of at RPC_TIMEOUT (err.stuck).
+const STUCK_MS = 5000;
+// how often a pending RPC asks whether its thread is stuck
+const PROBE_MS = 500;
 // an iOS app frees its port ~0.6 s after another one launched (it went to the background), and an agent that found the
 // port taken retries every second
 const HELD_GRACE = 1500;
@@ -42,6 +48,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
  * connect in time. PORT_IN_USE: a cabled iPhone's port is held by another app (another Mantis build, or a launch of
  * another runner), so this launch's agent couldn't listen there. DISCONNECTED: it went away during a call (which may or
  * may not have run), or is gone when idle / mark ping it. AGENT_ERROR: the call threw inside the app's agent.
+ * stuck ({ thread: "main" | "JS", forMs }): a call cut short (TIMEOUT, or DELIVERED for an Input.* one) because the
+ * thread it needs ran nothing for forMs >= STUCK_MS.
  */
 class MantisError extends Error {
   constructor(code, message, props) {
@@ -96,6 +104,13 @@ class Peer {
     this.refused = new Set();
     this.held = null; // why: another app holds the port (cabled iPhone)
     this.waiters = []; // ready(): { since, done, fail }
+    // when the runner first sent something since the agent last sent anything (null: nothing unanswered): how long its
+    // thread has been silent. A call given up on still counts: the agent never answered it.
+    this.asked = null;
+    // App sets it: resolves to { thread, forMs } when the thread this agent's calls need is stuck, else null
+    this.probe = null;
+    this.stuck = null; // the last probe's answer: a call after a stuck one probes at once
+    this.lastAlive = null; // native: the last Agent.alive answer's mainMs
   }
 
   get connected() {
@@ -119,6 +134,7 @@ class Peer {
       }
       if (msg?.method === "Agent.hello") return this.greet(ws, msg.params || {});
       if (ws !== this.ws) return;
+      this.asked = null;
       if (msg.id != null) {
         const p = this.pending.get(msg.id);
         if (!p) return;
@@ -134,6 +150,7 @@ class Peer {
       clearTimeout(helloTimer);
       if (this.ws !== ws) return;
       this.hello = null;
+      this.asked = this.stuck = this.lastAlive = null;
       this.failPending("agent disconnected");
     });
   }
@@ -170,6 +187,7 @@ class Peer {
     }
     if (this.ws !== ws) this.failPending("agent reconnected");
     this.ws = ws;
+    this.asked = this.stuck = this.lastAlive = null;
     this.hello = p;
     this.held = null;
     this.onHello?.(p);
@@ -244,23 +262,57 @@ class Peer {
     return r;
   }
 
+  // An RPC; it fails at RPC_TIMEOUT, or as soon as a probe says the thread it needs is stuck (err.stuck).
   raw(id, method, params) {
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        // an action that never answered may still have run
-        reject(
-          method.startsWith("Input.")
-            ? new MantisError("DELIVERED", `rpc timeout: ${method} (it may have run)`)
-            : new TimeoutError("TIMEOUT", `rpc timeout: ${method}`),
-        );
-      }, 15000);
+      let watch;
       const done = (f) => (v) => {
         clearTimeout(timer);
+        clearTimeout(watch);
+        this.pending.delete(id);
         f(v);
       };
+      // an action that never answered may still have run (also on a stuck thread: it may run once the thread does)
+      const fail = (why, props) =>
+        done(reject)(
+          method.startsWith("Input.")
+            ? new MantisError("DELIVERED", `${why}: ${method} (it may have run)`, props)
+            : new TimeoutError("TIMEOUT", `${why}: ${method}`, props),
+        );
+      const timer = setTimeout(() => fail("rpc timeout"), RPC_TIMEOUT);
+      const check = async () => {
+        this.stuck = await this.probe();
+        if (!this.pending.has(id)) return;
+        if (!this.stuck) return (watch = setTimeout(check, PROBE_MS));
+        const { thread, forMs } = this.stuck;
+        fail(`the app's ${thread} thread is stuck: it ran nothing for ${forMs}ms`, { stuck: this.stuck });
+      };
+      if (this.probe) watch = setTimeout(check, this.stuck ? 0 : PROBE_MS);
       this.pending.set(id, { resolve: done(resolve), reject: done(reject) });
-      this.ws.send(JSON.stringify({ id, method, params }));
+      this.send({ id, method, params });
+    });
+  }
+
+  send(msg) {
+    this.asked ??= performance.now();
+    this.ws.send(JSON.stringify(msg));
+  }
+
+  /** A probe: the method's result, or null when the agent doesn't answer within ms, is gone or throws. */
+  ask(method, ms) {
+    if (!this.connected) return Promise.resolve(null);
+    const id = ++this.seq;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        resolve(null);
+      }, ms);
+      const done = (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      };
+      this.pending.set(id, { resolve: done, reject: () => done(null) });
+      this.send({ id, method });
     });
   }
 }
@@ -288,6 +340,34 @@ class App extends EventEmitter {
     this.commitWaiters = [];
     this.touch = { seq: 0 }; // last touch start JS saw (Input.touchStart)
     this.js.onHello = () => (this.touch = { seq: 0 }); // a new JS context counts touches from 0
+    // Stuck threads (Peer.raw). Main: the native agent answers Agent.alive off the main thread with how long main hasn't
+    // run. JS: the JS agent is the JS thread, so its silence since the runner asked (a ping keeps asking) is the fact;
+    // it counts only while the native agent answers: a whole app that is silent (suspended in the background, stopped
+    // in a debugger) is not called stuck. An agent without Agent.alive (older Mantis): neither, calls run to their timeout.
+    const alive = () =>
+      this.native.hello?.features?.includes("alive") ? this.native.ask("Agent.alive", PROBE_MS) : Promise.resolve(null);
+    // Main is stuck after two answers in a row of at least STUCK_MS, the second larger: main didn't beat in between. One
+    // answer isn't enough: a process that just woke (iOS suspended, Android's cached-app freezer) answers with the sleep
+    // counted, until main's first beat. { alive, stuck }: whether the native agent answered, the main verdict.
+    const main = async () => {
+      const a = await alive();
+      const prev = this.native.lastAlive;
+      this.native.lastAlive = a?.mainMs ?? null;
+      const stuck = a && prev >= STUCK_MS && a.mainMs > prev ? { thread: "main", forMs: Math.round(a.mainMs) } : null;
+      return { alive: !!a, stuck };
+    };
+    this.native.probe = async () => (await main()).stuck;
+    let pinging = null; // one ping in flight at a time
+    this.js.probe = async () => {
+      pinging ??= this.js.ask("Agent.ping", RPC_TIMEOUT).finally(() => (pinging = null));
+      const silent = this.js.asked == null ? 0 : performance.now() - this.js.asked;
+      // iOS: the JS agent's socket is RN's WebSocket module, which runs on the main queue, so a stuck main thread
+      // holds JS calls too
+      const ios = this.platform === "ios";
+      const m = (silent >= STUCK_MS || ios) && (await main());
+      if (ios && m.stuck) return m.stuck;
+      return silent >= STUCK_MS && m.alive ? { thread: "JS", forMs: Math.round(silent) } : null;
+    };
     this.js.onEvent = (msg) => {
       if (msg.method === "Tree.committed")
         this.commitWaiters.splice(0).forEach((w) => w());
@@ -468,9 +548,13 @@ class App extends EventEmitter {
   // previous one can be lost (seen: terms checkbox right after the health one, both rects stable). One frame for
   // the event to reach JS, a ping queued behind it (= its handler and sync re-render ran), one frame to mount.
   // ponytail: doesn't wait for async follow-ups (fetches, timers); the next step's auto-wait covers those.
+  // The action already ran natively: JS not answering (stuck, or the RPC timeout) doesn't undo it, so DELIVERED.
   async settle() {
     await sleep(16);
-    await this.js.call("Agent.ping");
+    await this.js.call("Agent.ping").catch((e) => {
+      if (e.code !== "TIMEOUT") throw e;
+      throw new MantisError("DELIVERED", `the action ran, then ${e.message}`, e.stuck && { stuck: e.stuck });
+    });
     await sleep(16);
   }
 
@@ -735,19 +819,29 @@ class App extends EventEmitter {
   async mark({ timeout = DEFAULT_TIMEOUT } = {}) {
     const msg = (thread) => `mark: the ${thread} thread didn't answer in ${timeout}ms`;
     const [js, ui] = await Promise.all([
-      this.#ping(this.js, timeout, msg("JS")),
-      nativePing(this.#ping(this.native, timeout, msg("main"))),
+      this.#ping(this.js, timeout, "mark", msg("JS")),
+      nativePing(this.#ping(this.native, timeout, "mark", msg("main"))),
     ]);
     return { commitId: js.commitId, draws: ui.draws };
   }
 
-  // Agent.ping within ms: a stalled thread is a TimeoutError(message, props), not the RPC's after 15 s. An agent that's
-  // gone is DISCONNECTED at once: a plain call would wait up to 15 s for it to come back (a waiter picks its own fallback).
-  #ping(peer, ms, message, props) {
+  // Agent.ping within ms: a stalled thread is a TimeoutError(message, props), not the RPC's after 15 s; a stuck one is
+  // one as soon as the RPC knows (`${what}: ` its message, props and err.stuck). An agent that's gone is DISCONNECTED at
+  // once: a plain call would wait up to 15 s for it to come back (a waiter picks its own fallback).
+  #ping(peer, ms, what, message, props) {
     if (!peer.connected) return Promise.reject(new MantisError("DISCONNECTED", `the ${peer.role} agent is not connected`));
     let timer;
     return Promise.race([
-      peer.call("Agent.ping").finally(() => clearTimeout(timer)),
+      peer.call("Agent.ping").then(
+        (r) => (clearTimeout(timer), r),
+        (e) => {
+          clearTimeout(timer);
+          if (!e.stuck) throw e;
+          // iOS: a JS ping may be the one held by a stuck main thread
+          const busy = props?.busy && { busy: { ...props.busy, thread: e.stuck.thread } };
+          throw new TimeoutError("TIMEOUT", `${what}: ${e.message}`, { ...props, ...busy, stuck: e.stuck });
+        },
+      ),
       new Promise((_, reject) => {
         timer = setTimeout(() => reject(new TimeoutError("TIMEOUT", message, props)), ms);
       }),
@@ -773,7 +867,7 @@ class App extends EventEmitter {
     const t0 = performance.now();
     // a ping waits for what's left of timeout (at least 100 ms, so one sent at the end can still answer)
     const ping = (peer, thread) =>
-      this.#ping(peer, Math.max(100, t0 + timeout - performance.now()),
+      this.#ping(peer, Math.max(100, t0 + timeout - performance.now()), "app not idle",
         `app not idle after ${timeout}ms: the ${thread} thread didn't answer`, { busy: { thread } });
     let reacted = !since;
     for (;;) {
