@@ -40,6 +40,11 @@ class SceneDelegate: RCTDefaultReactNativeFactoryDelegate, UIWindowSceneDelegate
   }
 
   func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
+    // e2e/stuck.mantis.js: probespike://hang?ms=N blocks the main thread for N ms
+    for c in URLContexts where c.url.scheme == "probespike" && c.url.host == "hang" {
+      let ms = URLComponents(url: c.url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "ms" }?.value
+      Thread.sleep(forTimeInterval: Double(ms ?? "0").map { $0 / 1000 } ?? 0)
+    }
     RCTLinkingManager.scene(scene, openURLContexts: URLContexts)
   }
 
