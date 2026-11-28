@@ -26,5 +26,13 @@
             <category android:name="android.intent.category.LAUNCHER" />
         </intent-filter>
       </activity>
+      <!-- the system windows lab (App.tsx "Okna"): another activity of the app, opened by a link -->
+      <activity android:name=".LabActivity" android:exported="true">
+        <intent-filter>
+          <action android:name="android.intent.action.VIEW" />
+          <category android:name="android.intent.category.DEFAULT" />
+          <data android:scheme="probespike-lab" />
+        </intent-filter>
+      </activity>
     </application>
 </manifest>

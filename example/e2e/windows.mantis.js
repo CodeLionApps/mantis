@@ -1,6 +1,8 @@
 // What the app can't see, as facts: the screenshot's focused / state / keyboard / surfaces, the snapshot's state and
-// overlays, COVERED's state. Screen "Okna": a native surface, a permission prompt, a native Alert, a Modal.
+// overlays, COVERED's state. Screen "Okna": a native surface, a permission prompt, a native Alert, a Modal, another
+// activity (Android).
 // MANTIS_E2E=1 build installed; DEVICE=<adb serial or simulator / iPhone UDID> [PLATFORM=ios MANTIS_APP_ID=<bundle id>]
+// [SYSTEM_PROMPT=1: iOS simulator, the permission prompt test, which restarts SpringBoard]
 //   node --test e2e/windows.mantis.js
 const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
@@ -72,7 +74,7 @@ test('a Modal: an overlay of React content, the snapshot complete', async () => 
   assert.deepEqual([overlays.map(o => [o.type, o.react]), complete, focused], [[['modal', true]], true, true]);
 });
 
-test('a native Alert: an overlay that is not React, the nodes under it covered, in the picture', async () => {
+test('a native Alert: an overlay that is not React, the nodes under it covered; a tap outside it closes it (Android, cancelable) or does nothing (iOS)', async () => {
   const { nodes } = await app.snapshot();
   const modalButton = nodes.find(n => n.text === 'Okno Modal');
   await app.getByText('Komunikat').tap();
@@ -92,12 +94,29 @@ test('a native Alert: an overlay that is not React, the nodes under it covered, 
   assert.equal(snap.nodes.find(n => n.text === 'Okno Modal'), undefined);
   const [x, y] = centre(modalButton.rect), o = overlay.rect;
   assert.ok(y < o.y || y > o.y + o.height || x < o.x || x > o.x + o.width, 'the button is outside the dialog');
-  await app.touchscreen.tap(...centre(modalButton.rect));
-  await new Promise(r => setTimeout(r, 500));
-  assert.equal((await app.snapshot()).overlays[0]?.react, false, 'the alert is still there, no Modal opened');
   const shot = await shoot();
   assert.equal(shot.focused, android);
   assert.equal(shot.state, 'active');
+  // the tap goes to the dialog, not to the button under it: Android closes a cancelable one, iOS ignores it
+  await app.touchscreen.tap(x, y);
+  await new Promise(r => setTimeout(r, 500));
+  if (android) await until('the dialog is still there', async () => !(await app.snapshot()).overlays.length);
+  else assert.equal((await app.snapshot()).overlays[0]?.type, 'alert', 'the alert is still there');
+  assert.equal((await app.snapshot()).nodes.find(n => n.text === 'Zamknij okno'), undefined, 'no Modal opened');
+});
+
+test('another activity of the app over an Alert: the hidden dialog is not an overlay', { skip: !android && 'Android' }, async () => {
+  await app.getByText('Komunikat i aktywność').tap();
+  // a plain activity of the app on top: the first one is stopped, its window and its dialog hidden
+  // (the Alert alone covers every node too: wait for the windows on screen, the other activity's only)
+  await until('the other activity never came', async () => (await app.native.call('Page.screenshot', { scale: 0.1 })).windows.length === 1);
+  await app.idle();
+  const snap = await app.snapshot();
+  assert.deepEqual([snap.state, snap.focused, snap.overlays], ['active', true, []]);
+  assert.deepEqual(snap.reasons, ['no nodes: nothing of React\'s on screen (a splash screen)']);
+  // back: the other activity goes, the first one comes back with its dialog
+  assert.equal((await app.back()).ok, true);
+  await until('the dialog never came back', async () => (await app.snapshot()).overlays.length === 1);
 });
 
 test('the keyboard: the screenshot reports the one the snapshot sees', async () => {
@@ -115,8 +134,8 @@ test('the keyboard: the screenshot reports the one the snapshot sees', async () 
 });
 
 // The permission prompt is device state: reset before, restored after (Android: the permission's grant; iOS
-// simulator: contacts reset, and SpringBoard restarted to take the prompt away). Not on a physical iPhone (no reset
-// there).
+// simulator: contacts reset, and SpringBoard restarted, opt-in with SYSTEM_PROMPT=1: the prompt outlives the app, a
+// permission reset and even an uninstall). Not on a physical iPhone (no reset there).
 const PERM = 'android.permission.POST_NOTIFICATIONS';
 const sim = !android && !isIosDevice(target);
 const simctl = (...args) => execFileSync('xcrun', ['simctl', ...args], { encoding: 'utf8' });
@@ -129,7 +148,11 @@ const permission = {
     } else simctl('privacy', target.deviceId, 'reset', 'contacts', target.appId);
   },
 };
-test('a system permission prompt: the app not focused, its state, COVERED, the screenshot says it is not in it', { skip: !android && !sim && 'needs a simulator (a permission reset)' }, async () => {
+const skipPrompt = android
+  ? Number(adb('getprop', 'ro.build.version.sdk')) < 33 && 'POST_NOTIFICATIONS needs Android 13'
+  : !sim ? 'needs a simulator (a permission reset)'
+  : !process.env.SYSTEM_PROMPT && 'restarts SpringBoard to take the prompt away: SYSTEM_PROMPT=1 to run it';
+test('a system permission prompt: the app not focused, its state, COVERED, the screenshot says it is not in it', { skip: skipPrompt }, async () => {
   const granted = permission.read();
   permission.reset(); // Android: revoking a permission kills the app
   try {

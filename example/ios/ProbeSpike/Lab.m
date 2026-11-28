@@ -1,5 +1,6 @@
 // System windows lab (App.tsx "Okna"): a Metal view filled magenta (LabSurface) and a system permission prompt over the
-// app (Lab.askPermission: contacts; a TCC prompt goes away with the app that asked, a location one stays on screen).
+// app (Lab.askPermission: contacts). The prompt outlives the app: terminate, a permission reset or an uninstall leave it
+// on screen (e2e/windows.mantis.js restarts SpringBoard, opt-in).
 @import Contacts;
 @import Metal;
 @import QuartzCore;

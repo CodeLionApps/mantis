@@ -8,6 +8,7 @@ import {
   Animated,
   BackHandler,
   FlatList,
+  Linking,
   Modal,
   NativeModules,
   PermissionsAndroid,
@@ -278,7 +279,18 @@ function Windows({ onBack }: { onBack: () => void }) {
       <LabSurface testID="surface" style={styles.surface} />
       <Button title="Uprawnienie" onPress={ask} />
       <Text style={styles.body}>Odpowiedź: {answer}</Text>
-      <Button title="Komunikat" onPress={() => Alert.alert('Komunikat', 'Natywny', [{ text: 'OK' }])} />
+      {/* cancelable: Android closes it on a touch outside its box */}
+      <Button title="Komunikat" onPress={() => Alert.alert('Komunikat', 'Natywny', [{ text: 'OK' }], { cancelable: true })} />
+      {Platform.OS === 'android' && (
+        <Button
+          title="Komunikat i aktywność"
+          onPress={() => {
+            // the Alert stays with this activity, under the other one, which hides both
+            Alert.alert('Komunikat', 'Natywny', [{ text: 'OK' }]);
+            setTimeout(() => Linking.openURL('probespike-lab://lab'), 500);
+          }}
+        />
+      )}
       <Button title="Wstecz" onPress={onBack} />
       <Modal visible={modal} animationType="none" onRequestClose={() => setModal(false)}>
         <View style={styles.screen}>

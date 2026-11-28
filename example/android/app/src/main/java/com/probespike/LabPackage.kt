@@ -32,3 +32,12 @@ class LabSurfaceManager : SimpleViewManager<SurfaceView>() {
     h.unlockCanvasAndPost(c)
   }
 }
+
+// A plain (non-React) activity of the app over the main one (App.tsx "Okna", Android): opened by a link to
+// probespike-lab://, so the example needs no native module for it. Back finishes it.
+class LabActivity : androidx.activity.ComponentActivity() {
+  override fun onCreate(b: android.os.Bundle?) {
+    super.onCreate(b)
+    setContentView(android.widget.TextView(this).apply { text = "LabActivity"; setBackgroundColor(Color.WHITE) })
+  }
+}
