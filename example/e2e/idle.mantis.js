@@ -1,18 +1,49 @@
-// app.idle() on the example app: a spinner on screen keeps it busy, one hidden in a mounted overlay doesn't.
+// app.idle() on the example app: a spinner on screen keeps it busy, one hidden in a mounted overlay doesn't; work that
+// lands after the tap (a timer, a WebSocket reply, an animation, an image) is waited for, work that never ends isn't.
 // MANTIS_E2E=1 build installed; DEVICE=<adb serial or simulator / iPhone UDID> [PLATFORM=ios MANTIS_APP_ID=<bundle id>]
 //   node --test e2e/idle.mantis.js
 const { test, before, after, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
+const { execFileSync } = require('node:child_process');
+const http = require('node:http');
+const { WebSocketServer } = require('ws');
 const { App, expect } = require('@codelionapps/mantis');
 const { isIosDevice, launchApp, reversePort } = require('@codelionapps/mantis/device');
 
 const target = { platform: process.env.PLATFORM || 'android', deviceId: process.env.DEVICE, appId: process.env.MANTIS_APP_ID || 'com.probespike' };
 const app = new App(undefined, target.platform, { usb: isIosDevice(target) ? target.deviceId : undefined });
+// the screen "Później"'s server (App.tsx LAB): an image after 800 ms; on a socket, "hej" gets a reply after 600 ms, then a
+// ping every 200 ms
+const LAB = 9124;
+const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==', 'base64');
+const server = http.createServer((req, res) =>
+  setTimeout(() => res.writeHead(200, { 'content-type': 'image/png' }).end(PNG), 800),
+);
+const wss = new WebSocketServer({ server });
+wss.on('connection', ws =>
+  ws.on('message', m => {
+    if (String(m) !== 'hej') return;
+    setTimeout(() => {
+      ws.send('odpowiedź');
+      const ping = setInterval(() => ws.send('ping'), 200);
+      ws.on('close', () => clearInterval(ping));
+    }, 600);
+  }),
+);
+const adb = (...args) => execFileSync('adb', ['-s', target.deviceId, ...args]);
 before(async () => {
   await app.start();
   reversePort(app.port, target);
+  await new Promise(r => server.listen(LAB, '127.0.0.1', r));
+  if (target.platform === 'android') adb('reverse', `tcp:${LAB}`, `tcp:${LAB}`);
 });
-after(() => app.close());
+after(() => {
+  if (target.platform === 'android') adb('reverse', '--remove', `tcp:${LAB}`);
+  for (const ws of wss.clients) ws.terminate();
+  server.closeAllConnections();
+  server.close();
+  return app.close();
+});
 beforeEach(() => app.relaunch(() => launchApp({ ...target, launchArgs: app.launchArgs })));
 
 const timed = async (o) => {
@@ -40,3 +71,59 @@ for (const [button, how] of [['Zanikanie', 'faded to opacity 0'], ['Poza ekran',
     assert.ok((await timed({ timeout: 3000 })) < 1500);
     assert.equal((await app.getByTestId('overlay-spinner').all()).length, 1); // still mounted, still looping natively
   });
+
+const shows = async text => (await app.snapshot()).nodes.some(n => n.text === text);
+const later = async () => {
+  await app.getByText('Później').tap();
+  await expect(app.getByText('Stan: nic')).toBeVisible();
+  await app.idle();
+};
+
+test('a timer the tap set: idle waits for it', async () => {
+  await later();
+  await app.getByText('Za chwilę').tap();
+  assert.ok((await timed()) >= 600);
+  assert.ok(await shows('Stan: po czasie'));
+});
+
+test('an interval and timers that re-arm themselves: idle returns, reporting them', async () => {
+  await later();
+  await app.getByText('W tle').tap();
+  await expect(app.getByText('Stan: w tle')).toBeVisible();
+  const t = performance.now();
+  const { timers } = await app.idle();
+  assert.ok(performance.now() - t < 600);
+  assert.ok(timers.some(x => x.kind === 'interval' && x.ms === 1000), JSON.stringify(timers));
+  for (const ms of [300, 700]) assert.ok(timers.some(x => x.ms === ms && x.recurring), JSON.stringify(timers));
+});
+
+test('a WebSocket reply: idle waits for it; the server pinging later does not hold it', async () => {
+  await later();
+  await app.getByText('WebSocket').tap();
+  await app.idle();
+  assert.ok(await shows('Stan: WS odpowiedź'));
+  for (let i = 0; i < 3; i++) assert.ok((await timed()) < 400);
+});
+
+for (const [button, ms] of [['Ruch', 800], ['Ruch później', 1400]])
+  test(`a native-driver animation (${button}): idle waits for its end`, async () => {
+    await later();
+    const box = async () => (await app.snapshot()).nodes.find(n => n.testID === 'box').rect.x;
+    const x0 = await box();
+    await app.getByText(button).tap();
+    assert.ok((await timed()) >= ms - 200);
+    assert.ok(Math.abs((await box()) - x0 - 200) < 2);
+  });
+
+test('a looping animation: times out, saying what moves', async () => {
+  await later();
+  await app.getByText('Pętla').tap();
+  await assert.rejects(app.idle({ timeout: 1000 }), e => e.code === 'TIMEOUT' && !!e.busy.screen);
+});
+
+test('an image from the network: idle waits for it', { todo: 'native image loads are not tracked' }, async () => {
+  await later();
+  await app.getByText('Obrazek').tap();
+  await app.idle();
+  assert.ok(await shows('Stan: obrazek'));
+});

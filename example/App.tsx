@@ -8,8 +8,10 @@ import {
   Animated,
   BackHandler,
   FlatList,
+  Image,
   Modal,
   Pressable,
+  ScrollView,
   StyleSheet,
   Switch,
   Text,
@@ -312,6 +314,63 @@ function Overlay({ onBack }: { onBack: () => void }) {
   );
 }
 
+// idle() lab: work that lands a while after the tap (a timer, a WebSocket reply, a native animation, an image from the
+// network) and work that never ends (an interval, timers that re-arm themselves, a socket the server pings, a loop).
+// The server is the e2e test's (e2e/idle.mantis.js), on the host; Android reaches it through adb reverse.
+const LAB = 'localhost:9124';
+function Later({ onBack }: { onBack: () => void }) {
+  const [state, setState] = useState('nic');
+  const [image, setImage] = useState<string | null>(null);
+  const x = useRef(new Animated.Value(0)).current;
+  const stops = useRef<(() => void)[]>([]);
+  useEffect(() => () => stops.current.forEach(stop => stop()), []);
+  const background = () => {
+    const interval = setInterval(() => {}, 1000);
+    let timeout = setTimeout(function tick() {
+      timeout = setTimeout(tick, 300);
+    }, 300);
+    let on = true;
+    (async () => {
+      while (on) await new Promise<void>(r => setTimeout(r, 700));
+    })();
+    stops.current.push(() => {
+      clearInterval(interval);
+      clearTimeout(timeout);
+      on = false;
+    });
+    setState('w tle');
+  };
+  const socket = () => {
+    const ws = new WebSocket(`ws://${LAB}/`);
+    ws.onopen = () => ws.send('hej');
+    // the server pings every 200 ms after its reply: a pong answers it, it is not a request
+    ws.onmessage = e => (e.data === 'ping' ? ws.send('pong') : setState(`WS ${e.data}`));
+    stops.current.push(() => ws.close());
+  };
+  const move = (delay: number) => {
+    x.setValue(0);
+    Animated.timing(x, { toValue: 200, duration: 800, delay, useNativeDriver: true }).start(() => setState('przesunięte'));
+  };
+  const loop = () => Animated.loop(Animated.timing(x, { toValue: 200, duration: 400, useNativeDriver: true })).start();
+  return (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Stan: {state}</Text>
+      <Button title="Za chwilę" onPress={() => setTimeout(() => setState('po czasie'), 800)} />
+      <Button title="W tle" onPress={background} />
+      <Button title="WebSocket" onPress={socket} />
+      <View style={styles.switchRow}>
+        <Button title="Ruch" onPress={() => move(0)} />
+        <Button title="Ruch później" onPress={() => move(600)} />
+        <Button title="Pętla" onPress={loop} />
+      </View>
+      <Button title="Obrazek" onPress={() => setImage(`http://${LAB}/image.png?${Date.now()}`)} />
+      <Button title="Wstecz" onPress={onBack} />
+      <Animated.View testID="box" style={[styles.box, { transform: [{ translateX: x }] }]} />
+      {image && <Image testID="image" source={{ uri: image }} onLoad={() => setState('obrazek')} style={styles.box} />}
+    </View>
+  );
+}
+
 const SCREENS = {
   Logowanie: LoginFlow,
   Licznik: Counter,
@@ -323,6 +382,7 @@ const SCREENS = {
   Nakładka: Overlay,
   Przewijanie: Scrolling,
   Alerty: Alerts,
+  Później: Later,
 };
 
 export default function App() {
@@ -342,12 +402,12 @@ export default function App() {
       {Screen ? (
         <Screen onBack={() => setScreen(null)} />
       ) : (
-        <View style={styles.screen}>
+        <ScrollView style={styles.root} contentContainerStyle={styles.menu}>
           <Text style={styles.title}>Menu</Text>
           {(Object.keys(SCREENS) as (keyof typeof SCREENS)[]).map(s => (
             <Button key={s} title={s} onPress={() => setScreen(s)} />
           ))}
-        </View>
+        </ScrollView>
       )}
     </GestureHandlerRootView>
   );
@@ -356,6 +416,7 @@ export default function App() {
 const styles = StyleSheet.create({
   root: { flex: 1 },
   screen: { flex: 1, padding: 24, paddingTop: 80, backgroundColor: '#fff' },
+  menu: { flexGrow: 1, padding: 24, paddingTop: 80, backgroundColor: '#fff' },
   title: { fontSize: 24, fontWeight: '600', marginBottom: 16, color: '#111' },
   body: { fontSize: 16, marginBottom: 8, color: '#111' },
   input: { borderWidth: 1, borderColor: '#999', borderRadius: 6, padding: 10, marginBottom: 12, color: '#111' },
@@ -373,5 +434,6 @@ const styles = StyleSheet.create({
   modal: { backgroundColor: '#fff', borderRadius: 8, padding: 24 },
   ghBox: { height: 120, backgroundColor: '#16a34a', borderRadius: 8, justifyContent: 'center', alignItems: 'center', marginBottom: 12 },
   ghPan: { backgroundColor: '#9333ea' },
+  box: { width: 40, height: 40, backgroundColor: '#f59e0b' },
   overlay: { ...StyleSheet.absoluteFill, backgroundColor: '#0008', justifyContent: 'center', alignItems: 'center' },
 });
