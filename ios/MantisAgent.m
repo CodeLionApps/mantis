@@ -36,6 +36,7 @@
 #import <Network/Network.h>
 #import <objc/runtime.h>
 #import <pthread.h>
+#import <stdatomic.h>
 
 // Draw clock for Agent.ping (Android: an OnDrawListener per window). iOS has no draw callback, so two hooks on CALayer,
 // installed at load. A property set to a new value on the main thread: a mount, a native-driver / Reanimated frame, a
@@ -201,9 +202,11 @@ static MantisAgent *shared;
 static dispatch_queue_t netQ; // the sockets: _ws, the listener and its connections; never the main queue
 
 // Main thread heartbeat for Agent.alive: when main last ran it. Started by the first RPC (a runner drives this process),
-// not by connecting: without a runner the agent stays passive. A timer on a background queue, not dispatch_after on
-// main (DetoxSync counts main-queue dispatch_after up to 1.5 s as busy), nor CADisplayLink (no frames in the background).
+// not by connecting, so a build no runner talks to never beats; once started it beats for the process's life. A timer on
+// a background queue, not dispatch_after on main (DetoxSync counts main-queue dispatch_after up to 1.5 s as busy), nor
+// CADisplayLink (no frames in the background). One beat queued on main at a time: a deadlocked main doesn't pile them up.
 static volatile CFTimeInterval mantisBeat;
+static atomic_bool mantisBeatQueued;
 static void mantisBeatStart(void) {
   static dispatch_once_t once;
   static dispatch_source_t timer;
@@ -212,7 +215,11 @@ static void mantisBeatStart(void) {
     timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
     dispatch_source_set_timer(timer, DISPATCH_TIME_NOW, 250 * NSEC_PER_MSEC, 50 * NSEC_PER_MSEC);
     dispatch_source_set_event_handler(timer, ^{
-      dispatch_async(dispatch_get_main_queue(), ^{ mantisBeat = CACurrentMediaTime(); });
+      if (atomic_exchange(&mantisBeatQueued, true)) return;
+      dispatch_async(dispatch_get_main_queue(), ^{
+        mantisBeat = CACurrentMediaTime();
+        atomic_store(&mantisBeatQueued, false);
+      });
     });
     dispatch_resume(timer);
   });

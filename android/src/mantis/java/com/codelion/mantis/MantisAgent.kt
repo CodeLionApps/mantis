@@ -160,8 +160,9 @@ object MantisAgent {
   }
 
   // Main thread heartbeat for Agent.alive: lastBeat = when main last ran it. Started by the first RPC (a runner is
-  // driving this process), not by connecting: without a runner the agent stays passive. Not Choreographer: no frames
-  // while nothing draws or the app is in the background, where main still runs.
+  // driving this process), not by connecting, so a build no runner talks to never beats; once started it beats for the
+  // process's life. Re-posted by itself, so one at a time. Not Choreographer: no frames while nothing draws or the app is
+  // in the background, where main still runs.
   @Volatile private var lastBeat = 0L
   private val beater = object : Runnable {
     override fun run() {
