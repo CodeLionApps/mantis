@@ -38,6 +38,7 @@ let nativeMantis = { token: () => (tokenAsked++ ? runnerToken : null) }; // the 
 const backHandler = { addEventListener() {}, removeEventListener() {} }; // RN 0.76: removeEventListener a no-op too
 let keyboard = null; // the fake native agent's keyboard rect
 let alert = null; // the fake native agent's alert of the app (focused false, app active): its Input.back result
+let overlays = []; // the fake native agent's windows of the app over its main one
 let nativeBack = { ok: false, reason: "no native navigation stack to pop" };
 let screen = () => ({ draws: 0, idleMs: 1000, busy: null }); // the fake native agent's draw clock; null: no Agent.ping
 const { App, DETOX_VISIBLE, PROTOCOL, expect } = require("./runner");
@@ -325,6 +326,8 @@ async function checkUsbmux() {
           rects: params.tags.map((t) => nativeRects.get(t) ?? null),
           focused: !alert,
           appState: 0,
+          state: "active",
+          overlays,
           keyboard,
         }),
         // the native agent masks the secret ones
@@ -506,11 +509,11 @@ async function checkUsbmux() {
   assert(performance.now() - unseen < 100);
   silent = false;
   keyboard = { x: 0, y: 500, width: 400, height: 300 };
-  await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /on the keyboard/ });
+  await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /on the keyboard/, keyboard, state: "active" });
   keyboard = null;
   alert = { ok: false }; // focused false: a system window over the app on Android, an alert of its own on iOS
   const covered = performance.now();
-  await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /not focused/ });
+  await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /not focused/, state: "active" });
   assert(performance.now() - covered >= 300); // waited for focus first (a window that just opened)
   setTimeout(() => (alert = null), 100); // focus arrives (Android: a Modal's Dialog, ~130 ms after it shows)
   assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
@@ -571,7 +574,15 @@ async function checkUsbmux() {
   assert.equal(snap.nodes[by("testID", "back")].parent, by("testID", "screen-b"));
   assert.equal(snap.nodes[by("testID", "minus")].enabled, false);
   assert.equal(snap.focused, true);
+  assert.deepEqual([snap.state, snap.overlays], ["active", []]);
   assert.deepEqual([snap.complete, snap.reasons], [true, []]);
+  // a Modal (React's) is in the nodes; a native dialog of the app (Android's Alert) is not
+  const rect = { x: 20, y: 300, width: 320, height: 160 };
+  overlays = [{ type: "modal", react: true, rect }];
+  assert.deepEqual([(await app.snapshot()).overlays, (await app.snapshot()).complete], [overlays, true]);
+  overlays = [{ type: "modal", react: false, rect }, { type: "modal", react: true, rect }];
+  assert.deepEqual((await app.snapshot()).reasons, ["a native modal of the app's own on screen: its content is not in the tree"]);
+  overlays = [];
   // rects as drawn natively (screen dp), not the JS layout (React root origin: a Modal under the status bar, transforms)
   nativeRects = new Map([[tagOf(minus), { x: 0, y: 24, width: 100, height: 20 }]]);
   assert.deepEqual((await app.snapshot()).nodes.find((n) => n.testID === "minus").rect, { x: 0, y: 24, width: 100, height: 20 });
