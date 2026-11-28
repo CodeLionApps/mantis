@@ -38,6 +38,7 @@ let nativeMantis = { token: () => (tokenAsked++ ? runnerToken : null) }; // the 
 const backHandler = { addEventListener() {}, removeEventListener() {} }; // RN 0.76: removeEventListener a no-op too
 let keyboard = null; // the fake native agent's keyboard rect
 let alert = null; // the fake native agent's alert of the app (focused false, app active): its Input.back result
+let overlays = []; // the fake native agent's windows of the app over its main one
 let nativeBack = { ok: false, reason: "no native navigation stack to pop" };
 let screen = () => ({ draws: 0, idleMs: 1000, busy: null }); // the fake native agent's draw clock; null: no Agent.ping
 const { App, DETOX_VISIBLE, PROTOCOL, expect } = require("./runner");
@@ -257,6 +258,113 @@ async function checkUsbmux() {
   fake.close();
 }
 
+// Stuck threads: a call waiting on a thread that ran nothing for STUCK_MS fails with err.stuck instead of at the RPC
+// timeout; the next call knows at once. Fake agents: the native one answers Agent.alive off its main thread.
+async function checkStuck() {
+  const STUCK_MS = 5000; // the runner's
+  const app = new App(); // Android, a free port
+  await app.start();
+  const url = (role) => `ws://127.0.0.1:${app.port}/?role=${role}`;
+  let beat = performance.now(); // the native main thread's last heartbeat; null: it beats right now (runs)
+  let mainStuck = false; // the native main thread runs nothing: its calls wait
+  let woke = 0; // the next n Agent.alive answers count a sleep the process just woke from
+  let silentApp = false; // nothing in the app answers (suspended)
+  let jsStuck = false; // the JS thread runs nothing: its calls wait until it runs again
+  const queued = [];
+  const agent = (role, features, answer) => {
+    const ws = new NodeWS(url(role));
+    ws.onopen = () => ws.send(hello(role, { token: app.token, features, ctx: "c" }));
+    ws.onmessage = (e) => answer(JSON.parse(e.data), (id, result) => ws.send(JSON.stringify({ id, result })));
+    return ws;
+  };
+  const native = () =>
+    agent("native", ["token", "alive"], ({ id, method }, reply) => {
+      if (method === "Agent.alive") {
+        if (silentApp) return;
+        if (!mainStuck) beat = performance.now();
+        return reply(id, { mainMs: woke-- > 0 ? 60000 : performance.now() - beat });
+      }
+      if (method === "Slow") return setTimeout(() => reply(id, {}), 1500); // a long call; main keeps running
+      if (!mainStuck) reply(id, method === "Agent.ping" ? { draws: 0, idleMs: 1000 } : { ratios: [] });
+    });
+  let nativeWs = native();
+  const js = agent("js", ["driver", "token"], (msg, reply) => {
+    const answer = () => reply(msg.id, msg.method === "Agent.ping" ? { commitId: 1, idleMs: 1000 } : { nodes: [] });
+    if (jsStuck) queued.push(answer);
+    else answer();
+  });
+  await Promise.all([app.js.ready(), app.native.ready()]);
+  const took = async (p, expected) => {
+    const t = performance.now();
+    await assert.rejects(p, expected);
+    return performance.now() - t;
+  };
+  const isMain = (code) => (e) => e.code === code && e.stuck.thread === "main" && e.stuck.forMs >= 60000;
+
+  // a process that just woke (suspended, Android's freezer) answers once with the sleep counted: not stuck
+  woke = 1;
+  assert.equal(await app.native.probe(), null);
+  assert.equal(await app.native.probe(), null);
+
+  // main stuck long ago (a crash dialog): the first call knows at its second probe, the next ones at once
+  mainStuck = true;
+  beat = performance.now() - 60000;
+  assert(await took(app.native.call("Layout.visibility", { tags: [] }), isMain("TIMEOUT")) < 3000);
+  assert(await took(app.native.call("Layout.visibility", { tags: [] }), (e) => isMain("TIMEOUT")(e) && /main thread is stuck/.test(e.message)) < 1500);
+  // an action may still run once main does: DELIVERED, with the fact
+  await assert.rejects(app.native.call("Input.tap", { x: 1, y: 1 }), isMain("DELIVERED"));
+  await assert.rejects(app.idle(), (e) => isMain("TIMEOUT")(e) && e.busy.thread === "main" && /^app not idle: the app's main thread is stuck/.test(e.message));
+  await assert.rejects(app.mark(), (e) => isMain("TIMEOUT")(e) && /^mark: the app's main thread is stuck/.test(e.message));
+  // an agent without Agent.alive (older Mantis): never stuck
+  const features = app.native.hello.features;
+  app.native.hello.features = ["token"];
+  assert.equal(await app.native.probe(), null);
+  app.native.hello.features = features;
+  // iOS: the JS agent's socket runs on the main queue, so a JS call reports main
+  app.platform = "ios";
+  await app.js.probe(); // the first answer since the one above (no Agent.alive) can't tell
+  assert.equal((await app.js.probe())?.thread, "main");
+  app.platform = "android";
+  assert.equal(await app.js.probe(), null); // Android: JS answers on its own
+  // main runs again: calls work; a long call while main keeps running is not stuck
+  mainStuck = false;
+  await app.native.call("Layout.visibility", { tags: [] });
+  await app.native.call("Slow");
+  // a reconnect (relaunch) starts over: nothing remembered
+  mainStuck = true;
+  beat = performance.now() - 60000;
+  await app.native.probe();
+  app.native.stuck = await app.native.probe();
+  assert.equal(app.native.stuck?.thread, "main");
+  mainStuck = false;
+  nativeWs.close();
+  await new Promise((r) => setTimeout(r, 50));
+  nativeWs = native();
+  await app.native.ready();
+  assert.deepEqual([app.native.stuck, app.native.asked, app.native.lastAlive], [null, null, null]);
+
+  // JS stuck: silent since asked, while the native agent answers
+  jsStuck = true;
+  const first = await took(app.js.call("Tree.query", {}), (e) => e.code === "TIMEOUT" && e.stuck.thread === "JS" && e.stuck.forMs >= STUCK_MS);
+  assert(first >= STUCK_MS && first < STUCK_MS + 3000, String(first));
+  assert(await took(app.js.call("Tree.query", {}), (e) => e.code === "TIMEOUT" && e.stuck.thread === "JS") < 1500);
+  // an action that ran natively, then JS doesn't take it: DELIVERED (not a TimeoutError), not a TIMEOUT inviting a retry
+  await assert.rejects(app.settle(), (e) => e.code === "DELIVERED" && e.name === "MantisError" && e.stuck.thread === "JS");
+  // the whole app silent (suspended in the background, stopped in a debugger): not called stuck
+  silentApp = true;
+  assert.equal(await app.js.probe(), null);
+  silentApp = false;
+  // JS runs again and answers what it was asked: no longer silent
+  jsStuck = false;
+  queued.splice(0).forEach((f) => f());
+  await app.js.call("Tree.query", {});
+  assert.equal(await app.js.probe(), null);
+
+  nativeWs.close();
+  js.close();
+  await app.close();
+}
+
 (async () => {
   checkContract();
 
@@ -325,6 +433,8 @@ async function checkUsbmux() {
           rects: params.tags.map((t) => nativeRects.get(t) ?? null),
           focused: !alert,
           appState: 0,
+          state: "active",
+          overlays,
           keyboard,
         }),
         // the native agent masks the secret ones
@@ -514,11 +624,11 @@ async function checkUsbmux() {
   assert(performance.now() - unseen < 100);
   silent = false;
   keyboard = { x: 0, y: 500, width: 400, height: 300 };
-  await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /on the keyboard/ });
+  await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /on the keyboard/, keyboard, state: "active" });
   keyboard = null;
   alert = { ok: false }; // focused false: a system window over the app on Android, an alert of its own on iOS
   const covered = performance.now();
-  await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /not focused/ });
+  await assert.rejects(app.touchscreen.tap(10, 600), { code: "COVERED", message: /not focused/, state: "active" });
   assert(performance.now() - covered >= 300); // waited for focus first (a window that just opened)
   setTimeout(() => (alert = null), 100); // focus arrives (Android: a Modal's Dialog, ~130 ms after it shows)
   assert.deepEqual(await app.touchscreen.tap(tagOf(minus), 5), sure);
@@ -579,7 +689,17 @@ async function checkUsbmux() {
   assert.equal(snap.nodes[by("testID", "back")].parent, by("testID", "screen-b"));
   assert.equal(snap.nodes[by("testID", "minus")].enabled, false);
   assert.equal(snap.focused, true);
+  assert.deepEqual([snap.state, snap.overlays], ["active", []]);
   assert.deepEqual([snap.complete, snap.reasons], [true, []]);
+  // a Modal (React's) is in the nodes; a native dialog of the app (Android's Alert) is not
+  const rect = { x: 20, y: 300, width: 320, height: 160 };
+  overlays = [{ type: "modal", react: true, rect }];
+  assert.deepEqual([(await app.snapshot()).overlays, (await app.snapshot()).complete], [overlays, true]);
+  overlays = [{ type: "modal", react: false, rect }, { type: "modal", react: true, rect }];
+  assert.deepEqual((await app.snapshot()).reasons, ["a native modal of the app's own on screen: its content is not in the tree"]);
+  overlays = null; // unknown (Android below API 29): no reason made up
+  assert.deepEqual([(await app.snapshot()).overlays, (await app.snapshot()).complete], [null, true]);
+  overlays = [];
   // rects as drawn natively (screen dp), not the JS layout (React root origin: a Modal under the status bar, transforms)
   nativeRects = new Map([[tagOf(minus), { x: 0, y: 24, width: 100, height: 20 }]]);
   assert.deepEqual((await app.snapshot()).nodes.find((n) => n.testID === "minus").rect, { x: 0, y: 24, width: 100, height: 20 });
@@ -981,6 +1101,7 @@ async function checkUsbmux() {
   assert.match(traced, /Input\.typeText/);
   assert.doesNotMatch(traced, /hunter2/);
   await checkUsbmux();
+  await checkStuck();
 
   // Android launch args (read once per JS context): a fresh agent's hello, given the Mantis native module
   const freshHello = async (module) => {

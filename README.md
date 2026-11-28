@@ -206,7 +206,7 @@ the list there first: Detox's `waitFor(...).whileElement(list).scroll(...)`, or 
 `app.native.call("Input.scroll", { tag: (await list.resolve()).tag, dy })`.
 
 `await app.snapshot()` returns the whole screen for an LLM driver:
-`{ commitId, nodes, focused, keyboard, screen, complete, reasons }`.
+`{ commitId, nodes, focused, state, overlays, keyboard, screen, complete, reasons }`.
 Nodes are host views with text, testID, label, role, a text input, a touch handler, a scroll view (`scroll`,
 `horizontal`; not one with `scrollEnabled={false}`) or a WebView, in tree (paint) order with `parent` indices, kept only when shown natively and not covered
 (another window, sheet backdrop, keyboard).
@@ -216,15 +216,44 @@ with a "show password" toggle on; the native agent masks it, the text never leav
 `onAccessibilityTap`, a gesture-handler button, or a view a gesture-handler `GestureDetector` with a tap or long press
 wraps.
 `complete: false` when the nodes don't show all a user sees, with `reasons`: the app's window has no focus (a system
-window, another app, or on iOS an alert of the app's own), no nodes (a splash screen), a WebView on screen (its page is
-not React). A driver that needs the whole screen takes a screenshot or an accessibility
+window, another app, or on iOS an alert of the app's own), a native overlay of the app's own (below), no nodes (a splash
+screen), a WebView on screen (its page is not React). A driver that needs the whole screen takes a screenshot or an accessibility
 dump then. `screen.density` is the app's own; comparing it with the device's (`adb shell wm density`) is up to you.
 Rects are screen dp as drawn natively (iOS: points), transforms in flight included: what `touchscreen.tap` takes, also
 for a Modal whose React root doesn't start at the top of the screen. `focused: false` = a system window (permission dialog, notification shade) is over the app, or on iOS
 an alert of the app's own. Both platforms report `hit`, `focused`, `keyboard` and `screen` (iOS: points, `density` =
 screen scale).
 
-`app.native.call("Page.screenshot", { scale })` returns `{ png, windows, fallbacks }`: a PNG (base64) of the app's own
+What is in front of the app, as far as the app itself can tell (no permissions, no other process's windows):
+
+- `state`: the app's lifecycle. iOS: `UIApplicationState`: `"inactive"` while a system alert (a permission prompt),
+  Control Center, Notification Center or the app switcher is over the app. Android, the same words: `"active"` = an
+  activity of the app is resumed, `"inactive"` = one is visible but none resumed (an activity of the system or another
+  app in front without hiding it: a permission prompt), `"background"` = none visible. It follows the last activity
+  resumed: briefly `"inactive"` while the app goes from one of its activities to another, and with two resumed at once
+  (split screen) pausing the later one reads `"inactive"` while the other is still resumed.
+- `focused: false` with `state: "active"`: Android, a system window that doesn't pause the app has the focus (the
+  notification shade, a system dialog); iOS, an alert of the app's own (it is in `overlays`).
+- `overlays`: the app's own windows (Android) or presented view controllers (iOS) over its main one, topmost first:
+  `{ type, react, rect }`. `type`: `"modal"` (Android: a `Dialog`, which RN's `Modal` and `Alert` are; iOS: a
+  presented controller, RN's `Modal` too), `"alert"` (iOS: a `UIAlertController`: RN's `Alert`, `ActionSheetIOS`),
+  `"popup"` (Android: a `PopupWindow` or another sub-window), `"window"` (any other). `react: true`: a React root is
+  in it (its React content is in the nodes); `react: false`: native content, in a screenshot but not in the nodes
+  (`complete: false`). That includes short-lived windows of the app's own process: a toast with a custom view, RN's
+  dev "Loading from Metro" popup (`{ type: "window", react: false }` for as long as they show). Only windows on
+  screen: those of an activity under another one of the app are hidden and not listed. Android below API 29: `null`
+  (only the activity window is known there), not "none". iOS lists presented controllers, not one being dismissed (a
+  closing alert is gone at once), nor a window of the app's own without one (a native SDK's overlay window).
+- Not knowable in-process, so not reported: windows of other processes that don't take the focus (a toast, a
+  heads-up notification, an autofill dropdown, another app's overlay), and what any other window shows.
+
+Behaviour change (Android): a focusable window that isn't `FLAG_NOT_TOUCH_MODAL` (a `Dialog`, a focusable popup)
+takes every touch, outside its box too, as the window manager gives it, so nothing under an `Alert`, a `DatePicker` or
+a popup menu is in the nodes or reachable, as on iOS. A locator tap on a view beside such a dialog now waits and times out (`NOT_ACTIONABLE`, `covered by window ...`)
+instead of tapping under it; a point tap there goes to the dialog, which closes when it is cancelable, instead of
+pressing the app. A window with `FLAG_NOT_TOUCHABLE` (an overlay touches go through) takes none.
+
+`app.native.call("Page.screenshot", { scale })` returns `{ png, windows, fallbacks, focused, state, keyboard, surfaces }`: a PNG (base64) of the app's own
 windows composed as on screen, in-process (no XCTest, no `adb screencap`). Screen-sized, `scale` px per dp (iOS: per
 point; default 1). No status bar, navigation bar, keyboard or system dialogs: they are not the app's. `windows`: the
 windows drawn, bottom-up. Android: activity, Modals, dialogs and popups, read back by `PixelCopy` (hardware layers and
@@ -234,6 +263,24 @@ it can't read is drawn by `View.draw` (`fallbacks`: how many), which fails on a 
 expo-image): on API 29–33 a Modal showing one makes the call fail. Below API 29: the activity window only (Modals,
 dialogs and popups are not in the picture), on 24–25 by `View.draw`. iOS: `drawViewHierarchy`, `layer.renderInContext` for a
 window that can't (`fallbacks`; `render: true` forces it).
+
+What is on screen but not in the picture, as of the call's start (the picture alone can't tell "the screen is like
+this" from "this part is missing"):
+
+- `focused: false` or `state` other than `"active"`: a window of another process is over the app (a permission prompt,
+  the notification shade, a system alert), as in the snapshot. iOS, `focused: false` with `state: "active"`: an alert
+  of the app's own, which is in the picture.
+- `keyboard`: the soft keyboard's rect (screen dp), or `null`; it is another process's.
+- `surfaces`: `{ rect, tag, window }` for content drawn outside the windows' own pixels: Android, every shown
+  `SurfaceView` (video, camera preview, maps, GL; black or what is under it in the picture); iOS, the Metal, OpenGL
+  and video layers (`CAMetalLayer`, `CAEAGLLayer`, `AVPlayerLayer`, `AVSampleBufferDisplayLayer`) of a window drawn
+  by `renderInContext` (`drawViewHierarchy` has them: Metal checked on a simulator and an iPhone). `tag`: the nearest
+  React view, `window`: the index in `windows` (a window over it may hide it on screen too). `rect`: Android, the part
+  not clipped by its ancestors; iOS, the layer's whole rect on screen (clipping ancestors not applied). Such content
+  also doesn't draw through the app's windows, so `idle()`'s draw clock doesn't see it change (a playing video doesn't
+  keep the app busy).
+- Never reported: the status and navigation bars, windows of other processes that don't take the focus (a toast, a
+  heads-up notification, an autofill dropdown), DRM-protected video.
 
 `await app.back()` is the back button: `{ ok, via, reason }`, ~ms, in-process, settled like `tap`.
 
@@ -323,7 +370,8 @@ For a driver that decides from `app.snapshot()` (an LLM) rather than from select
   React had already replaced, nothing was pressed; it is not tapped again (something else may be under the point now):
   snapshot again (`err.tag` = `took`). `COVERED` instead of tapping when the app's window has no focus (after waiting
   300 ms for it: a window that just opened gets focus a little later) or the point is on the keyboard: the touch would
-  land in the app beneath.
+  land in the app beneath. `err.state`: the app's `state` then; `err.keyboard`: the keyboard's rect when the point is on
+  it.
 - `await app.keyboard.type(text, { timeout = 1000 })`: into the text field that has focus, one character (code point)
   at a time through the IME, at the cursor, each settled, so a per-character `onChangeText` (a code input moving focus
   to the next box) sees every character apart; `onKeyPress` fires per character on both platforms. `"\n"` is typed as a
@@ -356,19 +404,60 @@ that export nothing. An exception inside an agent (the app) comes back as `AGENT
 
 | `code`             | Meaning                                                                                       |
 | ------------------ | --------------------------------------------------------------------------------------------- |
-| `TIMEOUT`          | a wait ran out: `idle`, `expect`, a read-only RPC                                             |
+| `TIMEOUT`          | a wait ran out: `idle`, `expect`, a read-only RPC; or was cut short because the app's thread it waits on is stuck (`err.stuck`, see [A stuck app](#a-stuck-app)) |
 | `NOT_ACTIONABLE`   | a tap / fill target never became actionable; `err.reason`: the last check (`not found`, `disabled`, `covered by ...`) |
 | `NOT_FOCUSED`      | no text field took the text (`fill`, `keyboard.type`)                                        |
-| `DELIVERED`        | the touch or text reached the app, or may have (an `Input.*` RPC that never answered): retrying could do it twice |
+| `DELIVERED`        | the touch or text reached the app, or may have (an `Input.*` RPC that never answered, `err.stuck` when its thread is stuck; an action that ran natively and JS then didn't answer): retrying could do it twice |
 | `STRICT`           | a locator matched several elements                                                            |
 | `STALE`            | what a snapshot showed is gone (a `getByTag` node, the view under a point tap, a JS reload): snapshot again; `err.tag` says which |
-| `COVERED`          | `touchscreen.tap` at a point under a system window or the keyboard                            |
+| `COVERED`          | `touchscreen.tap` at a point under a system window or the keyboard; `err.state`, `err.keyboard` |
 | `UNSUPPORTED`      | the app's agent is older than this runner: rebuild the app                                    |
 | `INVALID_ARGUMENT` | e.g. `scroll("sideways")`                                                                    |
 | `NOT_CONNECTED`    | an agent didn't connect in time                                                               |
 | `PORT_IN_USE`      | a cabled iPhone: another app answered on the agent's port (another Mantis build, or a launch of another runner) and this launch's agent never did (`relaunch`, a call waiting for the agents) |
 | `DISCONNECTED`     | an agent went away during a call (relaunch, crash); the call may or may not have run. `idle` and `mark` throw it at once when an agent is gone (other calls wait for it to reconnect) |
 | `AGENT_ERROR`      | the call threw inside the app's agent                                                         |
+
+### A stuck app
+
+When the app's main or JS thread runs nothing (a crashed app behind the system's crash dialog, an ANR, a deadlock, long
+synchronous work), its agents' sockets stay open, and a call would wait for the RPC timeout (15 s). Instead, while a call
+waits, the runner asks every 500 ms whether the thread it needs runs:
+
+- Main: the native agent answers `Agent.alive` off the main thread, with how long main hasn't run its heartbeat (every
+  250 ms, from the runner's first call on; not frame-based, so it beats in the background too). iOS: the agent's sockets
+  live on a queue of their own (a cabled iPhone's too, which relays the JS agent off the main thread as well).
+- JS: the JS agent is that thread, so the fact is its silence: how long since the runner asked it something (a ping
+  keeps asking) without a word back. It counts only while the native agent answers. iOS: the JS agent's socket is RN's
+  WebSocket module, which runs on the main queue, so a stuck main thread holds JS calls too (`thread: "main"`).
+
+A thread that ran nothing for 5000 ms (Android's ANR threshold) is stuck (main: two answers in a row say so, the second
+larger, so one right after the process woke from a sleep, which counts the sleep, doesn't): the call fails with `err.stuck` =
+`{ thread: "main" | "JS", forMs }` and `TIMEOUT`, or `DELIVERED` for an `Input.*` call (it is queued on that thread and
+may still run when the thread does). The next call to that agent asks at once, so it fails within a round trip while
+the thread is stuck and works again once it runs. `idle` and `mark` too (`err.busy.thread` names the same thread). An
+action that ran natively and then waits for JS to take it (`tap`, `fill`, `scroll`, `back`, `keyboard.type`) is
+`DELIVERED` when JS doesn't answer, stuck or not (a `MantisError`, no longer a `TimeoutError`: `instanceof` checks change).
+Android's crash dialog keeps the crashed thread (main) blocked until it is dismissed, so the app stays connected and its
+main thread is stuck; its JS thread may still answer. On iOS a crash ends the process: `DISCONNECTED`.
+
+Not called stuck, the call runs to its timeout as before:
+
+- a whole app that answers nothing: iOS suspends an app in the background, Android's cached-app freezer freezes one that
+  stays in the background a while (until then its main thread runs), a native debugger stopped at a breakpoint (lldb,
+  Android Studio's default suspend-all);
+- an app built with an older Mantis (no `Agent.alive`).
+
+A long call whose thread keeps running isn't either (a long drag: main draws its frames).
+
+Behaviour change (this version): a thread busy for 5 to 15 s in one go (a debug build, a loaded emulator, a heavy first
+render) used to answer late and the call succeeded; now the call fails at about 5 s (`TIMEOUT`, or `DELIVERED` for
+`Input.*`) with `err.stuck`. There is no option to wait longer: the caller decides what to do with the fact (wait and
+call again, which works as soon as the thread runs).
+
+Limits: a JS thread paused in a JS debugger (debug builds) reads as stuck; the first call after a thread got stuck
+waits until it has been stuck for about 5000 ms; iOS, a JS call silent for 5 s while main has been stuck for less is
+reported as `thread: "JS"` (main holds the JS agent's socket there, so the cause may be main).
 
 ## Channel
 

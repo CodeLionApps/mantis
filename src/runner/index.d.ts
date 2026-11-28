@@ -36,11 +36,70 @@ export class MantisError extends Error {
   typed?: number;
   /** STALE: the tag that is gone (getByTag's, or the view under a point tap; null: unknown). */
   tag?: number | null;
+  /**
+   * TIMEOUT / DELIVERED: the call was cut short because the thread it needs is stuck. DELIVERED also when an action ran
+   * natively and JS then didn't answer (a MantisError, not a TimeoutError).
+   */
+  stuck?: Stuck;
+  /** COVERED: the app's state then (null: an agent that doesn't report it). */
+  state?: AppState | null;
+  /** COVERED on the keyboard: its rect. */
+  keyboard?: Rect;
+}
+/** A thread of the app that ran nothing for forMs (at least 5000 ms, Android's ANR threshold). */
+export interface Stuck {
+  thread: "main" | "JS";
+  forMs: number;
 }
 /** A wait that ran out (code TIMEOUT, or NOT_ACTIONABLE / NOT_FOCUSED for an action's auto-wait). */
 export class TimeoutError extends MantisError {
   /** idle: what still held the wait when it ran out */
   busy?: IdleBusy;
+}
+
+/**
+ * The app's lifecycle. Android: active = an activity of the app is resumed; inactive = one is visible but none resumed
+ * (another app's or the system's activity in front: a permission prompt); background = none visible. iOS:
+ * UIApplicationState (inactive: a system alert, Control Center, Notification Center, the app switcher).
+ */
+export type AppState = "active" | "inactive" | "background";
+
+/** One of the app's own windows (Android) or presented view controllers (iOS) over its main one. */
+export interface Overlay {
+  /** modal: a Dialog (Android: RN's Modal and Alert) / a presented controller (iOS: RN's Modal); alert: iOS
+   * UIAlertController (RN's Alert); popup: Android PopupWindow or another sub-window; window: any other */
+  type: "modal" | "alert" | "popup" | "window";
+  /** a React root exists in it (its React content is in the nodes; native views inside may not be); false: native, in
+   * a screenshot but not in the nodes */
+  react: boolean;
+  rect: Rect;
+}
+
+/** Something on screen a screenshot doesn't have: Android SurfaceView, iOS Metal / OpenGL / video layer. */
+export interface Surface {
+  rect: Rect;
+  /** the nearest React tag (null: none) */
+  tag: number | null;
+  /** index in windows of the window it is in */
+  window: number;
+}
+
+/** app.native.call("Page.screenshot", { scale, render }). focused, state, keyboard, surfaces: as of the start. */
+export interface Screenshot {
+  ok: true;
+  /** PNG, base64 */
+  png: string;
+  /** the app's windows drawn, bottom-up (class names) */
+  windows: string[];
+  /** windows drawn the slower way (Android View.draw, iOS renderInContext) */
+  fallbacks: number;
+  /** false / state not active: a window of another process is over the app, not in the picture */
+  focused?: boolean;
+  state?: AppState;
+  /** the soft keyboard on screen, not in the picture */
+  keyboard?: Rect | null;
+  /** content on screen that the picture lacks (Android: every SurfaceView; iOS: in a fallbacks window) */
+  surfaces?: Surface[];
 }
 
 /** A host view of app.snapshot(). */
@@ -80,6 +139,10 @@ export interface Snapshot {
   nodes: SnapshotNode[];
   /** false: a system window, another app or (iOS) an alert of the app's own is in front */
   focused: boolean | null;
+  /** null: an agent that doesn't report it */
+  state: AppState | null;
+  /** topmost first; [] = none; null: unknown (an agent that doesn't report them, Android below API 29) */
+  overlays: Overlay[] | null;
   keyboard: Rect | null;
   screen: { width: number; height: number; density: number } | null;
   complete: boolean;
@@ -249,8 +312,8 @@ export declare class App extends EventEmitter {
   getByTestId(testId: string): Locator;
   getByTag(tag: number): Locator;
   getByPlaceholder(text: TextMatch, opts?: { exact?: boolean }): Locator;
-  /** Raw RPC to the native agent, e.g. call("Page.screenshot", { scale }) (README: { png, windows, fallbacks }). */
-  readonly native: { call(method: string, params?: object): Promise<any> };
+  /** Raw RPC to the native agent, e.g. call("Page.screenshot", { scale }) (a Screenshot). */
+  readonly native: { call(method: "Page.screenshot", params?: { scale?: number; render?: boolean; afterUpdates?: boolean }): Promise<Screenshot>; call(method: string, params?: object): Promise<any> };
 
   on(event: "touch", listener: (touch: TouchEvent) => void): this;
   on(event: string | symbol, listener: (...args: any[]) => void): this;

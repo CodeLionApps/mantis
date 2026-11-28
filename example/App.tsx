@@ -9,7 +9,11 @@ import {
   BackHandler,
   FlatList,
   Image,
+  Linking,
   Modal,
+  NativeModules,
+  PermissionsAndroid,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -17,6 +21,7 @@ import {
   Text,
   TextInput,
   View,
+  requireNativeComponent,
 } from 'react-native';
 import { GestureDetector, GestureHandlerRootView, usePanGesture, useTapGesture } from 'react-native-gesture-handler';
 
@@ -257,6 +262,46 @@ function Gestures({ onBack }: { onBack: () => void }) {
   );
 }
 
+// System windows lab: what the app's own screenshot and snapshot don't have. A native surface (Android SurfaceView, iOS
+// Metal layer: example/android LabPackage.kt, example/ios Lab.m), a system permission prompt, a native Alert, a Modal.
+const LabSurface = requireNativeComponent<{ testID?: string; style?: object }>('LabSurface');
+function Windows({ onBack }: { onBack: () => void }) {
+  const [modal, setModal] = useState(false);
+  const [answer, setAnswer] = useState('brak');
+  const ask = async () => {
+    if (Platform.OS === 'ios') return NativeModules.Lab.askPermission();
+    setAnswer(await PermissionsAndroid.request('android.permission.POST_NOTIFICATIONS'));
+  };
+  return (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Okna</Text>
+      {/* first: above a dialog in the middle of the screen, where a tap under the dialog goes */}
+      <Button title="Okno Modal" onPress={() => setModal(true)} />
+      <LabSurface testID="surface" style={styles.surface} />
+      <Button title="Uprawnienie" onPress={ask} />
+      <Text style={styles.body}>Odpowiedź: {answer}</Text>
+      {/* cancelable: Android closes it on a touch outside its box */}
+      <Button title="Komunikat" onPress={() => Alert.alert('Komunikat', 'Natywny', [{ text: 'OK' }], { cancelable: true })} />
+      {Platform.OS === 'android' && (
+        <Button
+          title="Komunikat i aktywność"
+          onPress={() => {
+            // the Alert stays with this activity, under the other one, which hides both
+            Alert.alert('Komunikat', 'Natywny', [{ text: 'OK' }]);
+            setTimeout(() => Linking.openURL('probespike-lab://lab'), 500);
+          }}
+        />
+      )}
+      <Button title="Wstecz" onPress={onBack} />
+      <Modal visible={modal} animationType="none" onRequestClose={() => setModal(false)}>
+        <View style={styles.screen}>
+          <Button title="Zamknij okno" onPress={() => setModal(false)} />
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
 // Alert lab for app.back(): back runs the cancel-style button, an alert without one stays
 function Alerts({ onBack }: { onBack: () => void }) {
   const [log, setLog] = useState<string[]>([]);
@@ -383,6 +428,24 @@ function Later({ onBack }: { onBack: () => void }) {
   );
 }
 
+// e2e/stuck.mantis.js: a thread that runs nothing for 9 s (main: through the app's own URL, see MainActivity and
+// SceneDelegate), a crash (Android: the main thread, behind the system's crash dialog)
+function Stuck({ onBack }: { onBack: () => void }) {
+  const busy = () => {
+    for (const end = Date.now() + 9000; Date.now() < end; );
+  };
+  return (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Zawieszenie</Text>
+      <Button title="Wątek główny" onPress={() => Linking.openURL('probespike://hang?ms=9000')} />
+      {/* later: the tap's own RPCs run first */}
+      <Button title="Wątek JS" onPress={() => setTimeout(busy, 300)} />
+      <Button title="Awaria" onPress={() => Linking.openURL('probespike://crash')} />
+      <Button title="Wstecz" onPress={onBack} />
+    </View>
+  );
+}
+
 const SCREENS = {
   Logowanie: LoginFlow,
   Licznik: Counter,
@@ -393,8 +456,10 @@ const SCREENS = {
   Gesty: Gestures,
   Nakładka: Overlay,
   Przewijanie: Scrolling,
+  Okna: Windows,
   Alerty: Alerts,
   Później: Later,
+  Zawieszenie: Stuck,
 };
 
 export default function App() {
@@ -446,6 +511,7 @@ const styles = StyleSheet.create({
   modal: { backgroundColor: '#fff', borderRadius: 8, padding: 24 },
   ghBox: { height: 120, backgroundColor: '#16a34a', borderRadius: 8, justifyContent: 'center', alignItems: 'center', marginBottom: 12 },
   ghPan: { backgroundColor: '#9333ea' },
+  surface: { height: 100, marginBottom: 12 },
   box: { width: 40, height: 40, backgroundColor: '#f59e0b' },
   overlay: { ...StyleSheet.absoluteFill, backgroundColor: '#0008', justifyContent: 'center', alignItems: 'center' },
 });
