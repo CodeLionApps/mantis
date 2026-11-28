@@ -374,7 +374,8 @@ waits, the runner asks every 500 ms whether the thread it needs runs:
   250 ms, from the runner's first call on; not frame-based, so it beats in the background too). iOS: the agent's sockets
   live on a queue of their own (a cabled iPhone's too, which relays the JS agent off the main thread as well).
 - JS: the JS agent is that thread, so the fact is its silence: how long since the runner asked it something (a ping
-  keeps asking) without a word back. It counts only while the native agent answers.
+  keeps asking) without a word back. It counts only while the native agent answers. iOS: the JS agent's socket is RN's
+  WebSocket module, which runs on the main queue, so a stuck main thread holds JS calls too (`thread: "main"`).
 
 A thread that ran nothing for 5000 ms (Android's ANR threshold) is stuck: the call fails with `err.stuck` =
 `{ thread: "main" | "JS", forMs }` and `TIMEOUT`, or `DELIVERED` for an `Input.*` call (it is queued on that thread and

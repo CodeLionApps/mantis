@@ -353,7 +353,12 @@ class App extends EventEmitter {
     this.js.probe = async () => {
       pinging ??= this.js.ask("Agent.ping", RPC_TIMEOUT).finally(() => (pinging = null));
       const silent = this.js.asked == null ? 0 : performance.now() - this.js.asked;
-      return silent >= STUCK_MS && (await alive()) ? { thread: "JS", forMs: Math.round(silent) } : null;
+      // iOS: the JS agent's socket is RN's WebSocket module, which runs on the main queue, so a stuck main thread
+      // holds JS calls too
+      const ios = this.platform === "ios";
+      const a = (silent >= STUCK_MS || ios) && (await alive());
+      if (ios && a?.mainMs >= STUCK_MS) return { thread: "main", forMs: Math.round(a.mainMs) };
+      return silent >= STUCK_MS && a ? { thread: "JS", forMs: Math.round(silent) } : null;
     };
     this.js.onEvent = (msg) => {
       if (msg.method === "Tree.committed")
@@ -820,7 +825,10 @@ class App extends EventEmitter {
         (r) => (clearTimeout(timer), r),
         (e) => {
           clearTimeout(timer);
-          throw e.stuck ? new TimeoutError("TIMEOUT", `${what}: ${e.message}`, { ...props, stuck: e.stuck }) : e;
+          if (!e.stuck) throw e;
+          // iOS: a JS ping may be the one held by a stuck main thread
+          const busy = props?.busy && { busy: { ...props.busy, thread: e.stuck.thread } };
+          throw new TimeoutError("TIMEOUT", `${what}: ${e.message}`, { ...props, ...busy, stuck: e.stuck });
         },
       ),
       new Promise((_, reject) => {
