@@ -15,7 +15,6 @@ const EXPECT_TIMEOUT = Number(process.env.MANTIS_EXPECT_TIMEOUT) || 1000;
 // the worker, not the globals: works with exposeGlobals: false, and require("detox") reads element/expect/... off it
 const { worker } = mantisDevice.requireDetox("detox/internals");
 const device = mantisDevice.detoxDevice("the Detox device");
-const ios = device.getPlatform() === "ios";
 const app = new App(undefined, device.getPlatform());
 beforeAll(async () => {
   await app.start();
@@ -26,8 +25,8 @@ beforeAll(async () => {
   // brought to the foreground (newInstance: false)
   device.launchApp = (params = {}, ...rest) =>
     app.relaunch(() =>
-      // iOS simulators share the Mac's localhost: tell the agents this runner's port and token
-      launch(ios ? { ...params, launchArgs: { ...params.launchArgs, ...app.launchArgs } } : params, ...rest),
+      // the agents echo this runner's token (iOS also needs its port: simulators share the Mac's localhost)
+      launch({ ...params, launchArgs: { ...params.launchArgs, ...app.launchArgs } }, ...rest),
     );
   // a reload starts a new JS context: the next step waits for its agent instead of hitting the dying one
   const reload = device.reloadReactNative.bind(device);

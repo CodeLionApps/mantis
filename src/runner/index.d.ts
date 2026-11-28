@@ -175,7 +175,7 @@ export declare class App extends EventEmitter {
   readonly port: number;
   readonly usb: string | undefined;
   platform: Platform;
-  /** iOS launch args the agents need: this runner's port and token. */
+  /** Launch args the agents need: this runner's token (both platforms) and port (iOS). Pass them to every launch. */
   readonly launchArgs: { mantisPort: number; mantisToken: string };
   readonly touchscreen: { tap(x: number, y: number, opts?: { timeout?: number }): Promise<TapResult> };
   readonly keyboard: { type(text: string, opts?: { timeout?: number }): Promise<void> };

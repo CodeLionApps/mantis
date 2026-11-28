@@ -62,7 +62,9 @@ import javax.net.SocketFactory
  * Mantis native agent. Compiled in only with MANTIS_E2E=1 (src/mantis, see build.gradle) and started by
  * MantisInitProvider. The app must allow cleartext traffic to localhost (network security config) in that build.
  *
- * Passive until a runner listens on the host: dials ws://localhost:9123 (adb reverse) and retries every 2 s.
+ * Passive until a runner listens on the host: dials ws://localhost:9123 (adb reverse) and retries every 2 s. Starts
+ * dialing once the first activity is created: the hello carries the runner's token from that activity's intent (every
+ * Mantis app on the device dials the same port, the runner accepts only its own launch).
  * Own socket, independent of the JS thread, so measuring / hit-testing / input work while JS is busy.
  * All view work on the main thread. Coordinates exchanged with the runner are dp (= JS units).
  */
@@ -88,6 +90,16 @@ object MantisAgent {
   private var activity: Activity? = null
   private var ws: WebSocket? = null
 
+  /** The runner's token (launch arg mantisToken): null until the first activity is created, "" if it had none. */
+  @Volatile var token: String? = null
+    private set
+
+  // Detox puts launch args in a Bundle extra "launchArgs"; `am start --es` (src/device launchApp) as plain extras.
+  // ponytail: read once per process, from its first activity; a later intent (onNewIntent) doesn't change it
+  private fun tokenOf(a: Activity): String = try {
+    a.intent?.getBundleExtra("launchArgs")?.getString("mantisToken") ?: a.intent?.getStringExtra("mantisToken") ?: ""
+  } catch (e: Exception) { "" } // extras that don't unparcel (BadParcelableException)
+
   @JvmStatic
   fun install(application: Application) {
     app = application
@@ -98,13 +110,17 @@ object MantisAgent {
     app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
       override fun onActivityResumed(a: Activity) { activity = a }
       override fun onActivityPaused(a: Activity) { if (activity == a) activity = null }
-      override fun onActivityCreated(a: Activity, b: Bundle?) {}
+      override fun onActivityCreated(a: Activity, b: Bundle?) {
+        if (token == null) {
+          token = tokenOf(a)
+          connect()
+        }
+      }
       override fun onActivityStarted(a: Activity) {}
       override fun onActivityStopped(a: Activity) {}
       override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
       override fun onActivityDestroyed(a: Activity) {}
     })
-    connect()
   }
 
   private fun connect() {
@@ -112,7 +128,9 @@ object MantisAgent {
       override fun onOpen(webSocket: WebSocket, response: Response) {
         // v: src/runner PROTOCOL
         webSocket.send(JSONObject().put("method", "Agent.hello")
-          .put("params", JSONObject().put("role", "native").put("platform", "android").put("v", 2)).toString())
+          .put("params", JSONObject().put("role", "native").put("platform", "android").put("v", 2)
+            .put("token", token.takeUnless { it.isNullOrEmpty() } ?: JSONObject.NULL)
+            .put("features", JSONArray().put("token"))).toString())
       }
       // OkHttp's reader thread: an exception here would restart the socket and fail every RPC in flight, so validate
       // the frame first; a frame without a numeric id has nothing to answer
