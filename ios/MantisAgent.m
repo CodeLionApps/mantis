@@ -128,22 +128,35 @@ static BOOL mantisShown(CALayer *l, BOOL loop) {
   return NO;
 }
 
-// Image loads in flight for Agent.ping (Android: Fresco's pipeline). RN's <Image> loads through RCTImageLoader (cache,
-// network via RCTNetworking, decode); every one of its load methods ends in the one hooked here. A load ends when its
-// completion block ran (it hands the image to the view, an error too) or when it's cancelled (the view went away):
-// Fabric calls the returned request's cancellationBlock, Paper its -cancel, so the hook returns a request whose block
-// ends it too. No RN headers (the pod doesn't depend on React): by name, at load, else once the app is up.
+// Image loads in flight for Agent.ping (Android: Fresco's pipeline). RN's <Image> and Image.prefetch load through
+// RCTImageLoader (cache, network via RCTNetworking, decode); every one of its load methods ends in the one hooked here
+// (Image.getSize doesn't). A load ends when its completion block ran (it hands the image to the view, an error too)
+// or when it's cancelled (the view went away): Fabric calls the returned request's cancellationBlock, Paper its
+// -cancel, so the hook returns a request whose block ends it too. A loader that's gone (a JS reload) never calls back:
+// its loads end with it. No RN headers (the pod doesn't depend on React): by name, at load, once the app is up, else
+// from a ping; only if the methods have the shape this expects (another RN version: not hooked, no loads).
 // ponytail: image libraries with a pipeline of their own (SDWebImage: expo-image, FastImage) aren't seen.
-// id -> @[URL without query, CACurrentMediaTime at its start]
-static NSMutableDictionary<NSNumber *, NSArray *> *mantisImages;
+@interface MantisImageLoad : NSObject
+@property (nonatomic, copy) NSString *url; // without query
+@property (nonatomic) CFTimeInterval at; // CACurrentMediaTime at its start
+@property (nonatomic, weak) id loader;
+@end
+@implementation MantisImageLoad
+@end
+
+static NSMutableDictionary<NSNumber *, MantisImageLoad *> *mantisImages;
 
 static void mantisHookImages(void) {
   static BOOL hooked;
+  if (hooked) return;
   Class loader = NSClassFromString(@"RCTImageLoader"), req = NSClassFromString(@"RCTImageURLLoaderRequest");
   SEL sel = NSSelectorFromString(@"loadImageWithURLRequest:size:scale:clipped:resizeMode:priority:attribution:"
                                  "progressBlock:partialLoadBlock:completionBlock:");
+  SEL init = NSSelectorFromString(@"initWithRequestId:imageURL:cancellationBlock:");
   Method m = loader && req ? class_getInstanceMethod(loader, sel) : NULL;
-  if (hooked || !m) return;
+  if (!m || method_getNumberOfArguments(m) != 12 || ![req instancesRespondToSelector:init]) return;
+  for (NSString *key in @[@"requestId", @"imageURL", @"cancellationBlock"])
+    if (![req instancesRespondToSelector:NSSelectorFromString(key)]) return;
   hooked = YES;
   mantisImages = [NSMutableDictionary new];
   typedef void (^Done)(NSError *, UIImage *, id);
@@ -155,10 +168,14 @@ static void mantisHookImages(void) {
       BOOL clipped, NSInteger mode, NSInteger priority, const void *attribution, id progress, id partial, Done done) {
     static NSUInteger next;
     NSString *url = [r.URL.absoluteString componentsSeparatedByString:@"?"].firstObject ?: @"";
+    MantisImageLoad *load = [MantisImageLoad new];
+    load.url = [url substringToIndex:MIN(url.length, 200)];
+    load.at = CACurrentMediaTime();
+    load.loader = self;
     NSNumber *key;
     @synchronized (mantisImages) {
       key = @(++next);
-      mantisImages[key] = @[[url substringToIndex:MIN(url.length, 200)], @(CACurrentMediaTime())];
+      mantisImages[key] = load;
     }
     dispatch_block_t end = ^{ @synchronized (mantisImages) { [mantisImages removeObjectForKey:key]; } };
     // ended after done: the view gets the image on the main queue, so a ping that sees the load gone comes after it
@@ -166,11 +183,10 @@ static void mantisHookImages(void) {
                       ^(NSError *e, UIImage *image, id meta) { if (done) done(e, image, meta); end(); });
     if (!request) { end(); return nil; }
     dispatch_block_t cancel = [request valueForKey:@"cancellationBlock"];
-    return make([req alloc], NSSelectorFromString(@"initWithRequestId:imageURL:cancellationBlock:"),
-                [request valueForKey:@"requestId"], [request valueForKey:@"imageURL"], ^{
-                  end();
-                  if (cancel) cancel();
-                });
+    return make([req alloc], init, [request valueForKey:@"requestId"], [request valueForKey:@"imageURL"], ^{
+      end();
+      if (cancel) cancel();
+    });
   }));
 }
 
@@ -962,14 +978,17 @@ static NSString *transitionReason(UIWindow *w) {
     // else the last change (its view's class and React tag, the setter). net: image loads in flight (mantisImages), as
     // the JS agent's requests: ms, url, image: true.
     CFTimeInterval now = CACurrentMediaTime();
+    mantisHookImages(); // not yet: React loaded later still
     NSMutableArray *net = [NSMutableArray new];
     @synchronized (mantisImages) {
-      NSArray *loads = [mantisImages.allValues sortedArrayUsingComparator:^(NSArray *a, NSArray *b) {
-        return [a[1] compare:b[1]];
+      for (NSNumber *k in mantisImages.allKeys)
+        if (!mantisImages[k].loader) [mantisImages removeObjectForKey:k];
+      NSArray *loads = [mantisImages.allValues sortedArrayUsingComparator:^(MantisImageLoad *a, MantisImageLoad *b) {
+        return a.at < b.at ? NSOrderedAscending : a.at > b.at ? NSOrderedDescending : NSOrderedSame;
       }];
-      for (NSArray *i in loads) {
+      for (MantisImageLoad *i in loads) {
         if (net.count == 100) break;
-        [net addObject:@{@"ms": @(round((now - [i[1] doubleValue]) * 1000)), @"url": i[0], @"image": @YES}];
+        [net addObject:@{@"ms": @(round((now - i.at) * 1000)), @"url": i.url, @"image": @YES}];
       }
     }
     NSString *busy;
