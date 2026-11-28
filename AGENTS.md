@@ -30,4 +30,7 @@ commits, PRs or issues.
   simulators the host's 9123, a cabled iPhone listens on 9123. So one Mantis app per device, and per host for iOS
   simulators. Stop any other Mantis build on the target before running the example, and run the `*.mantis.js` files
   one at a time.
+- Opt-in, because they change device state beyond the app: `SYSTEM_PROMPT=1` runs `e2e/windows.mantis.js`'s permission
+  prompt test on an iOS simulator (it restarts SpringBoard to take the prompt away). Run it for changes to `state` /
+  `focused` on iOS.
 - A change on one platform: check the other one too, or say in the PR that it is untested there.
