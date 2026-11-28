@@ -464,42 +464,52 @@ try {
 
 // ---------- timers ----------
 // Pending JS timers, for the runner's idle wait: a setTimeout the tap set (navigate in 800 ms) is work about to land.
-// kind: timeout, interval or frame (requestAnimationFrame); ms: the delay. recurring: an interval, or a timer set within
-// 16 ms of one of the same kind and delay firing: re-armed from its callback or its awaiting continuation (a poll loop,
-// a requestAnimationFrame loop), it never ends. The agent's own timers use the originals.
-// ponytail: recurring by kind, delay and time, not by call site: an unrelated timer of that delay set within 16 ms of
-// one firing counts as recurring too.
-const timers = new Map(); // id (frames: "f" + id) -> { kind, ms, at, recurring }
-const fired = new Map(); // kind + delay -> when one last fired
-// the last timer that fired and didn't recur: what it started (a native animation after Animated's delay) may take
-// a frame or two to show, so the runner counts it as activity, like a commit
-let lastFired = null; // { kind, ms, at }
+// kind: timeout, interval or frame (requestAnimationFrame); ms: the delay. Timers are grouped by kind and delay bucket
+// (half octaves: 990 and 1000 ms are one, 300 and 600 ms aren't); fires: how often the bucket fired in a row, each
+// within a few periods of the previous one; sinceLastFire: ms since it last fired (null: never). recurring: an
+// interval, or a timer whose bucket fired at least twice in a row: a poll, a countdown, a re-armed or await-sleep
+// loop, a requestAnimationFrame loop. It never ends, so it doesn't hold the wait.
+// ponytail: by kind and delay, not by call site (a stack per timer costs too much). So the first two rounds of a loop
+// count as one-off, and unrelated timers of one bucket firing in a row (every 0 ms timer, every frame) count as
+// recurring.
+const timers = new Map(); // id -> { kind, ms, at, bucket }
+const buckets = new Map(); // kind + delay bucket -> { fires, last, held } (bounded: ~40 buckets a kind)
+// held: when a timer of the bucket that did hold the wait last fired: what it started (a native animation after
+// Animated's delay) may take a frame or two to show, so the runner counts it as activity, like a commit
+const MAX_PINGED = 100; // ponytail: the ping lists at most this many (short ones first); an app with more drops the rest
+const bucketOf = (kind, ms) => kind + Math.round(Math.log2(ms + 16) * 2);
 const setTimeoutOrig = global.setTimeout;
 function track(set, clear, kind) {
   const orig = global[set];
   const origClear = global[clear];
   if (typeof orig !== "function" || typeof origClear !== "function") return;
-  const key = (id) => (kind === "frame" ? "f" + id : id);
   global[set] = function (cb, ms, ...args) {
     if (typeof cb !== "function") return orig.call(this, cb, ms, ...args);
     const delay = kind === "frame" ? 0 : Math.max(0, Number(ms) || 0);
-    const k = kind + delay;
-    const at = Date.now();
-    const t = { kind, ms: delay, at, recurring: kind === "interval" || at - (fired.get(k) ?? -Infinity) <= 16 };
+    const t = { kind, ms: delay, at: Date.now(), bucket: bucketOf(kind, delay) };
+    t.once = kind !== "interval" && !recurring(t.bucket, t.at);
     function run(...a) {
-      fired.set(k, Date.now());
-      if (kind !== "interval") timers.delete(key(id));
-      if (!t.recurring) lastFired = { kind, ms: delay, at: Date.now() };
+      const now = Date.now();
+      const b = buckets.get(t.bucket);
+      // in a row: the previous fire of the bucket within 4 periods (and a second) of this one
+      const next = b && now - b.last <= 4 * delay + 1000 ? b.fires + 1 : 1;
+      buckets.set(t.bucket, { fires: next, last: now, held: t.once ? now : b?.held ?? 0, kind, ms: delay });
+      if (kind !== "interval") timers.delete(id);
       return cb.apply(this, a);
     }
     const id = kind === "frame" ? orig.call(this, run) : orig.call(this, run, ms, ...args);
-    timers.set(key(id), t);
+    timers.set(id, t);
     return id;
   };
+  // RN's timer ids share one space and clear* are interchangeable (clearTimeout clears a frame too)
   global[clear] = function (id) {
-    timers.delete(key(id));
+    timers.delete(id);
     return origClear.call(this, id);
   };
+}
+function recurring(bucket, now) {
+  const b = buckets.get(bucket);
+  return !!b && b.fires >= 2 && now - b.last <= 4 * b.ms + 1000;
 }
 for (const t of [["setTimeout", "clearTimeout", "timeout"], ["setInterval", "clearInterval", "interval"],
   ["requestAnimationFrame", "cancelAnimationFrame", "frame"]])
@@ -563,7 +573,7 @@ const handlers = {
   "Input.back": back,
   // queued behind any touch events already on the JS thread: the reply means their handlers have run
   // idleMs: since the last commit; net: requests in flight (age in ms, URL without query; ws: a WebSocket connecting
-  // or waiting for a reply); timers: pending ones (left: ms until due); fired: the last one that fired, not recurring
+  // or waiting for a reply); timers: pending ones (left: ms until due); fired: one-off timers that fired lately
   "Agent.ping": () => {
     const now = Date.now();
     const net = [];
@@ -572,10 +582,22 @@ const handlers = {
       if (ws.readyState === 0) net.push({ ms: now - s.at, url: s.url, ws: "connecting" });
       else if (ws.readyState === 1 && s.sent) net.push({ ms: now - s.sent, url: s.url, ws: "reply" });
     const pending = [];
-    for (const t of timers.values())
-      pending.push({ kind: t.kind, ms: t.ms, left: t.kind === "interval" ? null : t.at + t.ms - now, recurring: t.recurring });
-    const last = lastFired && { kind: lastFired.kind, ms: lastFired.ms, ago: now - lastFired.at };
-    return { commitId, idleMs: now - commitAt, net, timers: pending, fired: last };
+    for (const t of timers.values()) {
+      const b = buckets.get(t.bucket);
+      pending.push({
+        kind: t.kind,
+        ms: t.ms,
+        left: t.kind === "interval" ? null : t.at + t.ms - now,
+        recurring: t.kind === "interval" || !t.once || recurring(t.bucket, now),
+        fires: b ? b.fires : 0,
+        sinceLastFire: b ? now - b.last : null,
+      });
+    }
+    pending.sort((x, y) => (x.left ?? Infinity) - (y.left ?? Infinity));
+    // fired: buckets whose one-off timer fired in the last 5 s (what it started may show a frame later)
+    const fired = [];
+    for (const b of buckets.values()) if (now - b.held < 5000) fired.push({ kind: b.kind, ms: b.ms, ago: now - b.held });
+    return { commitId, idleMs: now - commitAt, net, timers: pending.slice(0, MAX_PINGED), fired };
   },
 };
 

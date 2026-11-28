@@ -17,6 +17,9 @@ const PORT =
   (Number(process.env.JEST_WORKER_ID) || 1) -
   1;
 const DEFAULT_TIMEOUT = 10000;
+// idle: how long a WebSocket connecting or waiting for a reply holds the wait at most (a reply over a socket comes in
+// well under that; a socket that takes longer is a push channel, a one-way send or a backend that's down)
+const WS_HOLD_MS = 1500;
 const CONNECT_TIMEOUT = 15000;
 // an iOS app frees its port ~0.6 s after another one launched (it went to the background), and an agent that found the
 // port taken retries every second
@@ -756,9 +759,10 @@ class App extends EventEmitter {
    * spinner never stops); err.busy has it as facts. Resolves to what is still pending but didn't hold the wait.
    * since (app.mark() taken before an action): idle counts only once the app reacted to it (a commit or a draw since),
    * or reactMs passed without one; for actions the app handles a while later (back, a tap whose handler awaits).
-   * netMaxMs: a request (or WebSocket) in flight longer than this no longer holds the wait (polling, a hung request).
-   * timerMaxMs: a setTimeout / requestAnimationFrame set for at most this holds it (Detox: 1.5 s); intervals and timers
-   * that re-arm themselves never do.
+   * netMaxMs: a request in flight longer than this no longer holds the wait (polling, a hung request). A WebSocket
+   * connecting or waiting for a reply holds it WS_HOLD_MS at most (or netMaxMs, if less).
+   * timerMaxMs: a one-off setTimeout / requestAnimationFrame set for at most this holds it (Detox: 1.5 s), and quietMs
+   * after it fired; intervals and recurring timers (the agent: its delay bucket fired twice in a row) never do.
    * ponytail: Android's clock can't tell which view drew, so a focused text field's caret (a draw every 500 ms) keeps
    * quietMs >= 500 from ever passing; blur the field first.
    * An agent that's gone (or goes) fails it at once with DISCONNECTED, not at timeout.
@@ -777,11 +781,15 @@ class App extends EventEmitter {
       const network = js.net ?? [];
       const timers = js.timers ?? []; // an agent older than timer tracking: none
       const busy = {};
-      const net = network.filter((r) => r.ms < netMaxMs);
+      const net = network.filter((r) => r.ms < (r.ws ? Math.min(netMaxMs, WS_HOLD_MS) : netMaxMs));
       const due = timers.filter((t) => !t.recurring && t.ms <= timerMaxMs);
-      // one that just fired counts as activity (left < 0): what it started may show a frame or two later
-      const fired = js.fired && js.fired.ms <= timerMaxMs ? js.fired.ago : Infinity;
-      if (fired < quietMs) due.push({ kind: js.fired.kind, ms: js.fired.ms, left: -fired, recurring: false });
+      // one that just fired counts as activity: what it started may show a frame or two later
+      let fired = Infinity;
+      for (const f of js.fired ?? [])
+        if (f.ms <= timerMaxMs && f.ago < quietMs) {
+          due.push({ kind: f.kind, ms: f.ms, left: null, recurring: false, fired: true, sinceLastFire: f.ago });
+          fired = Math.min(fired, f.ago);
+        }
       if (net.length) busy.network = net;
       if (due.length) busy.timers = due;
       if (js.idleMs < quietMs) busy.react = { idleMs: js.idleMs };
@@ -793,9 +801,10 @@ class App extends EventEmitter {
       }
       const left = t0 + timeout - performance.now();
       if (left < 0) throw new TimeoutError("TIMEOUT", `app not idle after ${timeout}ms: ${busyText(busy)}`, { busy });
-      // until both clocks can be quiet and the first timer due fired; a frame at a time while waiting for the app to react
+      // until both clocks can be quiet and the first timer due fired (250 ms at most: it may be cleared); a frame at a
+      // time while waiting for the app to react
       const quiet = quietMs - Math.min(js.idleMs ?? quietMs, ui.idleMs ?? quietMs, fired);
-      const fires = due.length ? Math.min(...due.map((t) => t.left)) : 0;
+      const fires = Math.min(250, ...due.map((t) => t.left ?? 0));
       await sleep(reacted ? Math.min(Math.max(16, quiet, fires), left + 1) : 16);
     }
   }
@@ -842,7 +851,7 @@ function busyText({ network = [], timers = [], react, screen, reacted }) {
     : ws ? `WebSocket waiting ${ms}ms for a reply: ${url}`
     : `request in flight for ${ms}ms: ${url}`);
   for (const t of timers)
-    out.push(`${t.kind === "frame" ? "requestAnimationFrame" : `setTimeout ${t.ms}ms`} ${t.left < 0 ? `fired ${-t.left}ms ago` : t.kind === "frame" ? "pending" : `due in ${t.left}ms`}`);
+    out.push(`${t.kind === "frame" ? "requestAnimationFrame" : `setTimeout ${t.ms}ms`} ${t.fired ? `fired ${t.sinceLastFire}ms ago` : t.kind === "frame" ? "pending" : `due in ${t.left}ms`}`);
   if (react) out.push(`React committed ${react.idleMs}ms ago`);
   if (screen) out.push(`screen changed ${screen.idleMs}ms ago${screen.what ? ` (${screen.what})` : ""}`);
   if (reacted === false) out.push("no commit or draw since the mark yet");

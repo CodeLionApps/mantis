@@ -136,9 +136,9 @@ export interface IdleOptions {
   timeout?: number;
   since?: Mark;
   reactMs?: number;
-  /** a request or WebSocket in flight longer than this doesn't hold the wait (default Infinity) */
+  /** a request in flight longer than this doesn't hold the wait (default Infinity); a WebSocket: 1500 at most */
   netMaxMs?: number;
-  /** a setTimeout / requestAnimationFrame set for longer than this doesn't hold the wait (default 1500) */
+  /** a one-off setTimeout / requestAnimationFrame set for longer than this doesn't hold the wait (default 1500; 0: none) */
   timerMaxMs?: number;
 }
 
@@ -150,15 +150,21 @@ export interface PendingRequest {
   ws?: "connecting" | "reply";
 }
 
-/** A pending JS timer. */
+/** A pending JS timer (in err.busy also one that just fired: fired true). */
 export interface PendingTimer {
   kind: "timeout" | "interval" | "frame";
   /** its delay (frame: 0) */
   ms: number;
-  /** ms until due; null for an interval. In err.busy, negative: it fired that long ago (less than quietMs) */
+  /** ms until due (negative: overdue, the JS thread is busy); null for an interval or one that fired */
   left: number | null;
-  /** an interval, or a timer re-armed as one of its kind and delay fired (a poll loop): never holds the wait */
+  /** an interval, or its kind and delay bucket fired at least twice in a row (a poll, a loop): never holds the wait */
   recurring: boolean;
+  /** how often its kind and delay bucket fired in a row */
+  fires: number;
+  /** ms since that bucket last fired; null: never */
+  sinceLastFire: number | null;
+  /** err.busy only: a one-off timer that fired less than quietMs ago (what it started may show a frame later) */
+  fired?: true;
 }
 
 /** idle resolved: what was still pending but didn't hold the wait (beyond netMaxMs / timerMaxMs, recurring). */
