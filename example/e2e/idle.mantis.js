@@ -130,9 +130,12 @@ test('a looping animation: times out, saying what moves', async () => {
   await assert.rejects(tapIdle('Pętla', { timeout: 1500, quietMs: 300 }), e => e.code === 'TIMEOUT' && !!(e.busy.screen || e.busy.thread === 'main'));
 });
 
-test('an image from the network: idle waits for it', { ...lab, todo: 'native image loads are not tracked' }, async () => {
+test('an image from the network: idle waits for it, reporting the load', lab, async () => {
   await later();
+  const since = await app.mark();
   await app.getByText('Obrazek').tap();
+  await assert.rejects(app.idle({ since, timeout: 500 }), e =>
+    e.code === 'TIMEOUT' && !!e.busy.network?.some(r => r.image && r.url === 'http://localhost:9124/image.png'));
   await app.idle();
   assert.ok(await shows('Stan: obrazek'));
 });
