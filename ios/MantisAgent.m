@@ -575,6 +575,73 @@ static NSString *transitionReason(UIWindow *w) {
   return nil;
 }
 
+// The topmost view controller of the key window (an alert of the app's own: its UIAlertController).
+- (UIViewController *)topController {
+  UIViewController *top = self.windows.firstObject.rootViewController;
+  for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
+  while (top.presentedViewController) top = top.presentedViewController;
+  return top;
+}
+
+// focused: the app is active and no alert of its own is on top (a system alert makes the app inactive). state:
+// UIApplicationState as Android's (active; inactive = a system alert, Control Center, Notification Center, the app
+// switcher or the lock screen over it; background). keyboard: its end frame, screen points, or null.
+- (NSDictionary *)focus {
+  UIApplicationState st = UIApplication.sharedApplication.applicationState;
+  CGRect kb = CGRectIntersection(_keyboard, UIScreen.mainScreen.bounds);
+  return @{@"focused": @((BOOL)(st == UIApplicationStateActive && ![self.topController isKindOfClass:UIAlertController.class])),
+           @"state": st == UIApplicationStateActive ? @"active" : st == UIApplicationStateInactive ? @"inactive" : @"background",
+           @"keyboard": CGRectIsNull(kb) || kb.size.height < 1 ? NSNull.null : R(kb)};
+}
+
+static BOOL hasRN(UIView *v) {
+  if (v.tag > 0 && isRN(v)) return YES;
+  for (UIView *c in v.subviews) if (hasRN(c)) return YES;
+  return NO;
+}
+
+// The app's own view controllers presented over its windows' roots, topmost first, as Android's overlays: type (alert =
+// a UIAlertController, which RN's Alert and ActionSheetIOS are; modal = any other, RN's Modal too), react (React content
+// in it: in the nodes) and rect (screen points). ponytail: a window of the app's own without a presented controller
+// (a native SDK's overlay window) isn't listed.
+- (NSArray *)overlays {
+  NSMutableArray *out = [NSMutableArray array];
+  for (UIWindow *w in self.windows) {
+    NSString *cls = NSStringFromClass(w.class);
+    if ([cls containsString:@"Keyboard"] || [cls containsString:@"TextEffects"]) continue;
+    NSMutableArray *chain = [NSMutableArray array];
+    for (UIViewController *vc = w.rootViewController.presentedViewController; vc; vc = vc.presentedViewController)
+      if (vc.isViewLoaded && !vc.isBeingDismissed) [chain insertObject:vc atIndex:0];
+    for (UIViewController *vc in chain)
+      [out addObject:@{@"type": [vc isKindOfClass:UIAlertController.class] ? @"alert" : @"modal", @"react": @(hasRN(vc.view)),
+                       @"rect": R(presentedRect(vc.view))}];
+  }
+  return out;
+}
+
+// Layers whose content a window drawn by layer.renderInContext lacks (Metal, OpenGL, video), screen points; w = the
+// index in the screenshot's windows.
+static void uncaptured(CALayer *l, NSUInteger w, NSMutableArray *out) {
+  if (l.hidden || l.opacity < 0.01) return;
+  static NSArray<Class> *kinds;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    NSMutableArray *k = [NSMutableArray array];
+    for (NSString *n in @[@"CAMetalLayer", @"CAEAGLLayer", @"AVPlayerLayer", @"AVSampleBufferDisplayLayer"]) if (NSClassFromString(n)) [k addObject:NSClassFromString(n)];
+    kinds = k;
+  });
+  for (Class c in kinds)
+    if ([l isKindOfClass:c]) {
+      UIView *v = nil;
+      for (CALayer *a = l; a && !v; a = a.superlayer) if ([a.delegate isKindOfClass:UIView.class]) v = (UIView *)a.delegate;
+      CGRect r = CGRectIntersection([l convertRect:l.bounds toLayer:nil], UIScreen.mainScreen.bounds);
+      while (v && !(v.tag > 0 && isRN(v))) v = v.superview;
+      if (!CGRectIsNull(r)) [out addObject:@{@"rect": R(r), @"tag": v ? @(v.tag) : NSNull.null, @"window": @(w)}];
+      return;
+    }
+  for (CALayer *c in l.sublayers) uncaptured(c, w, out);
+}
+
 // Run block after n display frames (vsync-aligned, unlike a timer); an exception in it answers the RPC (done).
 - (void)afterFrames:(int)n done:(void (^)(id))done do:(void (^)(void))block {
   __block int left = n;
@@ -661,17 +728,12 @@ static NSString *transitionReason(UIWindow *w) {
       [ats addObject:at];
       [rects addObject:seen ? R(presentedRect(v)) : NSNull.null];
     }
-    UIViewController *top = self.windows.firstObject.rootViewController;
-    for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
-    while (top.presentedViewController) top = top.presentedViewController;
-    BOOL focused = UIApplication.sharedApplication.applicationState == UIApplicationStateActive && ![top isKindOfClass:UIAlertController.class];
     CGRect screen = UIScreen.mainScreen.bounds;
-    CGRect kb = CGRectIntersection(_keyboard, screen);
+    [res addEntriesFromDictionary:self.focus];
     // appState (UIApplicationState: 0 active, 1 inactive = a system alert / Control Center / the lock screen over it, 2 background),
     // why focused is false: an alert of the app's own or the system's, or a screen that is off.
-    [res addEntriesFromDictionary:@{@"hit": hits, @"at": ats, @"rects": rects, @"focused": @(focused),
-           @"appState": @(UIApplication.sharedApplication.applicationState), @"top": NSStringFromClass(top.class) ?: NSNull.null,
-           @"keyboard": CGRectIsNull(kb) || kb.size.height < 1 ? NSNull.null : R(kb),
+    [res addEntriesFromDictionary:@{@"hit": hits, @"at": ats, @"rects": rects, @"overlays": self.overlays,
+           @"appState": @(UIApplication.sharedApplication.applicationState), @"top": NSStringFromClass(self.topController.class) ?: NSNull.null,
            @"screen": @{@"width": @(screen.size.width), @"height": @(screen.size.height), @"density": @(UIScreen.mainScreen.scale)}}];
     done(res);
   } else if ([method isEqualToString:@"Action.check"]) {
@@ -832,14 +894,16 @@ static NSString *transitionReason(UIWindow *w) {
     // the Control Center are not the app's. scale: px per point (default 1).
     // A window drawViewHierarchy cannot draw (it returns NO; seen as black frames on a physical iPhone) is drawn by
     // layer.renderInContext instead: works off screen, but misdraws transformed text (tab bar labels) and has no
-    // blur/video/Metal content. render: renderInContext only. `fallbacks`: windows drawn that way.
+    // blur/video/Metal content. render: renderInContext only. `fallbacks`: windows drawn that way; `surfaces`: their Metal,
+    // OpenGL and video layers (not in the picture). focused, state, keyboard (not in the picture): as of the start.
     CGRect screen = UIScreen.mainScreen.bounds;
     UIGraphicsImageRendererFormat *f = [UIGraphicsImageRendererFormat preferredFormat];
     f.scale = [p[@"scale"] doubleValue] > 0 ? [p[@"scale"] doubleValue] : 1;
     f.opaque = YES;
     BOOL render = [p[@"render"] boolValue], after = [p[@"afterUpdates"] boolValue];
     __block int fallbacks = 0;
-    NSMutableArray *drawn = [NSMutableArray array];
+    NSMutableArray *drawn = [NSMutableArray array], *surfaces = [NSMutableArray array];
+    NSDictionary *focus = self.focus;
     UIImage *img = [[[UIGraphicsImageRenderer alloc] initWithSize:screen.size format:f] imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
       [UIColor.blackColor setFill];
       [ctx fillRect:screen];
@@ -851,13 +915,17 @@ static NSString *transitionReason(UIWindow *w) {
         [drawn addObject:cls];
         if (!render && [w drawViewHierarchyInRect:w.frame afterScreenUpdates:after]) continue;
         if (!render) fallbacks++;
+        uncaptured(w.layer, drawn.count - 1, surfaces);
         CGContextSaveGState(ctx.CGContext);
         CGContextTranslateCTM(ctx.CGContext, w.frame.origin.x, w.frame.origin.y);
         [w.layer renderInContext:ctx.CGContext];
         CGContextRestoreGState(ctx.CGContext);
       }
     }];
-    done(@{@"ok": @YES, @"fallbacks": @(fallbacks), @"windows": drawn, @"png": [UIImagePNGRepresentation(img) base64EncodedStringWithOptions:0]});
+    NSMutableDictionary *res = [focus mutableCopy];
+    [res addEntriesFromDictionary:@{@"ok": @YES, @"fallbacks": @(fallbacks), @"windows": drawn, @"surfaces": surfaces,
+                                    @"png": [UIImagePNGRepresentation(img) base64EncodedStringWithOptions:0]}];
+    done(res);
   } else if ([method isEqualToString:@"Input.back"]) {
     // The back button, in-process, as Input.back on Android: pops the topmost navigation controller that can go back (a
     // native stack: the pop its back button or edge swipe does). iOS has no system back: a JS stack (@react-navigation/stack)
@@ -868,9 +936,7 @@ static NSString *transitionReason(UIWindow *w) {
       return done(@{@"ok": @NO, @"reason": @"app not active (a system alert or another app in front)"});
     CGRect kb = CGRectIntersection(_keyboard, UIScreen.mainScreen.bounds);
     if (!CGRectIsNull(kb) && kb.size.height >= 1) return done(@{@"ok": @NO, @"reason": @"keyboard on screen"});
-    UIViewController *top = self.windows.firstObject.rootViewController;
-    for (UIWindow *w in self.windows) if (w.isKeyWindow) top = w.rootViewController;
-    while (top.presentedViewController) top = top.presentedViewController;
+    UIViewController *top = self.topController;
     if ([p[@"alert"] boolValue] && ![top isKindOfClass:UIAlertController.class]) return done(@{@"ok": @NO, @"reason": @"no alert"});
     if ([top isKindOfClass:UIAlertController.class]) {
       // An alert of the app's own (RN's Alert: a UIAlertController presented in a window of its own, made key; a system
