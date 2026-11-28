@@ -582,6 +582,8 @@ async function checkUsbmux() {
   assert.deepEqual([(await app.snapshot()).overlays, (await app.snapshot()).complete], [overlays, true]);
   overlays = [{ type: "modal", react: false, rect }, { type: "modal", react: true, rect }];
   assert.deepEqual((await app.snapshot()).reasons, ["a native modal of the app's own on screen: its content is not in the tree"]);
+  overlays = null; // unknown (Android below API 29): no reason made up
+  assert.deepEqual([(await app.snapshot()).overlays, (await app.snapshot()).complete], [null, true]);
   overlays = [];
   // rects as drawn natively (screen dp), not the JS layout (React root origin: a Modal under the status bar, transforms)
   nativeRects = new Map([[tagOf(minus), { x: 0, y: 24, width: 100, height: 20 }]]);

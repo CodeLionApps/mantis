@@ -56,7 +56,8 @@ export interface Overlay {
   /** modal: a Dialog (Android: RN's Modal and Alert) / a presented controller (iOS: RN's Modal); alert: iOS
    * UIAlertController (RN's Alert); popup: Android PopupWindow or another sub-window; window: any other */
   type: "modal" | "alert" | "popup" | "window";
-  /** React content in it (in the nodes); false: native, in a screenshot but not in the nodes */
+  /** a React root exists in it (its React content is in the nodes; native views inside may not be); false: native, in
+   * a screenshot but not in the nodes */
   react: boolean;
   rect: Rect;
 }
@@ -127,7 +128,7 @@ export interface Snapshot {
   focused: boolean | null;
   /** null: an agent that doesn't report it */
   state: AppState | null;
-  /** topmost first; [] = none; null: an agent that doesn't report them */
+  /** topmost first; [] = none; null: unknown (an agent that doesn't report them, Android below API 29) */
   overlays: Overlay[] | null;
   keyboard: Rect | null;
   screen: { width: number; height: number; density: number } | null;
@@ -247,7 +248,7 @@ export declare class App extends EventEmitter {
   getByTag(tag: number): Locator;
   getByPlaceholder(text: TextMatch, opts?: { exact?: boolean }): Locator;
   /** Raw RPC to the native agent, e.g. call("Page.screenshot", { scale }) (a Screenshot). */
-  readonly native: { call(method: "Page.screenshot", params?: { scale?: number; render?: boolean }): Promise<Screenshot>; call(method: string, params?: object): Promise<any> };
+  readonly native: { call(method: "Page.screenshot", params?: { scale?: number; render?: boolean; afterUpdates?: boolean }): Promise<Screenshot>; call(method: string, params?: object): Promise<any> };
 
   on(event: "touch", listener: (touch: TouchEvent) => void): this;
   on(event: string | symbol, listener: (...args: any[]) => void): this;

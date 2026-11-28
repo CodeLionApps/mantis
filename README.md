@@ -227,17 +227,29 @@ What is in front of the app, as far as the app itself can tell (no permissions, 
 - `state`: the app's lifecycle. iOS: `UIApplicationState`: `"inactive"` while a system alert (a permission prompt),
   Control Center, Notification Center or the app switcher is over the app. Android, the same words: `"active"` = an
   activity of the app is resumed, `"inactive"` = one is visible but none resumed (an activity of the system or another
-  app in front without hiding it: a permission prompt), `"background"` = none visible.
+  app in front without hiding it: a permission prompt), `"background"` = none visible. It follows the last activity
+  resumed: briefly `"inactive"` while the app goes from one of its activities to another, and with two resumed at once
+  (split screen) pausing the later one reads `"inactive"` while the other is still resumed.
 - `focused: false` with `state: "active"`: Android, a system window that doesn't pause the app has the focus (the
   notification shade, a system dialog); iOS, an alert of the app's own (it is in `overlays`).
 - `overlays`: the app's own windows (Android) or presented view controllers (iOS) over its main one, topmost first:
   `{ type, react, rect }`. `type`: `"modal"` (Android: a `Dialog`, which RN's `Modal` and `Alert` are; iOS: a
   presented controller, RN's `Modal` too), `"alert"` (iOS: a `UIAlertController`: RN's `Alert`, `ActionSheetIOS`),
-  `"popup"` (Android: a `PopupWindow` or another sub-window), `"window"` (any other). `react: false`: native content,
-  in a screenshot but not in the nodes (`complete: false`). An Android `Dialog` takes every touch, outside its box too
-  (as the window manager gives it), so nothing under an `Alert` is in the nodes or reachable by a tap, as on iOS.
+  `"popup"` (Android: a `PopupWindow` or another sub-window), `"window"` (any other). `react: true`: a React root is
+  in it (its React content is in the nodes); `react: false`: native content, in a screenshot but not in the nodes
+  (`complete: false`). That includes short-lived windows of the app's own process: a toast with a custom view, RN's
+  dev "Loading from Metro" popup (`{ type: "window", react: false }` for as long as they show). Only windows on
+  screen: those of an activity under another one of the app are hidden and not listed. Android below API 29: `null`
+  (only the activity window is known there), not "none". iOS lists presented controllers, not one being dismissed (a
+  closing alert is gone at once), nor a window of the app's own without one (a native SDK's overlay window).
 - Not knowable in-process, so not reported: windows of other processes that don't take the focus (a toast, a
   heads-up notification, an autofill dropdown, another app's overlay), and what any other window shows.
+
+Behaviour change (Android): a focusable window that isn't `FLAG_NOT_TOUCH_MODAL` (a `Dialog`, a focusable popup)
+takes every touch, outside its box too, as the window manager gives it, so nothing under an `Alert`, a `DatePicker` or
+a popup menu is in the nodes or reachable, as on iOS. A locator tap on a view beside such a dialog now waits and times out (`NOT_ACTIONABLE`, `covered by window ...`)
+instead of tapping under it; a point tap there goes to the dialog, which closes when it is cancelable, instead of
+pressing the app. A window with `FLAG_NOT_TOUCHABLE` (an overlay touches go through) takes none.
 
 `app.native.call("Page.screenshot", { scale })` returns `{ png, windows, fallbacks, focused, state, keyboard, surfaces }`: a PNG (base64) of the app's own
 windows composed as on screen, in-process (no XCTest, no `adb screencap`). Screen-sized, `scale` px per dp (iOS: per
@@ -261,7 +273,10 @@ this" from "this part is missing"):
   `SurfaceView` (video, camera preview, maps, GL; black or what is under it in the picture); iOS, the Metal, OpenGL
   and video layers (`CAMetalLayer`, `CAEAGLLayer`, `AVPlayerLayer`, `AVSampleBufferDisplayLayer`) of a window drawn
   by `renderInContext` (`drawViewHierarchy` has them: Metal checked on a simulator and an iPhone). `tag`: the nearest
-  React view, `window`: the index in `windows` (a window over it may hide it on screen too).
+  React view, `window`: the index in `windows` (a window over it may hide it on screen too). `rect`: Android, the part
+  not clipped by its ancestors; iOS, the layer's whole rect on screen (clipping ancestors not applied). Such content
+  also doesn't draw through the app's windows, so `idle()`'s draw clock doesn't see it change (a playing video doesn't
+  keep the app busy).
 - Never reported: the status and navigation bars, windows of other processes that don't take the focus (a toast, a
   heads-up notification, an autofill dropdown), DRM-protected video.
 
