@@ -267,11 +267,11 @@ never passes while a field is focused.
   1500 ms at most (or `netMaxMs`, if less): past that it is a push channel, a one-way send (typing, presence, an
   unanswered ping) or a backend that's down (a reconnect loop), and it stays only a fact.
 - Images: RN's `<Image>` loading, from the request to the decoded image handed to the view (Android: Fresco's image
-  pipeline; iOS: `RCTImageLoader`), cache hits and local files too. Each is a `network` entry with `image: true` and
-  holds the wait like a request, up to `netMaxMs`: a load has an end (the image, an error, or cancelled when its view
-  goes), and a screen whose images are still placeholders isn't the screen the caller waits for. Image libraries with a
-  pipeline of their own (expo-image, FastImage: Glide / SDWebImage) and native SDKs with their own network stack
-  (Firebase-like) aren't tracked.
+  pipeline; iOS: `RCTImageLoader`), cache hits and local files too; `Image.prefetch` as well, and `Image.getSize` on
+  Android only. Each is a `network` entry with `image: true` and holds the wait like a request, up to `netMaxMs`: a load
+  has an end (the image, an error, or cancelled when its view goes), and a screen whose images are still placeholders
+  isn't the screen the caller waits for. Image libraries with a pipeline of their own (expo-image, FastImage: Glide /
+  SDWebImage) and native SDKs with their own network stack (Firebase-like) aren't tracked.
 - Timers: a one-off `setTimeout` / `requestAnimationFrame` set for at most `timerMaxMs` (the tap that navigates 800 ms
   later), and `quietMs` after it fired (what it started may draw a frame later: `Animated`'s `delay` is a JS timer that
   then starts a native animation). Intervals and recurring timers never end and don't hold it: a timer is recurring
