@@ -363,10 +363,22 @@ function Later({ onBack }: { onBack: () => void }) {
         <Button title="Ruch później" onPress={() => move(600)} />
         <Button title="Pętla" onPress={loop} />
       </View>
-      <Button title="Obrazek" onPress={() => setImage(`http://${LAB}/image.png?${Date.now()}`)} />
+      <View style={styles.switchRow}>
+        <Button title="Obrazek" onPress={() => setImage(`http://${LAB}/image.png?${Date.now()}`)} />
+        <Button title="Wolny obrazek" onPress={() => setImage(`http://${LAB}/slow.png?${Date.now()}`)} />
+        <Button title="Zły obrazek" onPress={() => setImage(`http://${LAB}/missing.png?${Date.now()}`)} />
+      </View>
       <Button title="Wstecz" onPress={onBack} />
       <Animated.View testID="box" style={[styles.box, { transform: [{ translateX: x }] }]} />
-      {image && <Image testID="image" source={{ uri: image }} onLoad={() => setState('obrazek')} style={styles.box} />}
+      {image && (
+        <Image
+          testID="image"
+          source={{ uri: image }}
+          onLoad={() => setState('obrazek')}
+          onError={() => setState('błąd obrazka')}
+          style={styles.box}
+        />
+      )}
     </View>
   );
 }
