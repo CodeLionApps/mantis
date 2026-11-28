@@ -182,7 +182,7 @@ Known differences from Detox:
 ```js
 const { setupMantis, expect } = require("@codelionapps/mantis");
 const app = setupMantis(); // starts the runner
-await app.relaunch(() => device.launchApp({ launchArgs: app.launchArgs })); // iOS needs the runner's port + token
+await app.relaunch(() => device.launchApp({ launchArgs: app.launchArgs })); // the runner's token (+ port on iOS)
 
 await app.getByTestId("email").fill("ala@example.com");
 await app.getByRole("button", { name: "Zaloguj" }).tap();
@@ -344,16 +344,23 @@ The runner listens on `127.0.0.1` only. Android agents dial 9123 on the device, 
 runner's host port: a free one the OS picks, unless you pass a port or set `MANTIS_PORT` (read `app.port` after
 `start()`). So a Mantis app on another device on the same host, with its own `adb reverse`, can't reach this runner.
 Agents say hello with the
-protocol version; an app built with another Mantis version is refused with an error that says so. iOS simulators share
-the Mac's localhost, so iOS agents must also echo the runner's token (launch arg `mantisToken`, which the Detox layer
-adds; `app.launchArgs` for the Playwright-style API). Only the greeted socket of each agent may answer calls or send
-events. Each Jest worker gets its own port, so parallel workers (one device each) work. Two Mantis apps on one
-Android device both dial its 9123: run one at a time.
+protocol version; an app built with another Mantis version is refused with an error that says so. Agents must also
+echo the runner's token (launch arg `mantisToken`, which the Detox layer adds; `app.launchArgs` for the Playwright-style
+API): iOS simulators share the Mac's localhost, and every Mantis app on an Android device dials the same 9123. A hello
+without it is refused, and `relaunch` / calls then fail with `NOT_CONNECTED` saying why: `no token` (launched without
+`app.launchArgs`, or on Android an app built with an older Mantis: rebuild it) or `wrong token` (launched by another
+runner). Only the greeted socket of each agent may answer calls or send events, so another Mantis app on the device can't
+take over the runner. Each Jest worker gets its own port, so parallel workers (one device each) work.
+
+Android: the native agent reads the token from the intent of the app's first activity (Detox's `launchArgs` bundle,
+or `am start --es mantisToken`), and starts dialing then; the JS agent reads it through the `Mantis` native module (a
+legacy module: needs the New Architecture's TurboModule interop, on by default). A launch that reuses the running
+process (Detox `newInstance: false`) keeps the token of the process's first launch.
 
 What the channel does not protect against:
 
-- Other processes on the test host. Android agents send no token: anything that can reach `127.0.0.1` there can
-  reach the adb server too (`127.0.0.1:5037`, no authentication), which already controls the device.
+- Other processes on the test host. Anything that can reach `127.0.0.1` there can reach the adb server too
+  (`127.0.0.1:5037`, no authentication), which already controls the device and can read the token from the launch.
 - Other apps on the device. The agents trust whatever listens on the device's `localhost` port, so an app that binds
   it could read the UI tree and drive the E2E build. Install `MANTIS_E2E=1` builds only on emulators, simulators and
   test devices. On a physical iPhone the native agent listens instead, and takes only connections that carry the

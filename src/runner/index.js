@@ -144,9 +144,14 @@ class Peer {
             ? `protocol v${p.v}, runner v${PROTOCOL}: rebuild the app with this Mantis version`
             : p.error
               ? p.error
-              : // ...and other runners' apps: iOS agents must echo this runner's token (launch arg mantisToken)
-                this.platform === "ios" && p.token !== this.token
-                ? "wrong token: launch with the runner's launchArgs (app.launchArgs)"
+              : // ...and other runners' apps, or (Android) any other Mantis app on the device, which dials the same port:
+                // agents must echo this runner's token (launch arg mantisToken)
+                p.token !== this.token
+                ? this.platform === "android" && !p.features?.includes("token")
+                  ? "no token: an app built with an older Mantis version (rebuild it with this one)"
+                  : p.token == null
+                    ? "no token: launch with the runner's launchArgs (app.launchArgs)"
+                    : "wrong token: launched by another runner; launch with this runner's launchArgs (app.launchArgs)"
                 : null;
     if (why) {
       this.rejected = `${this.role} agent rejected: ${why}`;
@@ -282,8 +287,9 @@ class App extends EventEmitter {
   }
 
   /**
-   * iOS launch args the agents need: simulators share the Mac's localhost, so this runner's port and token. An iPhone
-   * listens on that port (on the phone), and only with the token, which it accepts the runner's connections with.
+   * Launch args the agents need: this runner's token, which they echo in their hello (Android: every Mantis app on a
+   * device dials the same port). iOS also reads the port: simulators share the Mac's localhost, and an iPhone listens
+   * on that port (on the phone), accepting only connections that carry the token.
    */
   get launchArgs() {
     return { mantisPort: this.port, mantisToken: this.token };
@@ -410,8 +416,9 @@ class App extends EventEmitter {
         "NOT_CONNECTED",
         `Mantis agents not connected ${timeout}ms after launch (js: ${this.js.connected}, native: ${this.native.connected}): ` +
           `${e.message}. Is this a Mantis build (MANTIS_E2E=1, withMantis() in metro.config.js) and is port ${this.port} ` +
-          "reachable from the device (Android: adb reverse; iPhone: cabled, launched with app.launchArgs, and no other " +
-          `Mantis app holding the port: one suspended in the background refuses connections like a free port, the app's log ` +
+          "reachable from the device (Android: adb reverse, launched with app.launchArgs; iPhone: cabled, launched with " +
+          "app.launchArgs, and no other Mantis app holding the port: one suspended in the background refuses connections " +
+          `like a free port, the app's log ` +
           `then says "listener on port ${this.port} failed")?`,
       );
     }
@@ -1133,7 +1140,7 @@ function expect(locator, negate = false) {
  * Call at the top of a test file: starts the runner before the app is launched and reverses its port, in the test
  * framework's suite hooks (beforeAll/afterAll: Jest, Vitest globals, Jasmine; before/after: Mocha).
  * Target: { platform, deviceId }, left out = Detox's current device. Launch through app.relaunch(() => launch(...))
- * so tests start once the agents are connected; pass launchArgs: app.launchArgs (iOS: the runner's port and token).
+ * so tests start once the agents are connected; pass launchArgs: app.launchArgs (the runner's token, iOS also its port).
  */
 function setupMantis(target = {}) {
   const device = require("../device");

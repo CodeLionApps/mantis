@@ -13,6 +13,8 @@ Module._load = function (request, ...rest) {
   if (request === "react-native")
     return {
       Platform: { OS: "android" },
+      // the token the native agent read from the launch intent; null at first: no activity yet, the JS agent asks again
+      NativeModules: { Mantis: { token: () => (tokenAsked++ ? runnerToken : null) } },
       Dimensions: { get: () => ({ width: 400, height: 800 }) },
     };
   // iOS's no-op BackHandler: the agent keeps its listeners for Input.back
@@ -30,6 +32,8 @@ Module._load = function (request, ...rest) {
   return load.call(this, request, ...rest);
 };
 
+let runnerToken; // the selftest runner's; fake agents echo it
+let tokenAsked = 0;
 const backHandler = { addEventListener() {}, removeEventListener() {} }; // RN 0.76: removeEventListener a no-op too
 let keyboard = null; // the fake native agent's keyboard rect
 let alert = null; // the fake native agent's alert of the app (focused false, app active): its Input.back result
@@ -105,7 +109,7 @@ const NodeWS = global.WebSocket; // the JS agent's gets replaced below
 const hello = (role, extra = {}) =>
   JSON.stringify({
     method: "Agent.hello",
-    params: { role, platform: "android", v: PROTOCOL, ...extra },
+    params: { role, platform: "android", v: PROTOCOL, token: runnerToken, features: ["token"], ...extra },
   });
 const closed = (ws) => new Promise((r) => (ws.onclose = r));
 
@@ -259,6 +263,8 @@ async function checkUsbmux() {
   const iosApp = new App(9198, "ios");
   const sock = { close() {} };
   iosApp.js.greet(sock, { role: "js", platform: "ios", v: PROTOCOL });
+  assert.match(iosApp.js.rejected, /no token: launch with the runner's launchArgs/);
+  iosApp.js.greet(sock, { role: "js", platform: "ios", v: PROTOCOL, token: "another runner's" });
   assert.match(iosApp.js.rejected, /wrong token/);
   iosApp.js.greet(sock, { role: "js", platform: "ios", v: PROTOCOL, token: iosApp.launchArgs.mantisToken });
   assert.equal(iosApp.js.hello?.token, iosApp.token);
@@ -271,6 +277,7 @@ async function checkUsbmux() {
   await Promise.all(free.map((a) => a.close()));
   assert.equal(new App(undefined, "ios").port, require("./runner").PORT);
   const app = new App(9199);
+  runnerToken = app.launchArgs.mantisToken;
   await app.start();
   assert.equal(app.port, 9199);
 
@@ -363,6 +370,22 @@ async function checkUsbmux() {
     current: { child: root, memoizedState: { element: {} } },
   });
   await Promise.all([app.js.ready(), app.native.ready()]);
+  assert.equal(tokenAsked, 2);
+
+  // Android: every Mantis app on a device dials the same port. One without this runner's token (built with an older
+  // Mantis, launched without app.launchArgs, or by another runner) is refused and doesn't replace the connected agent.
+  const peer = app.native.ws;
+  for (const [extra, why] of [
+    [{ token: undefined, features: undefined }, /no token: an app built with an older Mantis/],
+    [{ token: null }, /no token: launch with the runner's launchArgs/],
+    [{ token: "another runner's" }, /wrong token/],
+  ]) {
+    const foreign = new NodeWS(`${URL}/?role=native`);
+    foreign.onopen = () => foreign.send(hello("native", extra));
+    await Promise.race([closed(foreign), new Promise((r) => setTimeout(r, 1000)).then(() => assert.fail(`accepted: ${JSON.stringify(extra)}`))]);
+    assert.match(app.native.rejected, why);
+  }
+  assert(app.native.connected && app.native.ws === peer);
 
   const id = (t) => app.getByTestId(t);
   const quick = { timeout: 300 };
