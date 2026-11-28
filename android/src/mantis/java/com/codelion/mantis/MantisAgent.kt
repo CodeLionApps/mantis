@@ -22,6 +22,7 @@ import android.os.SystemClock
 import android.util.Base64
 import android.util.TypedValue
 import android.view.PixelCopy
+import android.view.SurfaceView
 import android.view.WindowManager
 import android.view.Choreographer
 import android.view.InputDevice
@@ -89,6 +90,7 @@ object MantisAgent {
   }
   private lateinit var app: Application
   private var activity: Activity? = null
+  private var started = 0 // activities of the app started (visible), resumed or not
   private var ws: WebSocket? = null
 
   /** The runner's token (launch arg mantisToken): null until the first activity is created, "" if it had none. */
@@ -117,8 +119,8 @@ object MantisAgent {
           connect()
         }
       }
-      override fun onActivityStarted(a: Activity) {}
-      override fun onActivityStopped(a: Activity) {}
+      override fun onActivityStarted(a: Activity) { started++ }
+      override fun onActivityStopped(a: Activity) { started-- }
       override fun onActivitySaveInstanceState(a: Activity, b: Bundle) {}
       override fun onActivityDestroyed(a: Activity) {}
     })
@@ -239,11 +241,15 @@ object MantisAgent {
   private val decor: View get() = decorOrNull ?: error("no resumed activity")
   private val density: Float get() = app.resources.displayMetrics.density
 
-  /** All windows of this process (activity, Modal dialogs, popups), topmost first. Coordinates are screen-based. */
+  /**
+   * All windows of this process (activity, Modal dialogs, popups) that are on screen, topmost first. Coordinates are
+   * screen-based. windowVisibility: the windows of a stopped activity (another activity of the app over it, the app in
+   * the background) stay attached, with their dialogs, but the window manager hides them.
+   */
   private fun roots(): List<View> {
     // ponytail: API 29+ (WindowInspector); below that only the activity window, so no Modal support
     val all = if (Build.VERSION.SDK_INT >= 29) WindowInspector.getGlobalWindowViews() else listOfNotNull(decorOrNull)
-    return all.filter { it.isShown }.reversed()
+    return all.filter { it.isShown && it.windowVisibility == View.VISIBLE }.reversed()
   }
 
   private fun findView(tag: Int): View? = roots().firstNotNullOfOrNull { it.findViewById<View>(tag) }
@@ -264,8 +270,84 @@ object MantisAgent {
     return Rect(r.left.roundToInt(), r.top.roundToInt(), r.right.roundToInt(), r.bottom.roundToInt())
   }
 
-  /** Topmost window containing the point (px, screen); where a real touch would land. */
-  private fun windowAt(x: Float, y: Float): View? = roots().firstOrNull { screenRect(it).contains(x.toInt(), y.toInt()) }
+  /**
+   * Topmost window containing the point (px, screen), or a touch-modal one above it: where a real touch would land. A
+   * focusable window without FLAG_NOT_TOUCH_MODAL (a Dialog: an AlertDialog, a Modal) takes every touch, outside its
+   * rect too (the window manager gives it those; a cancelable dialog closes on them). ponytail: the whole screen; in
+   * split screen the window manager limits that to the app's part, which only matters for points outside the app.
+   */
+  private fun windowAt(x: Float, y: Float): View? =
+    roots().firstOrNull { touchable(it) && (screenRect(it).contains(x.toInt(), y.toInt()) || touchModal(it)) }
+
+  private fun params(win: View) = win.layoutParams as? WindowManager.LayoutParams
+
+  // FLAG_NOT_TOUCHABLE: touches go through it to the window below (an overlay SDK's banner, a debug overlay)
+  private fun touchable(win: View) = (params(win)?.flags ?: 0) and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE == 0
+
+  private fun touchModal(win: View) = params(win)?.let {
+    it.type != WindowManager.LayoutParams.TYPE_BASE_APPLICATION && it.flags and (WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+      WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) == 0
+  } == true
+
+  /**
+   * The app's lifecycle, as on iOS: active = an activity of the app is resumed; inactive = one is started (visible) but
+   * none resumed: an activity of another app or of the system is in front without hiding it (a permission prompt, a
+   * dialog-style activity), or the app is between two of its own activities; background = none is started.
+   * ponytail: the last resumed activity only; with two resumed at once (multi-resume, split screen), pausing the later
+   * one reads inactive while the other is still resumed.
+   */
+  private fun state() = if (activity != null) "active" else if (started > 0) "inactive" else "background"
+
+  /** The soft keyboard (IME insets of the resumed activity's window), screen dp, or null. */
+  private fun keyboard(): Any {
+    val decor = decorOrNull ?: return JSONObject.NULL
+    val ime = ViewCompat.getRootWindowInsets(decor)?.getInsets(WindowInsetsCompat.Type.ime())?.bottom ?: 0
+    if (ime <= 0) return JSONObject.NULL
+    val r = screenRect(decor)
+    return JSONObject().put("x", r.left / density).put("y", (r.bottom - ime) / density)
+      .put("width", r.width() / density).put("height", ime / density)
+  }
+
+  /**
+   * The app's own windows over its activity's, topmost first: type (modal = a Dialog, which RN's Modal and Alert are;
+   * popup = a PopupWindow or another sub-window; window = any other), react (a React root in it: its content is in the
+   * nodes) and rect (screen dp). null below API 29: only the activity window is known there (roots), not "none".
+   */
+  private fun overlays(): Any {
+    if (Build.VERSION.SDK_INT < 29) return JSONObject.NULL
+    val out = JSONArray()
+    for (w in roots()) {
+      val type = params(w)?.type ?: continue
+      if (type == WindowManager.LayoutParams.TYPE_BASE_APPLICATION) continue
+      out.put(JSONObject().put("type", when (type) {
+        WindowManager.LayoutParams.TYPE_APPLICATION -> "modal"
+        in WindowManager.LayoutParams.FIRST_SUB_WINDOW..WindowManager.LayoutParams.LAST_SUB_WINDOW -> "popup"
+        else -> "window"
+      }).put("react", reactRoot(w) != null).put("rect", rectOf(w)))
+    }
+    return out
+  }
+
+  /**
+   * What PixelCopy can't read: each shown SurfaceView's visible part (its content is on a surface of its own, outside
+   * the window: video, camera preview, a map, GL), screen dp, with the nearest React tag (null: none) and the index in
+   * the screenshot's windows of the window it is in (one over it may hide it on screen too).
+   */
+  private fun surfaces(v: View, window: Int, out: JSONArray) {
+    if (v.visibility != View.VISIBLE) return // the ancestors are: the recursion starts at a shown window
+    if (v is SurfaceView) {
+      val r = Rect()
+      if (v.getGlobalVisibleRect(r)) {
+        val o = IntArray(2).also { v.rootView.getLocationOnScreen(it) }
+        r.offset(o[0], o[1])
+        out.put(JSONObject().put("rect", JSONObject().put("x", r.left / density).put("y", r.top / density)
+          .put("width", r.width() / density).put("height", r.height() / density))
+          .put("tag", ancestorTags(v).opt(0) ?: JSONObject.NULL).put("window", window))
+      }
+      return
+    }
+    if (v is ViewGroup) for (i in 0 until v.childCount) surfaces(v.getChildAt(i), window, out)
+  }
 
   private fun rectOf(v: View): JSONObject {
     val r = screenRect(v)
@@ -392,8 +474,8 @@ object MantisAgent {
       // Visible share per tag (Detox semantics, see visibleRatio), for toBeInViewport and filter({ visible }).
       // hit: true (App.snapshot) adds per tag whether a touch at the centre of its visible part reaches it (null = no
       // resumed activity, can't tell), and once: focused (a window of the app has focus; false under a system
-      // dialog), keyboard (IME rect or null) and screen size, all in screen dp, and rects: each tag's screen rect (null =
-      // not shown). inputs (tags): texts, each one's text as it is natively (an uncontrolled input's too), masked for the
+      // dialog), keyboard (IME rect or null) and screen size, all in screen dp, rects: each tag's screen rect (null =
+      // not shown), state (see state()) and overlays (the app's own windows over its activity's). inputs (tags): texts, each one's text as it is natively (an uncontrolled input's too), masked for the
       // tags in secret (passwords never leave the device); null = no text field there.
       "Layout.visibility" -> {
         val tags = p.getJSONArray("tags")
@@ -425,14 +507,9 @@ object MantisAgent {
           res.put("texts", texts)
         }
         if (withHit) {
-          val decor = decorOrNull
-          val win = decor ?: roots().lastOrNull() // the activity window is the bottom one
-          val ime = decor?.let { ViewCompat.getRootWindowInsets(it)?.getInsets(WindowInsetsCompat.Type.ime())?.bottom } ?: 0
-          val keyboard = if (decor != null && ime > 0) screenRect(decor).let {
-            JSONObject().put("x", it.left / density).put("y", (it.bottom - ime) / density)
-              .put("width", it.width() / density).put("height", ime / density)
-          } else JSONObject.NULL
-          res.put("hit", hits).put("at", at).put("rects", rects).put("focused", roots().any { it.hasWindowFocus() }).put("keyboard", keyboard)
+          val win = decorOrNull ?: roots().lastOrNull() // the activity window is the bottom one
+          res.put("hit", hits).put("at", at).put("rects", rects).put("focused", roots().any { it.hasWindowFocus() }).put("keyboard", keyboard())
+            .put("state", state()).put("overlays", overlays())
             .put("screen", JSONObject().put("width", (win?.width ?: 0) / density).put("height", (win?.height ?: 0) / density)
               .put("density", density))
         }
@@ -642,7 +719,9 @@ object MantisAgent {
       }
 
       // The app's own windows, bottom-up, composed as on screen, as PNG base64 (iOS: same). No system UI: status bar
-      // icons, navigation bar, keyboard (another process), system dialogs. scale: px per dp (default 1).
+      // icons, navigation bar, keyboard (another process), system dialogs. scale: px per dp (default 1). With what is
+      // on screen but not in the picture, as of the start: focused false / state not active (a window of another process
+      // in front), keyboard, surfaces.
       "Page.screenshot" -> screenshot(p.optDouble("scale", 1.0).takeIf { it > 0 }?.toFloat() ?: 1f, done)
 
       else -> error("unknown method $method")
@@ -688,6 +767,9 @@ object MantisAgent {
       var bmp: Bitmap? = null
     }
     val layers = roots().filter { it.width > 0 && it.height > 0 }.reversed().map { Layer(it) }
+    val surfaces = JSONArray().also { a -> layers.forEachIndexed { i, l -> surfaces(l.win, i, a) } }
+    val facts = JSONObject().put("focused", roots().any { it.hasWindowFocus() }).put("state", state())
+      .put("keyboard", keyboard()).put("surfaces", surfaces)
     val compose = { fallbacks: Int ->
       val out = Bitmap.createBitmap((size.x * k).roundToInt(), (size.y * k).roundToInt(), Bitmap.Config.ARGB_8888)
       val png = try {
@@ -708,7 +790,7 @@ object MantisAgent {
         out.recycle() // ~10 MB a window at full resolution: don't leave it to the GC between screenshots
         layers.forEach { it.bmp?.recycle() }
       }
-      done(JSONObject().put("ok", true).put("fallbacks", fallbacks)
+      done(facts.put("ok", true).put("fallbacks", fallbacks)
         .put("windows", JSONArray(layers.map { it.win.javaClass.simpleName })).put("png", Base64.encodeToString(png, Base64.NO_WRAP)))
     }
     // after the last copy: the windows PixelCopy couldn't read drawn on the UI thread, then composed on [shot]

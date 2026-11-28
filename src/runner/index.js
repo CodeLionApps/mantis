@@ -627,10 +627,11 @@ class App extends EventEmitter {
       await this.nextCommitOrFrame();
       v = await this.native.call("Layout.visibility", { tags: [], hit: true });
     }
-    if (away(v)) throw new MantisError("COVERED", `${at}: app window not focused (a system window or another app in front)`);
+    const state = v.state ?? null;
+    if (away(v)) throw new MantisError("COVERED", `${at}: app window not focused (a system window or another app in front; app ${state})`, { state });
     const kb = v.keyboard;
     if (kb && x >= kb.x && x < kb.x + kb.width && y >= kb.y && y < kb.y + kb.height)
-      throw new MantisError("COVERED", `${at}: on the keyboard`);
+      throw new MantisError("COVERED", `${at}: on the keyboard`, { state, keyboard: kb });
     const { touch, took } = await this.tapOnce({ x, y }, timeout);
     if (touch && !touch.mounted)
       throw new MantisError(
@@ -696,7 +697,8 @@ class App extends EventEmitter {
    * order = paint order (later siblings drawn on top; zIndex/elevation aside). rect: screen dp as drawn natively
    * (transforms in flight included), what touchscreen.tap takes. value: a text input's native text.
    * focused false = a system dialog (permission prompt, Samsung Pass), or on iOS an alert of the app's own, is over
-   * the app; keyboard = IME rect or null.
+   * the app; state = the app's lifecycle (active, inactive, background); overlays = the app's own windows / presented
+   * controllers over its main one (React's or native); keyboard = IME rect or null.
    * complete false = the nodes don't show all a user sees; reasons say why (incompleteness).
    */
   async snapshot() {
@@ -744,9 +746,9 @@ class App extends EventEmitter {
         hit,
       });
     });
-    const { focused = null, keyboard = null, screen = null } = vis;
-    const reasons = incompleteness(out, focused);
-    return { commitId, nodes: out, focused, keyboard, screen, complete: !reasons.length, reasons };
+    const { focused = null, state = null, overlays = null, keyboard = null, screen = null } = vis;
+    const reasons = incompleteness(out, focused, overlays);
+    return { commitId, nodes: out, focused, state, overlays, keyboard, screen, complete: !reasons.length, reasons };
   }
 
   /**
@@ -961,9 +963,10 @@ const nativePing = (p) =>
 
 // Why a snapshot's nodes don't show all a user sees (App.snapshot complete / reasons).
 // ponytail: WebViews by host name (react-native-webview's RNCWebView); other native content (maps, video) isn't flagged.
-function incompleteness(nodes, focused) {
+function incompleteness(nodes, focused, overlays) {
   const reasons = [];
   if (focused !== true) reasons.push("app window not focused: a system window, another app or (iOS) an alert in front");
+  for (const o of overlays ?? []) if (!o.react) reasons.push(`a native ${o.type} of the app's own on screen: its content is not in the tree`);
   if (!nodes.length) reasons.push("no nodes: nothing of React's on screen (a splash screen)");
   const web = nodes.find((n) => /webview/i.test(n.type));
   if (web) reasons.push(`a WebView on screen (${web.type}): its page is not in the tree`);
