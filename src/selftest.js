@@ -257,6 +257,77 @@ async function checkUsbmux() {
   fake.close();
 }
 
+// Stuck threads: a call waiting on a thread that ran nothing for STUCK_MS fails with err.stuck instead of at the RPC
+// timeout; the next call knows at once. Fake agents: the native one answers Agent.alive off its main thread.
+async function checkStuck() {
+  const STUCK_MS = 5000; // the runner's
+  const app = new App(); // Android, a free port
+  await app.start();
+  const url = (role) => `ws://127.0.0.1:${app.port}/?role=${role}`;
+  let mainMs = 100; // the native agent's Agent.alive; Infinity: no answer (the whole app is suspended)
+  let mainStuck = false; // the native main thread runs nothing: its calls wait
+  let jsStuck = false; // the JS thread runs nothing: its calls wait until it runs again
+  const queued = [];
+  const agent = (role, features, answer) => {
+    const ws = new NodeWS(url(role));
+    ws.onopen = () => ws.send(hello(role, { token: app.token, features, ctx: "c" }));
+    ws.onmessage = (e) => answer(JSON.parse(e.data), (id, result) => ws.send(JSON.stringify({ id, result })));
+    return ws;
+  };
+  const native = agent("native", ["token", "alive"], ({ id, method, params }, reply) => {
+    if (method === "Agent.alive") return mainMs !== Infinity && reply(id, { mainMs });
+    if (method === "Slow") return setTimeout(() => reply(id, {}), 1500); // a long call; main keeps running
+    if (!mainStuck) reply(id, method === "Agent.ping" ? { draws: 0, idleMs: 1000 } : { ratios: [] });
+  });
+  const js = agent("js", ["driver", "token"], (msg, reply) => {
+    const answer = () => reply(msg.id, msg.method === "Agent.ping" ? { commitId: 1, idleMs: 1000 } : { nodes: [] });
+    if (jsStuck) queued.push(answer);
+    else answer();
+  });
+  await Promise.all([app.js.ready(), app.native.ready()]);
+  const took = async (p, expected) => {
+    const t = performance.now();
+    await assert.rejects(p, expected);
+    return performance.now() - t;
+  };
+
+  // main stuck long ago (a crash dialog): the first call knows at its first probe, the next ones at once
+  mainMs = 60000;
+  mainStuck = true;
+  const main = { thread: "main", forMs: 60000 };
+  assert(await took(app.native.call("Layout.visibility", { tags: [] }), { code: "TIMEOUT", name: "TimeoutError", stuck: main }) < 3000);
+  assert(await took(app.native.call("Layout.visibility", { tags: [] }), { code: "TIMEOUT", stuck: main, message: /main thread is stuck/ }) < 1500);
+  // an action may still run once main does: DELIVERED, with the fact
+  await assert.rejects(app.native.call("Input.tap", { x: 1, y: 1 }), { code: "DELIVERED", stuck: main });
+  await assert.rejects(app.idle(), { code: "TIMEOUT", stuck: main, busy: { thread: "main" }, message: /^app not idle: the app's main thread is stuck/ });
+  // main runs again: calls work; a long call while main keeps running is not stuck
+  mainMs = 100;
+  mainStuck = false;
+  await app.native.call("Layout.visibility", { tags: [] });
+  await app.native.call("Slow");
+
+  // JS stuck: silent since asked, while the native agent answers
+  jsStuck = true;
+  const first = await took(app.js.call("Tree.query", {}), (e) => e.code === "TIMEOUT" && e.stuck.thread === "JS" && e.stuck.forMs >= STUCK_MS);
+  assert(first >= STUCK_MS && first < STUCK_MS + 3000, String(first));
+  assert(await took(app.js.call("Tree.query", {}), (e) => e.code === "TIMEOUT" && e.stuck.thread === "JS") < 1500);
+  // an action that ran natively, then JS doesn't take it: DELIVERED, not a TIMEOUT that invites a retry
+  await assert.rejects(app.settle(), (e) => e.code === "DELIVERED" && e.stuck.thread === "JS");
+  // the whole app silent (suspended in the background, stopped in a debugger): not called stuck
+  mainMs = Infinity;
+  assert.equal(await app.js.probe(), null);
+  mainMs = 100;
+  // JS runs again and answers what it was asked: no longer silent
+  jsStuck = false;
+  queued.splice(0).forEach((f) => f());
+  await app.js.call("Tree.query", {});
+  assert.equal(await app.js.probe(), null);
+
+  native.close();
+  js.close();
+  await app.close();
+}
+
 (async () => {
   checkContract();
 
@@ -974,6 +1045,7 @@ async function checkUsbmux() {
   assert.match(traced, /Input\.typeText/);
   assert.doesNotMatch(traced, /hunter2/);
   await checkUsbmux();
+  await checkStuck();
 
   // Android launch args (read once per JS context): a fresh agent's hello, given the Mantis native module
   const freshHello = async (module) => {

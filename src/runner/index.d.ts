@@ -36,6 +36,13 @@ export class MantisError extends Error {
   typed?: number;
   /** STALE: the tag that is gone (getByTag's, or the view under a point tap; null: unknown). */
   tag?: number | null;
+  /** TIMEOUT / DELIVERED: the call was cut short because the thread it needs is stuck. */
+  stuck?: Stuck;
+}
+/** A thread of the app that ran nothing for forMs (at least 5000 ms, Android's ANR threshold). */
+export interface Stuck {
+  thread: "main" | "JS";
+  forMs: number;
 }
 /** A wait that ran out (code TIMEOUT, or NOT_ACTIONABLE / NOT_FOCUSED for an action's auto-wait). */
 export class TimeoutError extends MantisError {
