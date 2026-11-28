@@ -1,6 +1,6 @@
 // Mantis native agent as an RN library (autolinked). The agent's sources and its ContentProvider are compiled in only
-// when MANTIS_E2E=1 is set for the Gradle build; otherwise the library is just the empty MantisPackage (autolinking
-// needs a ReactPackage) and the app contains no agent.
+// when MANTIS_E2E=1 is set for the Gradle build; otherwise the library is just an empty MantisPackage (src/off:
+// autolinking needs a ReactPackage) and the app contains no agent.
 def mantisEnv = System.getenv("MANTIS_E2E")
 if (mantisEnv != null && !(mantisEnv in ["", "0", "1"])) {
     throw new GradleException("MANTIS_E2E must be 1 (agent) or 0/unset (no agent), got '${mantisEnv}'")
@@ -33,9 +33,12 @@ android {
     }
     sourceSets {
         main {
+            // one MantisPackage or the other: with the agent's token module, or empty
             if (mantisE2E) {
                 java.srcDirs += "src/mantis/java"
                 manifest.srcFile "src/mantis/AndroidManifest.xml"
+            } else {
+                java.srcDirs += "src/off/java"
             }
         }
     }

@@ -502,21 +502,32 @@ const handlers = {
 // Runner port: 9123; on iOS the launch argument `-mantisPort N` (NSUserDefaults argument domain, read through RN
 // Settings) overrides it, since simulators share the Mac's localhost. Android always dials 9123 on the device; the
 // runner maps it to its own port with adb reverse.
-// The token (launch argument -mantisToken, iOS only) proves to the runner that this app was launched by it.
+// The token (launch argument mantisToken) proves to the runner that this app was launched by it. Android: the native
+// agent reads it from the first activity's intent, this agent through the Mantis native module; null = no activity
+// yet (JS started early): try again later.
 let launchArgs;
 function getLaunchArgs() {
   if (launchArgs) return launchArgs;
-  launchArgs = { port: 9123, token: null, ios: false };
+  const a = { port: 9123, token: null, ios: false, error: null };
   try {
-    if (require("react-native").Platform.OS === "ios") {
-      launchArgs.ios = true;
+    const RN = require("react-native");
+    if (RN.Platform.OS === "ios") {
+      a.ios = true;
       const m = require("react-native/Libraries/Settings/Settings"); // Android: a fallback that only warns
       const settings = m.default || m;
-      launchArgs.port = Number(settings.get("mantisPort")) || 9123;
-      launchArgs.token = settings.get("mantisToken") || null;
+      a.port = Number(settings.get("mantisPort")) || 9123;
+      a.token = settings.get("mantisToken") || null;
+    } else {
+      const m = RN.NativeModules.Mantis;
+      if (!m) a.error = "no Mantis native module (a MANTIS_E2E=1 build? TurboModule interop on?)";
+      const t = m ? m.token() : "";
+      if (t == null) return null;
+      a.token = t || null;
     }
-  } catch (e) {}
-  return launchArgs;
+  } catch (e) {
+    a.error = "Mantis launch args: " + e; // reported in hello, instead of a misleading "no token"
+  }
+  return (launchArgs = a);
 }
 
 const PROTOCOL = 2; // src/runner PROTOCOL
@@ -528,7 +539,9 @@ function send(msg) {
 }
 
 function connect() {
-  const { port, token, ios } = getLaunchArgs();
+  const args = getLaunchArgs();
+  if (!args) return setTimeout(connect, 2000); // 2 s: see onclose
+  const { port, token, ios } = args;
   // iOS: only an app a runner launched (its token) dials; the runner refuses a token-less iOS hello anyway. On a phone
   // opened by hand nothing of ours listens on loopback, and whatever app binds the port would get the agent.
   if (ios && !token) return;
@@ -544,11 +557,12 @@ function connect() {
         platform,
         v: PROTOCOL,
         token,
-        error: checkInternals(),
+        error: checkInternals() || args.error,
         ctx: CTX,
         commitId,
         // the runner's getByTag / scroll need this agent: tag selector, snapshot horizontal / WebView / secret
-        features: ["driver"],
+        // token: an agent that sends this runner's token (Android; older ones send none)
+        features: ["driver", "token"],
       },
     });
   };
