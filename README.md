@@ -51,7 +51,9 @@ yarn add -D @codelionapps/mantis
    ```
 
    If you can't change the Metro config, the fallback is `import "@codelionapps/mantis/agent"` as the first line of
-   `index.js`. That import is not gated, so wrap it yourself (e.g. a platform-specific file for E2E builds only).
+   `index.js`. That import is not gated, so wrap it yourself (e.g. a platform-specific file for E2E builds only): the
+   agent patches globals (`setTimeout`, `setInterval`, `requestAnimationFrame` and their `clear*`, `WebSocket`,
+   `XMLHttpRequest`), so an ungated import changes them in production too.
 
 2. **Native**: autolinked. No changes to `MainApplication`, Gradle or the Xcode project.
 3. **E2E build**: set `MANTIS_E2E=1` for the whole build (Gradle / `xcodebuild`; it reaches the Metro bundling step
@@ -296,16 +298,40 @@ this" from "this part is missing"):
   system alert is over the app, a native push or pop is still animating, or nothing took it (Android would leave the app). RN's `BackHandler` is a no-op on iOS; the
   JS agent keeps the listeners, but only for `app.back()`.
 
-`await app.idle({ quietMs = 100, timeout, since, reactMs = 1000, netMaxMs = Infinity })` waits until the app stands still: no React commit and nothing changed on
-screen for `quietMs`, and no XHR / `fetch` in flight. On screen: Android, a window of the app drew or a drawable animates
-on the render thread where no draw is seen (an `ActivityIndicator`); iOS, a layer changed or an animation runs (stack
-transitions, native-driver and Reanimated frames, scrolling, Modal fades; not the keyboard or a text cursor). A spinner
-that is mounted but hidden, transparent or off screen doesn't count, on either platform; one covered by another view
-still does (occlusion isn't checked). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a
-transition. On timeout it throws, naming what is still busy: a spinner or a looping animation never stops. JS timers
-are not tracked. On Android a focused text field's caret draws every 500 ms, so `quietMs` of 500 or more never passes
-while a field is focused.
+`await app.idle({ quietMs = 100, timeout, since, reactMs = 1000, netMaxMs = Infinity, timerMaxMs = 1500 })` waits until
+the app stands still: no React commit and nothing changed on screen for `quietMs`, nothing in flight on the network, no
+JS timer about to fire. On screen: Android, a window of the app drew or a drawable animates on the render thread where
+no draw is seen (an `ActivityIndicator`); iOS, a layer changed or an animation runs (stack transitions, native-driver
+and Reanimated frames, scrolling, Modal fades; not the keyboard or a text cursor). A spinner that is mounted but hidden,
+transparent or off screen doesn't count, on either platform; one covered by another view still does (occlusion isn't
+checked). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a transition. On
+Android a focused text field's caret draws every 500 ms, so `quietMs` of 500 or more never passes while a field is
+focused.
 
+- Network: XHR / `fetch`, and the app's WebSockets: one connecting, or one that sent a message and got nothing back
+  since (a request whose reply comes as a message). A send within 16 ms of a message on that socket answers the server
+  (a pong to its ping) and doesn't count; an open socket waiting for nothing doesn't either. A socket holds the wait
+  1500 ms at most (or `netMaxMs`, if less): past that it is a push channel, a one-way send (typing, presence, an
+  unanswered ping) or a backend that's down (a reconnect loop), and it stays only a fact. Native SDKs (images,
+  Firebase-like SDKs with their own network stack) aren't tracked.
+- Timers: a one-off `setTimeout` / `requestAnimationFrame` set for at most `timerMaxMs` (the tap that navigates 800 ms
+  later), and `quietMs` after it fired (what it started may draw a frame later: `Animated`'s `delay` is a JS timer that
+  then starts a native animation). Intervals and recurring timers never end and don't hold it: a timer is recurring
+  once timers of its kind and delay (within about a half octave: 990 and 1000 ms are one) fired twice in a row, each
+  within four periods of the previous one: a poll, a countdown, a re-armed or `await sleep()` loop, a
+  `requestAnimationFrame` loop. Each timer carries the facts: `fires` (in a row), `sinceLastFire`. Limits: the first two
+  rounds of a loop count as one-off and are waited for; unrelated timers of one bucket firing in a row (every 0 ms timer,
+  every frame) count as recurring; an equal-delay chain longer than two steps looks like a loop from its third step on.
+  `timerMaxMs: 0` ignores timers.
+- Behaviour change (this version): idle now also waits for short timers and WebSocket replies. Opt out with
+  `timerMaxMs: 0` and `netMaxMs: 0` (the latter also stops waiting for requests).
+- Resolves to what is still pending but didn't hold the wait, as facts: `{ network, timers }` (requests older than
+  `netMaxMs`, sockets past their 1500 ms, timers longer than `timerMaxMs` or recurring), e.g. to tell that a screen
+  still polls.
+- On timeout it throws `TIMEOUT`, naming what is still busy; `err.busy` has the same as facts: `network`, `timers`,
+  `react` (committed `idleMs` ago), `screen` (changed `idleMs` ago, `what`: the animation still running or the last
+  change), `reacted: false` (see `since`), `thread` (`"JS"` / `"main"` didn't answer). A spinner or a looping animation
+  never stops: the caller decides what to do with that.
 - `since`: `await app.mark({ timeout })` taken before an action. The app may handle it a while later (a back on the JS thread, a
   handler that awaits first) and look idle until then; with `since`, idle counts only once a commit or a draw happened
   after the mark, or `reactMs` passed without one (the action changed nothing).

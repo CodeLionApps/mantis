@@ -413,8 +413,8 @@ function checkInternals() {
 
 // ---------- network ----------
 // Requests in flight, for the runner's idle wait: a screen whose data is still on the way is not done. XMLHttpRequest
-// only (RN's fetch is built on it); WebSockets and native SDKs (Firestore, analytics) aren't counted. RN dispatches
-// loadend after load, error, timeout and abort alike.
+// (RN's fetch is built on it) and WebSockets (below); native SDKs (images, Firestore, analytics) aren't counted. RN
+// dispatches loadend after load, error, timeout and abort alike.
 const inFlight = new Map(); // xhr -> { at, url }
 try {
   const XHR = global.XMLHttpRequest.prototype;
@@ -434,6 +434,88 @@ try {
     }
   };
 } catch (e) {}
+
+// The app's WebSockets: one still connecting, and one that sent a message and got nothing back since (a request whose
+// reply comes as a message), are in flight. A send within 16 ms of a message on that socket answers the server (a pong
+// from the ping's handler) and isn't counted. An open socket that waits for nothing isn't either. The agent's own
+// socket is of the original class (BaseWebSocket).
+const BaseWebSocket = global.WebSocket;
+const sockets = new Map(); // socket -> { at, url, got, sent }
+try {
+  global.WebSocket = class WebSocket extends BaseWebSocket {
+    constructor(url, ...rest) {
+      super(url, ...rest);
+      const s = { at: Date.now(), url: String(url).split("?")[0], got: 0, sent: 0 };
+      sockets.set(this, s);
+      this.addEventListener("message", () => {
+        s.got = Date.now();
+        s.sent = 0;
+      });
+      this.addEventListener("close", () => sockets.delete(this));
+    }
+    send(data) {
+      const r = super.send(data);
+      const s = sockets.get(this);
+      if (s && !s.sent && Date.now() - s.got > 16) s.sent = Date.now();
+      return r;
+    }
+  };
+} catch (e) {}
+
+// ---------- timers ----------
+// Pending JS timers, for the runner's idle wait: a setTimeout the tap set (navigate in 800 ms) is work about to land.
+// kind: timeout, interval or frame (requestAnimationFrame); ms: the delay. Timers are grouped by kind and delay bucket
+// (half octaves: 990 and 1000 ms are one, 300 and 600 ms aren't); fires: how often the bucket fired in a row, each
+// within a few periods of the previous one; sinceLastFire: ms since it last fired (null: never). recurring: an
+// interval, or a timer whose bucket fired at least twice in a row: a poll, a countdown, a re-armed or await-sleep
+// loop, a requestAnimationFrame loop. It never ends, so it doesn't hold the wait.
+// ponytail: by kind and delay, not by call site (a stack per timer costs too much). So the first two rounds of a loop
+// count as one-off, and unrelated timers of one bucket firing in a row (every 0 ms timer, every frame) count as
+// recurring.
+const timers = new Map(); // id -> { kind, ms, at, bucket }
+const buckets = new Map(); // kind + delay bucket -> { fires, last, held } (bounded: ~40 buckets a kind)
+// held: when a timer of the bucket that did hold the wait last fired: what it started (a native animation after
+// Animated's delay) may take a frame or two to show, so the runner counts it as activity, like a commit
+const MAX_PINGED = 100; // ponytail: the ping lists at most this many (short ones first); an app with more drops the rest
+const bucketOf = (kind, ms) => kind + Math.round(Math.log2(ms + 16) * 2);
+const setTimeoutOrig = global.setTimeout;
+function track(set, clear, kind) {
+  const orig = global[set];
+  const origClear = global[clear];
+  if (typeof orig !== "function" || typeof origClear !== "function") return;
+  global[set] = function (cb, ms, ...args) {
+    if (typeof cb !== "function") return orig.call(this, cb, ms, ...args);
+    const delay = kind === "frame" ? 0 : Math.max(0, Number(ms) || 0);
+    const t = { kind, ms: delay, at: Date.now(), bucket: bucketOf(kind, delay) };
+    t.once = kind !== "interval" && !recurring(t.bucket, t.at);
+    function run(...a) {
+      const now = Date.now();
+      const b = buckets.get(t.bucket);
+      // in a row: the previous fire of the bucket within 4 periods (and a second) of this one
+      const next = b && now - b.last <= 4 * delay + 1000 ? b.fires + 1 : 1;
+      buckets.set(t.bucket, { fires: next, last: now, held: t.once ? now : b?.held ?? 0, kind, ms: delay });
+      if (kind !== "interval") timers.delete(id);
+      return cb.apply(this, a);
+    }
+    const id = kind === "frame" ? orig.call(this, run) : orig.call(this, run, ms, ...args);
+    timers.set(id, t);
+    return id;
+  };
+  // RN's timer ids share one space and clear* are interchangeable (clearTimeout clears a frame too)
+  global[clear] = function (id) {
+    timers.delete(id);
+    return origClear.call(this, id);
+  };
+}
+function recurring(bucket, now) {
+  const b = buckets.get(bucket);
+  return !!b && b.fires >= 2 && now - b.last <= 4 * b.ms + 1000;
+}
+for (const t of [["setTimeout", "clearTimeout", "timeout"], ["setInterval", "clearInterval", "interval"],
+  ["requestAnimationFrame", "cancelAnimationFrame", "frame"]])
+  try {
+    track(...t);
+  } catch (e) {} // not writable: not tracked
 
 // ---------- back (iOS) ----------
 // iOS has no back button, and RN's BackHandler there drops every listener (BackHandler.ios.js is a no-op). Keep them
@@ -490,12 +572,32 @@ const handlers = {
   "Tree.snapshot": snapshot,
   "Input.back": back,
   // queued behind any touch events already on the JS thread: the reply means their handlers have run
-  // idleMs: since the last commit; net: requests in flight (age in ms, URL without query)
+  // idleMs: since the last commit; net: requests in flight (age in ms, URL without query; ws: a WebSocket connecting
+  // or waiting for a reply); timers: pending ones (left: ms until due); fired: one-off timers that fired lately
   "Agent.ping": () => {
     const now = Date.now();
     const net = [];
     for (const r of inFlight.values()) net.push({ ms: now - r.at, url: r.url });
-    return { commitId, idleMs: now - commitAt, net };
+    for (const [ws, s] of sockets)
+      if (ws.readyState === 0) net.push({ ms: now - s.at, url: s.url, ws: "connecting" });
+      else if (ws.readyState === 1 && s.sent) net.push({ ms: now - s.sent, url: s.url, ws: "reply" });
+    const pending = [];
+    for (const t of timers.values()) {
+      const b = buckets.get(t.bucket);
+      pending.push({
+        kind: t.kind,
+        ms: t.ms,
+        left: t.kind === "interval" ? null : t.at + t.ms - now,
+        recurring: t.kind === "interval" || !t.once || recurring(t.bucket, now),
+        fires: b ? b.fires : 0,
+        sinceLastFire: b ? now - b.last : null,
+      });
+    }
+    pending.sort((x, y) => (x.left ?? Infinity) - (y.left ?? Infinity));
+    // fired: buckets whose one-off timer fired in the last 5 s (what it started may show a frame later)
+    const fired = [];
+    for (const b of buckets.values()) if (now - b.held < 5000) fired.push({ kind: b.kind, ms: b.ms, ago: now - b.held });
+    return { commitId, idleMs: now - commitAt, net, timers: pending.slice(0, MAX_PINGED), fired };
   },
 };
 
@@ -540,12 +642,12 @@ function send(msg) {
 
 function connect() {
   const args = getLaunchArgs();
-  if (!args) return setTimeout(connect, 2000); // 2 s: see onclose
+  if (!args) return setTimeoutOrig(connect, 2000); // 2 s: see onclose
   const { port, token, ios } = args;
   // iOS: only an app a runner launched (its token) dials; the runner refuses a token-less iOS hello anyway. On a phone
   // opened by hand nothing of ours listens on loopback, and whatever app binds the port would get the agent.
   if (ios && !token) return;
-  ws = new WebSocket(`ws://localhost:${port}/?role=js`);
+  ws = new BaseWebSocket(`ws://localhost:${port}/?role=js`);
   ws.onopen = () => {
     touchSeq = 0; // the runner counts this connection's touches from 0 (App.js.onHello), also when it attaches late
     // react-native is loaded by now (connect runs after the entry module), not when this file is evaluated
@@ -590,7 +692,7 @@ function connect() {
   // timers < 1500 ms as "app busy", so a faster retry loop would stall Detox runs of the same build.
   // The first retry is immediate (setImmediate, not a 0 ms timer, which Detox also counts as busy).
   ws.onclose = () =>
-    retries++ ? setTimeout(connect, 2000) : setImmediate(connect);
+    retries++ ? setTimeoutOrig(connect, 2000) : setImmediate(connect);
   ws.onerror = () => {};
 }
 setImmediate(connect);

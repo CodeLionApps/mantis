@@ -17,6 +17,9 @@ const PORT =
   (Number(process.env.JEST_WORKER_ID) || 1) -
   1;
 const DEFAULT_TIMEOUT = 10000;
+// idle: how long a WebSocket connecting or waiting for a reply holds the wait at most (a reply over a socket comes in
+// well under that; a socket that takes longer is a push channel, a one-way send or a backend that's down)
+const WS_HOLD_MS = 1500;
 const CONNECT_TIMEOUT = 15000;
 // an iOS app frees its port ~0.6 s after another one launched (it went to the background), and an agent that found the
 // port taken retries every second
@@ -738,49 +741,73 @@ class App extends EventEmitter {
     return { commitId: js.commitId, draws: ui.draws };
   }
 
-  // Agent.ping within ms: a stalled thread is a TimeoutError(message), not the RPC's after 15 s. An agent that's gone
-  // is DISCONNECTED at once: a plain call would wait up to 15 s for it to come back (a waiter picks its own fallback).
-  #ping(peer, ms, message) {
+  // Agent.ping within ms: a stalled thread is a TimeoutError(message, props), not the RPC's after 15 s. An agent that's
+  // gone is DISCONNECTED at once: a plain call would wait up to 15 s for it to come back (a waiter picks its own fallback).
+  #ping(peer, ms, message, props) {
     if (!peer.connected) return Promise.reject(new MantisError("DISCONNECTED", `the ${peer.role} agent is not connected`));
     let timer;
     return Promise.race([
       peer.call("Agent.ping").finally(() => clearTimeout(timer)),
       new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new TimeoutError("TIMEOUT", message)), ms);
+        timer = setTimeout(() => reject(new TimeoutError("TIMEOUT", message, props)), ms);
       }),
     ]);
   }
 
   /**
-   * Waits until the app stands still: no React commit and nothing changed on screen for quietMs, no request in flight.
-   * Screen: Android, a window of the app drew; iOS, a layer changed or an animation runs (transitions, native-driver
-   * and Reanimated frames, scrolling). Throws on timeout, naming what is still busy (a spinner never stops).
+   * Waits until the app stands still: no React commit and nothing changed on screen for quietMs, no request in flight,
+   * no JS timer about to fire. Screen: Android, a window of the app drew; iOS, a layer changed or an animation runs
+   * (transitions, native-driver and Reanimated frames, scrolling). Throws on timeout, naming what is still busy (a
+   * spinner never stops); err.busy has it as facts. Resolves to what is still pending but didn't hold the wait.
    * since (app.mark() taken before an action): idle counts only once the app reacted to it (a commit or a draw since),
    * or reactMs passed without one; for actions the app handles a while later (back, a tap whose handler awaits).
-   * netMaxMs: a request in flight longer than this no longer holds the wait (polling, a hung request).
+   * netMaxMs: a request in flight longer than this no longer holds the wait (polling, a hung request). A WebSocket
+   * connecting or waiting for a reply holds it WS_HOLD_MS at most (or netMaxMs, if less).
+   * timerMaxMs: a one-off setTimeout / requestAnimationFrame set for at most this holds it (Detox: 1.5 s), and quietMs
+   * after it fired; intervals and recurring timers (the agent: its delay bucket fired twice in a row) never do.
    * ponytail: Android's clock can't tell which view drew, so a focused text field's caret (a draw every 500 ms) keeps
    * quietMs >= 500 from ever passing; blur the field first.
    * An agent that's gone (or goes) fails it at once with DISCONNECTED, not at timeout.
    */
-  async idle({ quietMs = 100, timeout = DEFAULT_TIMEOUT, since, reactMs = 1000, netMaxMs = Infinity } = {}) {
+  async idle({ quietMs = 100, timeout = DEFAULT_TIMEOUT, since, reactMs = 1000, netMaxMs = Infinity, timerMaxMs = 1500 } = {}) {
     const t0 = performance.now();
     // a ping waits for what's left of timeout (at least 100 ms, so one sent at the end can still answer)
     const ping = (peer, thread) =>
-      this.#ping(peer, Math.max(100, t0 + timeout - performance.now()), `app not idle after ${timeout}ms: the ${thread} thread didn't answer`);
+      this.#ping(peer, Math.max(100, t0 + timeout - performance.now()),
+        `app not idle after ${timeout}ms: the ${thread} thread didn't answer`, { busy: { thread } });
     let reacted = !since;
     for (;;) {
       const iter = performance.now();
       const [js, ui] = await Promise.all([ping(this.js, "JS"), nativePing(ping(this.native, "main"))]);
       reacted ||= js.commitId !== since.commitId || (ui.draws != null && ui.draws !== since.draws) || iter - t0 >= reactMs;
-      const busy = (js.net ?? []).filter((r) => r.ms < netMaxMs).map((r) => `request in flight for ${r.ms}ms: ${r.url}`);
-      if (js.idleMs < quietMs) busy.push(`React committed ${js.idleMs}ms ago`);
-      if (ui.idleMs < quietMs) busy.push(`screen changed ${Math.round(ui.idleMs)}ms ago${ui.busy ? ` (${ui.busy})` : ""}`);
-      if (!reacted) busy.push("no commit or draw since the mark yet");
-      if (!busy.length) return timing("idle", t0, iter);
-      if (performance.now() - t0 > timeout)
-        throw new TimeoutError("TIMEOUT", `app not idle after ${timeout}ms: ${busy.join("; ")}`);
-      // until both clocks can be quiet; a frame at a time while waiting for the app to react
-      await sleep(reacted ? Math.max(16, quietMs - Math.min(js.idleMs ?? quietMs, ui.idleMs ?? quietMs)) : 16);
+      const network = js.net ?? [];
+      const timers = js.timers ?? []; // an agent older than timer tracking: none
+      const busy = {};
+      const net = network.filter((r) => r.ms < (r.ws ? Math.min(netMaxMs, WS_HOLD_MS) : netMaxMs));
+      const due = timers.filter((t) => !t.recurring && t.ms <= timerMaxMs);
+      // one that just fired counts as activity: what it started may show a frame or two later
+      let fired = Infinity;
+      for (const f of js.fired ?? [])
+        if (f.ms <= timerMaxMs && f.ago < quietMs) {
+          due.push({ kind: f.kind, ms: f.ms, left: null, recurring: false, fired: true, sinceLastFire: f.ago });
+          fired = Math.min(fired, f.ago);
+        }
+      if (net.length) busy.network = net;
+      if (due.length) busy.timers = due;
+      if (js.idleMs < quietMs) busy.react = { idleMs: js.idleMs };
+      if (ui.idleMs < quietMs) busy.screen = { idleMs: Math.round(ui.idleMs), what: ui.busy ?? null };
+      if (!reacted) busy.reacted = false;
+      if (!Object.keys(busy).length) {
+        timing("idle", t0, iter);
+        return { network, timers };
+      }
+      const left = t0 + timeout - performance.now();
+      if (left < 0) throw new TimeoutError("TIMEOUT", `app not idle after ${timeout}ms: ${busyText(busy)}`, { busy });
+      // until both clocks can be quiet and the first timer due fired (250 ms at most: it may be cleared); a frame at a
+      // time while waiting for the app to react
+      const quiet = quietMs - Math.min(js.idleMs ?? quietMs, ui.idleMs ?? quietMs, fired);
+      const fires = Math.min(250, ...due.map((t) => t.left ?? 0));
+      await sleep(reacted ? Math.min(Math.max(16, quiet, fires), left + 1) : 16);
     }
   }
 
@@ -817,6 +844,20 @@ class App extends EventEmitter {
   getByPlaceholder(text, { exact = false } = {}) {
     return new Locator(this, { placeholder: exact ? norm(text) : loose(text) });
   }
+}
+
+// idle's err.busy as the message: what still holds the wait
+function busyText({ network = [], timers = [], react, screen, reacted }) {
+  const out = network.map(({ ms, url, ws }) =>
+    ws === "connecting" ? `WebSocket connecting for ${ms}ms: ${url}`
+    : ws ? `WebSocket waiting ${ms}ms for a reply: ${url}`
+    : `request in flight for ${ms}ms: ${url}`);
+  for (const t of timers)
+    out.push(`${t.kind === "frame" ? "requestAnimationFrame" : `setTimeout ${t.ms}ms`} ${t.fired ? `fired ${t.sinceLastFire}ms ago` : t.kind === "frame" ? "pending" : `due in ${t.left}ms`}`);
+  if (react) out.push(`React committed ${react.idleMs}ms ago`);
+  if (screen) out.push(`screen changed ${screen.idleMs}ms ago${screen.what ? ` (${screen.what})` : ""}`);
+  if (reacted === false) out.push("no commit or draw since the mark yet");
+  return out.join("; ");
 }
 
 // an iOS agent older than the draw clock: the JS clock alone

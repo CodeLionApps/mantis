@@ -363,14 +363,22 @@ async function checkUsbmux() {
   };
   let native = connectNative();
 
-  // real JS agent; it dials ws://localhost:9123, so point it at this test's port
+  // real JS agent; it dials ws://localhost:9123, so point it at this test's port (the app's own sockets go where asked)
   global.WebSocket = class extends NodeWS {
-    constructor() {
-      super(`${URL}/?role=js`);
+    constructor(url) {
+      super(url.includes("?role=js") ? `${URL}/?role=js` : url);
     }
   };
   global.XMLHttpRequest = class extends EventTarget { open() {} send() {} }; // RN's dispatches loadend when done
+  // the agent wraps the timer globals; this process's (runner, ws, this test) keep Node's, the app's are its wrappers
+  // frames: RN's ids share the timers' space (clearTimeout clears a frame), so a frame is a 16 ms timeout here
+  global.requestAnimationFrame = (cb) => setTimeout(() => cb(performance.now()), 16);
+  global.cancelAnimationFrame = (id) => clearTimeout(id);
+  const timerNames = ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "requestAnimationFrame", "cancelAnimationFrame"];
+  const nodeTimers = timerNames.map((k) => [k, global[k]]);
   require("./agent");
+  const appTimers = Object.fromEntries(nodeTimers.map(([k]) => [k, global[k]]));
+  for (const [k, f] of nodeTimers) global[k] = f;
   global.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(1, {
     current: { child: root, memoizedState: { element: {} } },
   });
@@ -651,6 +659,127 @@ async function checkUsbmux() {
   assert((await waited({ netMaxMs: 50 })) < 100);
   await assert.rejects(app.idle({ timeout: 100 }), /request in flight/);
   xhr.dispatchEvent(new Event("loadend"));
+
+  // JS timers: a one-off timeout of at most timerMaxMs holds idle until it fired (a tap that navigates 150 ms later),
+  // and quietMs after it (what it started may show a frame later)...
+  const nap = (ms) => new Promise((r) => setTimeout(r, ms));
+  let fired = false;
+  appTimers.setTimeout(() => (fired = true), 150);
+  assert((await waited()) >= 240 && fired);
+  assert.deepEqual((await app.js.call("Agent.ping")).fired.map((f) => f.ms), [150]);
+  // ...on timeout err.busy says which, as facts
+  const nav = appTimers.setTimeout(() => {}, 1000);
+  await assert.rejects(app.idle({ timeout: 100 }), (e) =>
+    e.code === "TIMEOUT" && /: setTimeout 1000ms due in \d+ms$/.test(e.message) && !e.busy.react &&
+    e.busy.timers.length === 1 && e.busy.timers[0].kind === "timeout" && e.busy.timers[0].ms === 1000 &&
+    e.busy.timers[0].fires === 0 && e.busy.timers[0].sinceLastFire === null);
+  assert((await waited({ timerMaxMs: 999 })) < 100); // longer than timerMaxMs: not waited for...
+  const { timers } = await app.idle({ timerMaxMs: 999 });
+  assert.equal(timers[0].ms, 1000); // ...but reported
+  appTimers.clearTimeout(nav);
+  assert.deepEqual((await app.idle()).timers, []);
+  // a frame: held one frame; cancelled with clearTimeout (ids are shared): gone
+  appTimers.requestAnimationFrame(() => {});
+  assert.deepEqual((await app.js.call("Agent.ping")).timers.map((t) => t.kind), ["frame"]);
+  assert((await waited()) >= 10);
+  appTimers.clearTimeout(appTimers.requestAnimationFrame(() => {}));
+  assert.deepEqual((await app.idle()).timers, []);
+  // a timer that just fired holds quietMs, even when a longer one fired after it
+  appTimers.setTimeout(() => {}, 20);
+  appTimers.setTimeout(() => {}, 30);
+  await nap(60);
+  const long = appTimers.setTimeout(() => {}, 5000);
+  await assert.rejects(app.idle({ timeout: 1, quietMs: 500, timerMaxMs: 6000 }), (e) => {
+    const ms = e.busy.timers.filter((t) => t.fired).map((t) => t.ms);
+    return ms.includes(20) && ms.includes(30) && /setTimeout 20ms fired \d+ms ago/.test(e.message);
+  });
+  appTimers.clearTimeout(long);
+  // an equal-delay two-step chain (step, then navigate) is one-off: the second step is waited for too
+  let steps = 0;
+  appTimers.setTimeout(() => appTimers.setTimeout(() => steps++, 60), 60);
+  await app.idle();
+  assert.equal(steps, 1);
+  // never-ending ones don't hold it once their bucket fired twice in a row: an interval, a re-armed timeout, an
+  // await-sleep loop, a poll that awaits a request between rounds, a frame loop
+  const beat = appTimers.setInterval(() => {}, 50);
+  let rearmed = appTimers.setTimeout(function tick() {
+    rearmed = appTimers.setTimeout(tick, 40);
+  }, 40);
+  let looping = true;
+  (async () => {
+    while (looping) await new Promise((r) => appTimers.setTimeout(r, 30));
+  })();
+  let poll = appTimers.setTimeout(async function tick() {
+    await nap(70); // the request
+    if (looping) poll = appTimers.setTimeout(tick, 90);
+  }, 90);
+  let frame = appTimers.requestAnimationFrame(function draw() {
+    frame = appTimers.requestAnimationFrame(draw);
+  });
+  const t1 = performance.now();
+  const { timers: pending } = await app.idle({ quietMs: 50 });
+  assert(performance.now() - t1 < 1000);
+  for (const x of ["interval 50", "timeout 40", "timeout 30"]) assert(pending.some((t) => `${t.kind} ${t.ms}` === x), x);
+  assert(pending.every((t) => t.recurring && t.fires >= 2 && t.sinceLastFire >= 0), JSON.stringify(pending));
+  appTimers.clearInterval(beat);
+  appTimers.clearTimeout(rearmed);
+  appTimers.clearTimeout(poll);
+  appTimers.cancelAnimationFrame(frame);
+  looping = false;
+  await nap(100);
+  assert.deepEqual((await app.idle()).timers, []);
+  assert.deepEqual(await app.idle(), { network: [], timers: [] });
+
+  // WebSockets: connecting, and a message sent with nothing received since, are in flight; a socket that waits for
+  // nothing (or answers the server: a pong) isn't. Either holds idle 1500 ms at most (a push channel, a one-way send),
+  // and stays a fact.
+  const echo = new (require("ws").WebSocketServer)({ port: 0 });
+  echo.on("connection", (s) => s.on("message", (m) =>
+    String(m) === "ping?" ? s.send("ping") : ["pong", "fire-and-forget"].includes(String(m)) ? null : setTimeout(() => s.send("re: " + m), 150)));
+  await new Promise((r) => echo.on("listening", r));
+  const chat = new WebSocket(`ws://127.0.0.1:${echo.address().port}/chat?token=secret`);
+  ping = await app.js.call("Agent.ping");
+  assert.deepEqual(ping.net.map((r) => [r.url, r.ws]), [[`ws://127.0.0.1:${echo.address().port}/chat`, "connecting"]]);
+  await new Promise((r) => chat.addEventListener("open", r));
+  assert((await waited()) < 100);
+  chat.send("hej");
+  await assert.rejects(app.idle({ timeout: 50 }), (e) => /WebSocket waiting \d+ms for a reply: ws:.*\/chat$/.test(e.message) && e.busy.network[0].ws === "reply");
+  assert((await waited()) >= 50); // the reply landed
+  chat.addEventListener("message", (e) => e.data === "ping" && chat.send("pong"));
+  chat.send("ping?");
+  await nap(50);
+  assert((await waited()) < 100); // the pong answered the server's ping
+  chat.send("fire-and-forget"); // never answered: holds 1500 ms, then a fact
+  const one = await waited({ timeout: 3000 });
+  assert(one >= 1400 && one < 2000, String(one));
+  assert.deepEqual((await app.idle()).network.map((r) => r.ws), ["reply"]);
+  assert((await waited({ netMaxMs: 0 })) < 100);
+  chat.close();
+  await nap(50);
+  assert.deepEqual((await app.idle()).network, []); // closed: gone
+  // a failed connect closes: gone too; a reconnect loop to a backend that's down resolves once its timer recurs
+  const port = echo.address().port;
+  echo.close();
+  await nap(50);
+  let reconnecting = true;
+  let last;
+  const connect = () => {
+    const ws = (last = new WebSocket(`ws://127.0.0.1:${port}/live`));
+    ws.closed = new Promise((done) => ws.addEventListener("close", done));
+    ws.addEventListener("close", () => reconnecting && appTimers.setTimeout(connect, 100));
+  };
+  connect();
+  const t2 = performance.now();
+  const { network: down, timers: again } = await app.idle({ timeout: 3000 });
+  // under the 3000 ms timeout; a socket stuck connecting may hold up to the 1500 ms WebSocket cap on a slow host
+  assert(performance.now() - t2 < 2500, String(performance.now() - t2));
+  assert(again.length === 0 || again[0].recurring, JSON.stringify({ down, again }));
+  reconnecting = false;
+  await nap(300); // a reconnect timer that was pending has fired by now
+  last.close(); // a failed connect can take seconds (or hang) on some hosts (CI): end the last attempt ourselves
+  await Promise.race([last.closed, nap(2000)]);
+  await nap(50);
+  assert.deepEqual(await app.idle(), { network: [], timers: [] });
 
   // iOS back, in Android's order: keyboard, the topmost Modal, BackHandler listeners last first, a native pop
   app.platform = "ios";
