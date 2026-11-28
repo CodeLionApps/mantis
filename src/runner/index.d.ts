@@ -155,7 +155,7 @@ export interface PendingTimer {
   kind: "timeout" | "interval" | "frame";
   /** its delay (frame: 0) */
   ms: number;
-  /** ms until due; null for an interval */
+  /** ms until due; null for an interval. In err.busy, negative: it fired that long ago (less than quietMs) */
   left: number | null;
   /** an interval, or a timer re-armed as one of its kind and delay fired (a poll loop): never holds the wait */
   recurring: boolean;

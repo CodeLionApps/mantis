@@ -643,10 +643,12 @@ async function checkUsbmux() {
   await assert.rejects(app.idle({ timeout: 100 }), /request in flight/);
   xhr.dispatchEvent(new Event("loadend"));
 
-  // JS timers: a timeout of at most timerMaxMs holds idle until it fired (a tap that navigates 150 ms later)...
+  // JS timers: a timeout of at most timerMaxMs holds idle until it fired (a tap that navigates 150 ms later), and
+  // quietMs after it (what it started may show a frame later)...
   let fired = false;
   appTimers.setTimeout(() => (fired = true), 150);
-  assert((await waited()) >= 140 && fired);
+  assert((await waited()) >= 240 && fired);
+  assert.equal((await app.js.call("Agent.ping")).fired.ms, 150);
   // ...on timeout err.busy says which, as facts
   const nav = appTimers.setTimeout(() => {}, 1000);
   await assert.rejects(app.idle({ timeout: 100 }), (e) =>

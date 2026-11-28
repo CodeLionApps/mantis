@@ -471,6 +471,9 @@ try {
 // one firing counts as recurring too.
 const timers = new Map(); // id (frames: "f" + id) -> { kind, ms, at, recurring }
 const fired = new Map(); // kind + delay -> when one last fired
+// the last timer that fired and didn't recur: what it started (a native animation after Animated's delay) may take
+// a frame or two to show, so the runner counts it as activity, like a commit
+let lastFired = null; // { kind, ms, at }
 const setTimeoutOrig = global.setTimeout;
 function track(set, clear, kind) {
   const orig = global[set];
@@ -486,6 +489,7 @@ function track(set, clear, kind) {
     function run(...a) {
       fired.set(k, Date.now());
       if (kind !== "interval") timers.delete(key(id));
+      if (!t.recurring) lastFired = { kind, ms: delay, at: Date.now() };
       return cb.apply(this, a);
     }
     const id = kind === "frame" ? orig.call(this, run) : orig.call(this, run, ms, ...args);
@@ -559,7 +563,7 @@ const handlers = {
   "Input.back": back,
   // queued behind any touch events already on the JS thread: the reply means their handlers have run
   // idleMs: since the last commit; net: requests in flight (age in ms, URL without query; ws: a WebSocket connecting
-  // or waiting for a reply); timers: pending ones (left: ms until due)
+  // or waiting for a reply); timers: pending ones (left: ms until due); fired: the last one that fired, not recurring
   "Agent.ping": () => {
     const now = Date.now();
     const net = [];
@@ -570,7 +574,8 @@ const handlers = {
     const pending = [];
     for (const t of timers.values())
       pending.push({ kind: t.kind, ms: t.ms, left: t.kind === "interval" ? null : t.at + t.ms - now, recurring: t.recurring });
-    return { commitId, idleMs: now - commitAt, net, timers: pending };
+    const last = lastFired && { kind: lastFired.kind, ms: lastFired.ms, ago: now - lastFired.at };
+    return { commitId, idleMs: now - commitAt, net, timers: pending, fired: last };
   },
 };
 

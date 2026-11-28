@@ -82,17 +82,18 @@ const later = async () => {
 test('a timer the tap set: idle waits for it', async () => {
   await later();
   await app.getByText('Za chwilę').tap();
-  assert.ok((await timed()) >= 600);
+  await app.idle();
   assert.ok(await shows('Stan: po czasie'));
 });
 
+// the first round of each is waited for (a timer not re-armed yet), then they recur
 test('an interval and timers that re-arm themselves: idle returns, reporting them', async () => {
   await later();
   await app.getByText('W tle').tap();
   await expect(app.getByText('Stan: w tle')).toBeVisible();
   const t = performance.now();
   const { timers } = await app.idle();
-  assert.ok(performance.now() - t < 600);
+  assert.ok(performance.now() - t < 1200);
   assert.ok(timers.some(x => x.kind === 'interval' && x.ms === 1000), JSON.stringify(timers));
   for (const ms of [300, 700]) assert.ok(timers.some(x => x.ms === ms && x.recurring), JSON.stringify(timers));
 });
@@ -110,15 +111,18 @@ for (const [button, ms] of [['Ruch', 800], ['Ruch później', 1400]])
     await later();
     const box = async () => (await app.snapshot()).nodes.find(n => n.testID === 'box').rect.x;
     const x0 = await box();
+    const t = performance.now();
     await app.getByText(button).tap();
-    assert.ok((await timed()) >= ms - 200);
+    await app.idle();
+    assert.ok(performance.now() - t >= ms);
     assert.ok(Math.abs((await box()) - x0 - 200) < 2);
   });
 
 test('a looping animation: times out, saying what moves', async () => {
   await later();
   await app.getByText('Pętla').tap();
-  await assert.rejects(app.idle({ timeout: 1000 }), e => e.code === 'TIMEOUT' && !!e.busy.screen);
+  // the emulator's main thread can be too slow to answer at all while it animates: busy.thread then
+  await assert.rejects(app.idle({ timeout: 1000 }), e => e.code === 'TIMEOUT' && !!(e.busy.screen || e.busy.thread === 'main'));
 });
 
 test('an image from the network: idle waits for it', { todo: 'native image loads are not tracked' }, async () => {

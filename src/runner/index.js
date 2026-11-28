@@ -779,6 +779,9 @@ class App extends EventEmitter {
       const busy = {};
       const net = network.filter((r) => r.ms < netMaxMs);
       const due = timers.filter((t) => !t.recurring && t.ms <= timerMaxMs);
+      // one that just fired counts as activity (left < 0): what it started may show a frame or two later
+      const fired = js.fired && js.fired.ms <= timerMaxMs ? js.fired.ago : Infinity;
+      if (fired < quietMs) due.push({ kind: js.fired.kind, ms: js.fired.ms, left: -fired, recurring: false });
       if (net.length) busy.network = net;
       if (due.length) busy.timers = due;
       if (js.idleMs < quietMs) busy.react = { idleMs: js.idleMs };
@@ -791,7 +794,7 @@ class App extends EventEmitter {
       const left = t0 + timeout - performance.now();
       if (left < 0) throw new TimeoutError("TIMEOUT", `app not idle after ${timeout}ms: ${busyText(busy)}`, { busy });
       // until both clocks can be quiet and the first timer due fired; a frame at a time while waiting for the app to react
-      const quiet = quietMs - Math.min(js.idleMs ?? quietMs, ui.idleMs ?? quietMs);
+      const quiet = quietMs - Math.min(js.idleMs ?? quietMs, ui.idleMs ?? quietMs, fired);
       const fires = due.length ? Math.min(...due.map((t) => t.left)) : 0;
       await sleep(reacted ? Math.min(Math.max(16, quiet, fires), left + 1) : 16);
     }
@@ -839,7 +842,7 @@ function busyText({ network = [], timers = [], react, screen, reacted }) {
     : ws ? `WebSocket waiting ${ms}ms for a reply: ${url}`
     : `request in flight for ${ms}ms: ${url}`);
   for (const t of timers)
-    out.push(t.kind === "frame" ? "requestAnimationFrame pending" : `setTimeout ${t.ms}ms due in ${t.left}ms`);
+    out.push(`${t.kind === "frame" ? "requestAnimationFrame" : `setTimeout ${t.ms}ms`} ${t.left < 0 ? `fired ${-t.left}ms ago` : t.kind === "frame" ? "pending" : `due in ${t.left}ms`}`);
   if (react) out.push(`React committed ${react.idleMs}ms ago`);
   if (screen) out.push(`screen changed ${screen.idleMs}ms ago${screen.what ? ` (${screen.what})` : ""}`);
   if (reacted === false) out.push("no commit or draw since the mark yet");
