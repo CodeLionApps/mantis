@@ -81,10 +81,16 @@ const later = async () => {
   await app.idle();
 };
 
+// tap, then idle since a mark taken before it: on a loaded device the press handler may run after tap() returned
+const tapIdle = async (text, o) => {
+  const since = await app.mark();
+  await app.getByText(text).tap();
+  return app.idle({ since, ...o });
+};
+
 test('a timer the tap set: idle waits for it', async () => {
   await later();
-  await app.getByText('Za chwilę').tap();
-  await app.idle();
+  await tapIdle('Za chwilę');
   assert.ok(await shows('Stan: po czasie'));
 });
 
@@ -100,8 +106,7 @@ test('an interval and timers that re-arm themselves: idle returns, reporting the
 
 test('a WebSocket reply: idle waits for it; the server pinging later does not hold it', lab, async () => {
   await later();
-  await app.getByText('WebSocket').tap();
-  await app.idle();
+  await tapIdle('WebSocket');
   assert.ok(await shows('Stan: WS odpowiedź'));
   // the pongs answer the server: nothing waits for a reply (an unanswered send would hold up to 1.5 s)
   for (let i = 0; i < 3; i++) assert.deepEqual((await app.idle({ timeout: 3000 })).network, []);
@@ -113,17 +118,16 @@ for (const [button, ms] of [['Ruch', 800], ['Ruch później', 1400]])
     const box = async () => (await app.snapshot()).nodes.find(n => n.testID === 'box').rect.x;
     const x0 = await box();
     const t = performance.now();
-    await app.getByText(button).tap();
-    await app.idle();
+    await tapIdle(button);
     assert.ok(performance.now() - t >= ms);
     assert.ok(Math.abs((await box()) - x0 - 200) < 2);
   });
 
 test('a looping animation: times out, saying what moves', async () => {
   await later();
-  await app.getByText('Pętla').tap();
-  // the emulator's main thread can be too slow to answer at all while it animates: busy.thread then
-  await assert.rejects(app.idle({ timeout: 1000 }), e => e.code === 'TIMEOUT' && !!(e.busy.screen || e.busy.thread === 'main'));
+  // an emulator's frames stall now and then (over 100 ms without a draw), and its main thread may not answer at all
+  // while it animates (busy.thread then)
+  await assert.rejects(tapIdle('Pętla', { timeout: 1500, quietMs: 300 }), e => e.code === 'TIMEOUT' && !!(e.busy.screen || e.busy.thread === 'main'));
 });
 
 test('an image from the network: idle waits for it', { ...lab, todo: 'native image loads are not tracked' }, async () => {
