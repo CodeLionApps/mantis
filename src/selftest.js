@@ -749,8 +749,10 @@ async function checkUsbmux() {
   echo.close();
   await nap(50);
   let reconnecting = true;
+  let last;
   const connect = () => {
-    const ws = new WebSocket(`ws://127.0.0.1:${port}/live`);
+    const ws = (last = new WebSocket(`ws://127.0.0.1:${port}/live`));
+    ws.closed = new Promise((done) => ws.addEventListener("close", done));
     ws.addEventListener("close", () => reconnecting && appTimers.setTimeout(connect, 100));
   };
   connect();
@@ -760,7 +762,9 @@ async function checkUsbmux() {
   assert(performance.now() - t2 < 2500, String(performance.now() - t2));
   assert(again.length === 0 || again[0].recurring, JSON.stringify({ down, again }));
   reconnecting = false;
-  await nap(300);
+  await nap(300); // a reconnect timer that was pending has fired by now
+  await last.closed; // a failed connect can take seconds on some hosts (CI)
+  await nap(50);
   assert.deepEqual(await app.idle(), { network: [], timers: [] });
 
   // iOS back, in Android's order: keyboard, the topmost Modal, BackHandler listeners last first, a native pop
