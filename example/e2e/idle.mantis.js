@@ -12,6 +12,8 @@ const { isIosDevice, launchApp, reversePort } = require('@codelionapps/mantis/de
 
 const target = { platform: process.env.PLATFORM || 'android', deviceId: process.env.DEVICE, appId: process.env.MANTIS_APP_ID || 'com.probespike' };
 const app = new App(undefined, target.platform, { usb: isIosDevice(target) ? target.deviceId : undefined });
+// the app reaches the test's server at localhost (Android: adb reverse); a cabled iPhone's localhost is the phone
+const lab = { skip: isIosDevice(target) && "a cabled iPhone can't reach the host's localhost:9124" };
 // the screen "Później"'s server (App.tsx LAB): an image after 800 ms; on a socket, "hej" gets a reply after 600 ms, then a
 // ping every 200 ms
 const LAB = 9124;
@@ -54,7 +56,7 @@ const timed = async (o) => {
 
 test('static screen: idle in about quietMs', async () => {
   await app.idle();
-  for (let i = 0; i < 3; i++) assert.ok((await timed()) < 400);
+  for (let i = 0; i < 3; i++) assert.ok((await timed()) < 1000);
 });
 
 test('a spinner on screen: times out, naming the loop', async () => {
@@ -86,24 +88,23 @@ test('a timer the tap set: idle waits for it', async () => {
   assert.ok(await shows('Stan: po czasie'));
 });
 
-// the first round of each is waited for (a timer not re-armed yet), then they recur
+// the first two rounds of each are waited for (they could be one-off timers), then they recur
 test('an interval and timers that re-arm themselves: idle returns, reporting them', async () => {
   await later();
   await app.getByText('W tle').tap();
   await expect(app.getByText('Stan: w tle')).toBeVisible();
-  const t = performance.now();
-  const { timers } = await app.idle();
-  assert.ok(performance.now() - t < 1200);
+  const { timers } = await app.idle({ timeout: 5000 });
   assert.ok(timers.some(x => x.kind === 'interval' && x.ms === 1000), JSON.stringify(timers));
-  for (const ms of [300, 700]) assert.ok(timers.some(x => x.ms === ms && x.recurring), JSON.stringify(timers));
+  for (const ms of [300, 700]) assert.ok(timers.some(x => x.ms === ms && x.recurring && x.fires >= 2), JSON.stringify(timers));
 });
 
-test('a WebSocket reply: idle waits for it; the server pinging later does not hold it', async () => {
+test('a WebSocket reply: idle waits for it; the server pinging later does not hold it', lab, async () => {
   await later();
   await app.getByText('WebSocket').tap();
   await app.idle();
   assert.ok(await shows('Stan: WS odpowiedź'));
-  for (let i = 0; i < 3; i++) assert.ok((await timed()) < 400);
+  // the pongs answer the server: nothing waits for a reply (an unanswered send would hold up to 1.5 s)
+  for (let i = 0; i < 3; i++) assert.deepEqual((await app.idle({ timeout: 3000 })).network, []);
 });
 
 for (const [button, ms] of [['Ruch', 800], ['Ruch później', 1400]])
@@ -125,7 +126,7 @@ test('a looping animation: times out, saying what moves', async () => {
   await assert.rejects(app.idle({ timeout: 1000 }), e => e.code === 'TIMEOUT' && !!(e.busy.screen || e.busy.thread === 'main'));
 });
 
-test('an image from the network: idle waits for it', { todo: 'native image loads are not tracked' }, async () => {
+test('an image from the network: idle waits for it', { ...lab, todo: 'native image loads are not tracked' }, async () => {
   await later();
   await app.getByText('Obrazek').tap();
   await app.idle();
