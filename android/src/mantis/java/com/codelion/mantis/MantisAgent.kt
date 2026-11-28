@@ -165,18 +165,21 @@ object MantisAgent {
    * Image loads in flight for the runner's idle wait: request id -> URL (no query, as the JS agent's requests), start.
    * From Fresco's image pipeline, which RN's <Image> loads through (memory and disk cache, network, decode), so a load
    * ends when the decoded image is handed to the view, or on failure or cancellation (the view went away). A listener
-   * added to the pipeline once Fresco is up (FrescoModule, at React's start; or the app, earlier): checked every 16 ms
-   * for 30 s from launch, then on each ping. ponytail: image libraries with a pipeline of their own (Glide: expo-image,
-   * FastImage) aren't seen.
+   * added to the pipeline once Fresco is up (FrescoModule, at React's start; or the app, earlier), and again to a new
+   * pipeline: an app that initializes Fresco itself gets it replaced when FrescoModule initializes it once more.
+   * Checked every 16 ms for 30 s from launch, then on each ping. ponytail: image libraries with a pipeline of their own
+   * (Glide: expo-image, FastImage) aren't seen.
    */
   private val images = java.util.concurrent.ConcurrentHashMap<String, Pair<String, Long>>()
-  private var imagesHooked = false
+  private var hooked: RequestListener? = null // the pipeline's listener last seen (ImageLoads added, if it could be)
   private fun hookImages(tries: Int = 30000 / 16) {
-    if (imagesHooked) return
-    if (!Fresco.hasBeenInitialized()) { if (tries > 0) main.postDelayed({ hookImages(tries - 1) }, 16); return }
-    imagesHooked = true
+    if (tries > 0) main.postDelayed({ hookImages(tries - 1) }, 16)
+    if (!Fresco.hasBeenInitialized()) return
     // the pipeline's own listener, forwarding to those of its config (getCombinedRequestListener(null) returns it)
     val pipeline = Fresco.getImagePipeline().getCombinedRequestListener(null)
+    if (pipeline === hooked) return
+    // not a ForwardingRequestListener (another Fresco): nothing to add to; a new pipeline is tried again
+    hooked = pipeline
     (pipeline as? ForwardingRequestListener)?.addRequestListener(ImageLoads)
   }
 
