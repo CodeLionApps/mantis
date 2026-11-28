@@ -249,20 +249,34 @@ window that can't (`fallbacks`; `render: true` forces it).
   system alert is over the app, a native push or pop is still animating, or nothing took it (Android would leave the app). RN's `BackHandler` is a no-op on iOS; the
   JS agent keeps the listeners, but only for `app.back()`.
 
-`await app.idle({ quietMs = 100, timeout, since, reactMs = 1000, netMaxMs = Infinity })` waits until the app stands still: no React commit and nothing changed on
-screen for `quietMs`, and no XHR / `fetch` in flight. On screen: Android, a window of the app drew or a drawable animates
-on the render thread where no draw is seen (an `ActivityIndicator`); iOS, a layer changed or an animation runs (stack
-transitions, native-driver and Reanimated frames, scrolling, Modal fades; not the keyboard or a text cursor). A spinner
-that is mounted but hidden, transparent or off screen doesn't count, on either platform; one covered by another view
-still does (occlusion isn't checked). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a
-transition. On timeout it throws, naming what is still busy: a spinner or a looping animation never stops. JS timers
-are not tracked. On Android a focused text field's caret draws every 500 ms, so `quietMs` of 500 or more never passes
-while a field is focused.
+`await app.idle({ quietMs = 100, timeout, since, reactMs = 1000, netMaxMs = Infinity, timerMaxMs = 1500 })` waits until
+the app stands still: no React commit and nothing changed on screen for `quietMs`, nothing in flight on the network, no
+JS timer about to fire. On screen: Android, a window of the app drew or a drawable animates on the render thread where
+no draw is seen (an `ActivityIndicator`); iOS, a layer changed or an animation runs (stack transitions, native-driver
+and Reanimated frames, scrolling, Modal fades; not the keyboard or a text cursor). A spinner that is mounted but hidden,
+transparent or off screen doesn't count, on either platform; one covered by another view still does (occlusion isn't
+checked). `tap()` and `back()` don't wait for it: call it before `snapshot()` when the action starts a transition. On
+Android a focused text field's caret draws every 500 ms, so `quietMs` of 500 or more never passes while a field is
+focused.
 
+- Network: XHR / `fetch`, and the app's WebSockets: one connecting, or one that sent a message and got nothing back
+  since (a request whose reply comes as a message). A send within 16 ms of a message on that socket answers the server
+  (a pong to its ping) and doesn't count; an open socket waiting for nothing doesn't either. Native SDKs (images,
+  Firebase-like SDKs with their own network stack) aren't tracked.
+- Timers: a pending `setTimeout` / `requestAnimationFrame` set for at most `timerMaxMs` (the tap that navigates 800 ms
+  later). Intervals and timers re-armed as one of the same delay fires (a poll loop, an `await sleep()` loop, a
+  `requestAnimationFrame` loop) never end and don't hold it; neither do longer timers. `timerMaxMs: 0` ignores timers.
+- Resolves to what is still pending but didn't hold the wait, as facts: `{ network, timers }` (requests older than
+  `netMaxMs`, timers longer than `timerMaxMs` or recurring), e.g. to tell that a screen still polls.
+- On timeout it throws `TIMEOUT`, naming what is still busy; `err.busy` has the same as facts: `network`, `timers`,
+  `react` (committed `idleMs` ago), `screen` (changed `idleMs` ago, `what`: the animation still running or the last
+  change), `reacted: false` (see `since`), `thread` (`"JS"` / `"main"` didn't answer). A spinner or a looping animation
+  never stops: the caller decides what to do with that.
 - `since`: `await app.mark({ timeout })` taken before an action. The app may handle it a while later (a back on the JS thread, a
   handler that awaits first) and look idle until then; with `since`, idle counts only once a commit or a draw happened
   after the mark, or `reactMs` passed without one (the action changed nothing).
-- `netMaxMs`: a request in flight longer than this no longer holds the wait (polling, a request that hangs).
+- `netMaxMs`: a request in flight (or a WebSocket waiting for a reply) longer than this no longer holds the wait
+  (polling, a request that hangs, a message the server never answers).
 - An agent that's gone (relaunch, crash, JS reload) fails `idle` and `mark` at once with `DISCONNECTED`, not at
   `timeout`.
 

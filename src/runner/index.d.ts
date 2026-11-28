@@ -38,7 +38,10 @@ export class MantisError extends Error {
   tag?: number | null;
 }
 /** A wait that ran out (code TIMEOUT, or NOT_ACTIONABLE / NOT_FOCUSED for an action's auto-wait). */
-export class TimeoutError extends MantisError {}
+export class TimeoutError extends MantisError {
+  /** idle: what still held the wait when it ran out */
+  busy?: IdleBusy;
+}
 
 /** A host view of app.snapshot(). */
 export interface SnapshotNode {
@@ -133,7 +136,49 @@ export interface IdleOptions {
   timeout?: number;
   since?: Mark;
   reactMs?: number;
+  /** a request or WebSocket in flight longer than this doesn't hold the wait (default Infinity) */
   netMaxMs?: number;
+  /** a setTimeout / requestAnimationFrame set for longer than this doesn't hold the wait (default 1500) */
+  timerMaxMs?: number;
+}
+
+/** An XHR / fetch in flight (URL without query), or a WebSocket connecting or waiting for a reply to a message it sent. */
+export interface PendingRequest {
+  url: string;
+  /** ms in flight (WebSocket reply: since the message it sent) */
+  ms: number;
+  ws?: "connecting" | "reply";
+}
+
+/** A pending JS timer. */
+export interface PendingTimer {
+  kind: "timeout" | "interval" | "frame";
+  /** its delay (frame: 0) */
+  ms: number;
+  /** ms until due; null for an interval */
+  left: number | null;
+  /** an interval, or a timer re-armed as one of its kind and delay fired (a poll loop): never holds the wait */
+  recurring: boolean;
+}
+
+/** idle resolved: what was still pending but didn't hold the wait (beyond netMaxMs / timerMaxMs, recurring). */
+export interface IdleResult {
+  network: PendingRequest[];
+  timers: PendingTimer[];
+}
+
+/** idle ran out: each source that still held it. */
+export interface IdleBusy {
+  network?: PendingRequest[];
+  timers?: PendingTimer[];
+  /** React committed less than quietMs ago */
+  react?: { idleMs: number };
+  /** the screen changed less than quietMs ago; what: the animation still running or the last change, if known */
+  screen?: { idleMs: number; what: string | null };
+  /** since: no commit or draw after the mark yet */
+  reacted?: false;
+  /** that thread didn't answer at all */
+  thread?: "JS" | "main";
 }
 
 export type BackResult =
@@ -187,7 +232,7 @@ export declare class App extends EventEmitter {
   scroll(direction: "up" | "down" | "left" | "right"): Promise<ScrollResult>;
   back(): Promise<BackResult>;
   mark(opts?: { timeout?: number }): Promise<Mark>;
-  idle(opts?: IdleOptions): Promise<void>;
+  idle(opts?: IdleOptions): Promise<IdleResult>;
   getByRole(role: string, opts?: { name?: TextMatch }): Locator;
   getByText(text: TextMatch): Locator;
   getByLabel(label: TextMatch): Locator;

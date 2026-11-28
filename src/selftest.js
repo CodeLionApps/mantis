@@ -360,14 +360,18 @@ async function checkUsbmux() {
   };
   let native = connectNative();
 
-  // real JS agent; it dials ws://localhost:9123, so point it at this test's port
+  // real JS agent; it dials ws://localhost:9123, so point it at this test's port (the app's own sockets go where asked)
   global.WebSocket = class extends NodeWS {
-    constructor() {
-      super(`${URL}/?role=js`);
+    constructor(url) {
+      super(url.includes("?role=js") ? `${URL}/?role=js` : url);
     }
   };
   global.XMLHttpRequest = class extends EventTarget { open() {} send() {} }; // RN's dispatches loadend when done
+  // the agent wraps the timer globals; this process's (runner, ws, this test) keep Node's, the app's are its wrappers
+  const nodeTimers = ["setTimeout", "clearTimeout", "setInterval", "clearInterval"].map((k) => [k, global[k]]);
   require("./agent");
+  const appTimers = Object.fromEntries(nodeTimers.map(([k]) => [k, global[k]]));
+  for (const [k, f] of nodeTimers) global[k] = f;
   global.__REACT_DEVTOOLS_GLOBAL_HOOK__.onCommitFiberRoot(1, {
     current: { child: root, memoizedState: { element: {} } },
   });
@@ -638,6 +642,60 @@ async function checkUsbmux() {
   assert((await waited({ netMaxMs: 50 })) < 100);
   await assert.rejects(app.idle({ timeout: 100 }), /request in flight/);
   xhr.dispatchEvent(new Event("loadend"));
+
+  // JS timers: a timeout of at most timerMaxMs holds idle until it fired (a tap that navigates 150 ms later)...
+  let fired = false;
+  appTimers.setTimeout(() => (fired = true), 150);
+  assert((await waited()) >= 140 && fired);
+  // ...on timeout err.busy says which, as facts
+  const nav = appTimers.setTimeout(() => {}, 1000);
+  await assert.rejects(app.idle({ timeout: 100 }), (e) =>
+    e.code === "TIMEOUT" && /: setTimeout 1000ms due in \d+ms$/.test(e.message) &&
+    e.busy.timers.length === 1 && e.busy.timers[0].kind === "timeout" && e.busy.timers[0].ms === 1000 && !e.busy.react);
+  assert((await waited({ timerMaxMs: 999 })) < 100); // longer than timerMaxMs: not waited for...
+  const { timers } = await app.idle({ timerMaxMs: 999 });
+  assert.equal(timers[0].ms, 1000); // ...but reported
+  appTimers.clearTimeout(nav);
+  assert.deepEqual((await app.idle()).timers, []);
+  // never-ending ones don't hold it: an interval, a timeout re-armed from its callback, an awaited sleep loop
+  const beat = appTimers.setInterval(() => {}, 50);
+  let rearmed = appTimers.setTimeout(function tick() {
+    rearmed = appTimers.setTimeout(tick, 40);
+  }, 40);
+  let looping = true;
+  (async () => {
+    while (looping) await new Promise((r) => appTimers.setTimeout(r, 30));
+  })();
+  await new Promise((r) => setTimeout(r, 100)); // each fired once
+  const pending = (await app.idle()).timers;
+  assert.deepEqual(pending.map((t) => [t.kind, t.ms, t.recurring]).sort(),
+    [["interval", 50, true], ["timeout", 30, true], ["timeout", 40, true]]);
+  appTimers.clearInterval(beat);
+  appTimers.clearTimeout(rearmed);
+  looping = false;
+  await new Promise((r) => setTimeout(r, 50));
+  assert.deepEqual((await app.idle()).timers, []);
+  assert.deepEqual(await app.idle(), { network: [], timers: [] });
+
+  // WebSockets: connecting, and a message sent with nothing received since, are in flight; a socket that waits for
+  // nothing (or answers the server: a pong) isn't
+  const echo = new (require("ws").WebSocketServer)({ port: 0 });
+  echo.on("connection", (s) => s.on("message", (m) => String(m) === "ping?" ? s.send("ping") : setTimeout(() => s.send("re: " + m), 150)));
+  await new Promise((r) => echo.on("listening", r));
+  const chat = new WebSocket(`ws://127.0.0.1:${echo.address().port}/chat?token=secret`);
+  ping = await app.js.call("Agent.ping");
+  assert.deepEqual(ping.net.map((r) => [r.url, r.ws]), [[`ws://127.0.0.1:${echo.address().port}/chat`, "connecting"]]);
+  await new Promise((r) => chat.addEventListener("open", r));
+  assert((await waited()) < 100);
+  chat.send("hej");
+  await assert.rejects(app.idle({ timeout: 50 }), (e) => /WebSocket waiting \d+ms for a reply: ws:.*\/chat$/.test(e.message) && e.busy.network[0].ws === "reply");
+  assert((await waited()) >= 50); // the reply landed
+  chat.addEventListener("message", (e) => e.data === "ping" && chat.send("pong"));
+  chat.send("ping?");
+  await new Promise((r) => setTimeout(r, 50));
+  assert((await waited()) < 100); // the pong answered the server's ping
+  chat.close();
+  echo.close();
 
   // iOS back, in Android's order: keyboard, the topmost Modal, BackHandler listeners last first, a native pop
   app.platform = "ios";
