@@ -9,12 +9,17 @@ import {
   BackHandler,
   FlatList,
   Modal,
+  NativeModules,
+  PermissionsAndroid,
+  Platform,
   Pressable,
+  ScrollView,
   StyleSheet,
   Switch,
   Text,
   TextInput,
   View,
+  requireNativeComponent,
 } from 'react-native';
 import { GestureDetector, GestureHandlerRootView, usePanGesture, useTapGesture } from 'react-native-gesture-handler';
 
@@ -255,6 +260,35 @@ function Gestures({ onBack }: { onBack: () => void }) {
   );
 }
 
+// System windows lab: what the app's own screenshot and snapshot don't have. A native surface (Android SurfaceView, iOS
+// Metal layer: example/android LabPackage.kt, example/ios Lab.m), a system permission prompt, a native Alert, a Modal.
+const LabSurface = requireNativeComponent<{ testID?: string; style?: object }>('LabSurface');
+function Windows({ onBack }: { onBack: () => void }) {
+  const [modal, setModal] = useState(false);
+  const [answer, setAnswer] = useState('brak');
+  const ask = async () => {
+    if (Platform.OS === 'ios') return NativeModules.Lab.askPermission();
+    setAnswer(await PermissionsAndroid.request('android.permission.POST_NOTIFICATIONS'));
+  };
+  return (
+    <View style={styles.screen}>
+      <Text style={styles.title}>Okna</Text>
+      {/* first: above a dialog in the middle of the screen, where a tap under the dialog goes */}
+      <Button title="Okno Modal" onPress={() => setModal(true)} />
+      <LabSurface testID="surface" style={styles.surface} />
+      <Button title="Uprawnienie" onPress={ask} />
+      <Text style={styles.body}>Odpowiedź: {answer}</Text>
+      <Button title="Komunikat" onPress={() => Alert.alert('Komunikat', 'Natywny', [{ text: 'OK' }])} />
+      <Button title="Wstecz" onPress={onBack} />
+      <Modal visible={modal} animationType="none" onRequestClose={() => setModal(false)}>
+        <View style={styles.screen}>
+          <Button title="Zamknij okno" onPress={() => setModal(false)} />
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
 // Alert lab for app.back(): back runs the cancel-style button, an alert without one stays
 function Alerts({ onBack }: { onBack: () => void }) {
   const [log, setLog] = useState<string[]>([]);
@@ -322,6 +356,7 @@ const SCREENS = {
   Gesty: Gestures,
   Nakładka: Overlay,
   Przewijanie: Scrolling,
+  Okna: Windows,
   Alerty: Alerts,
 };
 
@@ -342,12 +377,12 @@ export default function App() {
       {Screen ? (
         <Screen onBack={() => setScreen(null)} />
       ) : (
-        <View style={styles.screen}>
+        <ScrollView style={styles.root} contentContainerStyle={styles.menu}>
           <Text style={styles.title}>Menu</Text>
           {(Object.keys(SCREENS) as (keyof typeof SCREENS)[]).map(s => (
             <Button key={s} title={s} onPress={() => setScreen(s)} />
           ))}
-        </View>
+        </ScrollView>
       )}
     </GestureHandlerRootView>
   );
@@ -356,6 +391,7 @@ export default function App() {
 const styles = StyleSheet.create({
   root: { flex: 1 },
   screen: { flex: 1, padding: 24, paddingTop: 80, backgroundColor: '#fff' },
+  menu: { flexGrow: 1, padding: 24, paddingTop: 80, backgroundColor: '#fff' },
   title: { fontSize: 24, fontWeight: '600', marginBottom: 16, color: '#111' },
   body: { fontSize: 16, marginBottom: 8, color: '#111' },
   input: { borderWidth: 1, borderColor: '#999', borderRadius: 6, padding: 10, marginBottom: 12, color: '#111' },
@@ -373,5 +409,6 @@ const styles = StyleSheet.create({
   modal: { backgroundColor: '#fff', borderRadius: 8, padding: 24 },
   ghBox: { height: 120, backgroundColor: '#16a34a', borderRadius: 8, justifyContent: 'center', alignItems: 'center', marginBottom: 12 },
   ghPan: { backgroundColor: '#9333ea' },
+  surface: { height: 100, marginBottom: 12 },
   overlay: { ...StyleSheet.absoluteFill, backgroundColor: '#0008', justifyContent: 'center', alignItems: 'center' },
 });
