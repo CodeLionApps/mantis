@@ -221,11 +221,15 @@ object MantisAgent {
   private val decor: View get() = decorOrNull ?: error("no resumed activity")
   private val density: Float get() = app.resources.displayMetrics.density
 
-  /** All windows of this process (activity, Modal dialogs, popups), topmost first. Coordinates are screen-based. */
+  /**
+   * All windows of this process (activity, Modal dialogs, popups) that are on screen, topmost first. Coordinates are
+   * screen-based. windowVisibility: the windows of a stopped activity (another activity of the app over it, the app in
+   * the background) stay attached, with their dialogs, but the window manager hides them.
+   */
   private fun roots(): List<View> {
     // ponytail: API 29+ (WindowInspector); below that only the activity window, so no Modal support
     val all = if (Build.VERSION.SDK_INT >= 29) WindowInspector.getGlobalWindowViews() else listOfNotNull(decorOrNull)
-    return all.filter { it.isShown }.reversed()
+    return all.filter { it.isShown && it.windowVisibility == View.VISIBLE }.reversed()
   }
 
   private fun findView(tag: Int): View? = roots().firstNotNullOfOrNull { it.findViewById<View>(tag) }
@@ -253,19 +257,24 @@ object MantisAgent {
    * split screen the window manager limits that to the app's part, which only matters for points outside the app.
    */
   private fun windowAt(x: Float, y: Float): View? =
-    roots().firstOrNull { screenRect(it).contains(x.toInt(), y.toInt()) || touchModal(it) }
+    roots().firstOrNull { touchable(it) && (screenRect(it).contains(x.toInt(), y.toInt()) || touchModal(it)) }
 
   private fun params(win: View) = win.layoutParams as? WindowManager.LayoutParams
 
+  // FLAG_NOT_TOUCHABLE: touches go through it to the window below (an overlay SDK's banner, a debug overlay)
+  private fun touchable(win: View) = (params(win)?.flags ?: 0) and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE == 0
+
   private fun touchModal(win: View) = params(win)?.let {
-    it.type != WindowManager.LayoutParams.TYPE_BASE_APPLICATION &&
-      it.flags and (WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL) == 0
+    it.type != WindowManager.LayoutParams.TYPE_BASE_APPLICATION && it.flags and (WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+      WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE) == 0
   } == true
 
   /**
    * The app's lifecycle, as on iOS: active = an activity of the app is resumed; inactive = one is started (visible) but
    * none resumed: an activity of another app or of the system is in front without hiding it (a permission prompt, a
    * dialog-style activity), or the app is between two of its own activities; background = none is started.
+   * ponytail: the last resumed activity only; with two resumed at once (multi-resume, split screen), pausing the later
+   * one reads inactive while the other is still resumed.
    */
   private fun state() = if (activity != null) "active" else if (started > 0) "inactive" else "background"
 
@@ -282,9 +291,10 @@ object MantisAgent {
   /**
    * The app's own windows over its activity's, topmost first: type (modal = a Dialog, which RN's Modal and Alert are;
    * popup = a PopupWindow or another sub-window; window = any other), react (a React root in it: its content is in the
-   * nodes) and rect (screen dp).
+   * nodes) and rect (screen dp). null below API 29: only the activity window is known there (roots), not "none".
    */
-  private fun overlays(): JSONArray {
+  private fun overlays(): Any {
+    if (Build.VERSION.SDK_INT < 29) return JSONObject.NULL
     val out = JSONArray()
     for (w in roots()) {
       val type = params(w)?.type ?: continue
@@ -304,7 +314,7 @@ object MantisAgent {
    * the screenshot's windows of the window it is in (one over it may hide it on screen too).
    */
   private fun surfaces(v: View, window: Int, out: JSONArray) {
-    if (!v.isShown) return
+    if (v.visibility != View.VISIBLE) return // the ancestors are: the recursion starts at a shown window
     if (v is SurfaceView) {
       val r = Rect()
       if (v.getGlobalVisibleRect(r)) {
